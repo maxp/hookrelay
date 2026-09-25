@@ -1,0 +1,54 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Secrets and certificates
+*.pem
+*.key
+*.crt
+
+# Logs and runtime data
+*.log
+logs/
+run/
+tmp/
+*.pid
+
+# Dependencies and build artifacts
+node_modules/
+vendor/
+dist/
+build/
+coverage/
+
+# Language caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Go
+bin/
+*.test
+*.out
+
+# Rust
+target/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local Valkey data
+*.rdb
+appendonly.aof
+appendonlydir/
