@@ -1,0 +1,3 @@
+# Use Valkey for persistence and queue coordination
+
+Valkey will store canonical messages, deduplication records, recipient delivery queues, leases, retries, dead-letter state, and configuration behind internal repository interfaces. Correctness-sensitive transitions must be atomic, and webhook ingestion returns success only after deduplication, message persistence, queue insertion, and ready-index maintenance complete. Production durability still depends on the selected Valkey persistence, replication, failover, memory, backup, and restore configuration; Valkey success is not described as an absolute zero-loss guarantee under every infrastructure failure.
