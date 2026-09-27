@@ -46,7 +46,9 @@ The service must emit structured logs without credentials or sensitive payloads.
 - [`docs/design/platform.md`](docs/design/platform.md) records the platform and component topology.
 - [`docs/design/message-contract.md`](docs/design/message-contract.md) defines the initial webhook and Canonical Message contract.
 - [`docs/design/deduplication.md`](docs/design/deduplication.md) defines deduplication and atomic acceptance.
-- [`docs/design/delivery.md`](docs/design/delivery.md) defines the long-polling Consumer API and ordered-delivery state model.
+- [`docs/design/delivery.md`](docs/design/delivery.md) defines the ordered-delivery state model.
+- [`docs/design/consumer-api.md`](docs/design/consumer-api.md) defines the long-polling Consumer API.
+- [`docs/design/storage.md`](docs/design/storage.md) defines the accepted internal Valkey data structures and key namespace.
 - [`docs/design/open-questions.md`](docs/design/open-questions.md) lists decisions that remain open.
 
 ## Repository layout

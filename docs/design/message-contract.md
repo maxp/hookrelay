@@ -30,7 +30,22 @@ A Recipient Identity is:
 (Bot Platform, Bot Identifier, Chat Identifier)
 ```
 
-Bot Identifier and platform-provided Chat Identifier are opaque, case-sensitive strings. Leading zeros and exact values are preserved. Platform-specific normalization, when needed, belongs to the Converter.
+Bot Identifier and platform-provided Chat Identifier are opaque, case-sensitive strings. Leading zeros and exact values are preserved. The common domain does not trim whitespace or change case; platform-specific canonicalization, when needed, belongs to the Converter.
+
+Identity-component validation is:
+
+```text
+bot_platform:
+  1–32 ASCII characters
+  pattern [a-z][a-z0-9_-]*
+
+bot_id and chat_id:
+  1–128 UTF-8 bytes
+  no colon
+  no control characters
+```
+
+The serialized colon-delimited Recipient storage key is internal and is not included in the Canonical Message or Consumer API.
 
 ## Recipient scopes
 
@@ -40,7 +55,7 @@ Bot Identifier and platform-provided Chat Identifier are opaque, case-sensitive 
 - `bot`: a known event that inherently applies to the Bot Identity rather than a chat;
 - `relay`: a verified valid JSON payload that cannot be mapped to a known chat-level or bot-level structure.
 
-Bot and relay scopes use distinct, shared, typed reserved Chat Identifier values. The implementation must prevent those values from colliding with platform-provided identifiers. There is one bot-scoped queue and one relay-scoped fallback queue per Bot Identity. Those queues do not block any chat-scoped queue.
+Bot and relay scopes use the shared typed reserved Chat Identifier values `$hr_bot` and `$hr_relay`. Only the common domain module may create these values. A platform-provided Chat Identifier equal to either reserved value is invalid for chat scope and is routed to relay scope with `routing_issue.code = "reserved_chat_id"`. There is one bot-scoped queue and one relay-scoped fallback queue per Bot Identity. Those queues do not block any chat-scoped queue.
 
 Only verified payloads that are valid JSON may enter the relay scope. An unknown endpoint, failed verification, invalid JSON, or an oversized body does not create a Canonical Message.
 
@@ -89,6 +104,20 @@ Optional fields:
 The Canonical Payload is the complete platform-specific JSON value. Unknown object fields are retained. Exact source bytes, whitespace, and key order are not retained as the payload representation. A valid unexpected top-level JSON value is preserved as one payload and sent to relay scope.
 
 `platform_event_type` remains platform-specific. For an unknown structure, the Converter preserves the best safely extractable type or uses a reserved unknown value.
+
+The initial bounded `routing_issue.code` allowlist is:
+
+```text
+unknown_event_structure
+unknown_event_type
+missing_chat_id
+invalid_chat_id_type
+invalid_chat_id_value
+reserved_chat_id
+unexpected_json_shape
+```
+
+An unrecognized internal reason is exposed as `unknown_event_structure`. New public codes require documentation and bounded-cardinality tests.
 
 A relay-scoped message may contain:
 

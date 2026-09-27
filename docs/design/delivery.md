@@ -163,13 +163,28 @@ Before a claim enters long polling with an empty ready index, it performs one in
 
 Canonical Messages, each Recipient's ordered message sequence, queue-head state, the current Delivery Attempt, Delivery Cycle history, and dead-letter entries are authoritative state. Ready, lease-deadline, retry-deadline, global dead-letter, and deduplication indexes are derived accelerators and must be rebuildable from authoritative state.
 
-A bounded consistency checker detects and repairs safely derivable differences such as missing or stale ready and deadline index entries. Ambiguous authoritative state is not guessed or silently rewritten: the affected Recipient is placed in operational quarantine and an alert is raised. The first vertical slice may defer the checker, but its storage model must support it.
+Startup reconciliation repairs only safely derivable differences such as missing or stale ready and deadline index entries. Ambiguous authoritative state is never guessed or silently rewritten. Instead, hookrelay creates a minimal persistent block marker:
 
-After a Valkey restore, hookrelay starts not-ready, verifies storage-schema compatibility, performs bounded reconciliation, rebuilds safe derived indexes, processes overdue leases through the normal expiry transition, activates due retries, and becomes ready only when new atomic operations are safe. A deeper non-critical scan may continue in the background. Ambiguous Recipient state remains quarantined for operator resolution.
+```text
+hr1:q:<platform>:<bot>:<chat>
+```
+
+The marker contains only `detected_ms` and a bounded `reason_code`. While it exists, the Recipient is absent from ready and deadline indexes, cannot be claimed, and cannot accept new messages; affected webhook requests receive a retryable response. Other Recipients continue normally. Hookrelay emits a critical metric and structured log. The first version has no general repair engine or quarantine UI: an operator diagnoses the stored state, performs the documented manual recovery procedure, and removes the marker only after invariants have been verified.
+
+After a Valkey restore, hookrelay starts not-ready, rebuilds safe derived indexes, processes overdue leases through the normal expiry transition, activates due retries, and creates block markers for ambiguous Recipient state. It becomes ready when general new operations are safe; individual blocked Recipients remain unavailable until operator recovery.
 
 An active Delivery Queue record is removed when its final normal message is acknowledged or moved to dead-letter. Recipient dead-letter state and operational history may outlive an empty normal queue.
 
-Queue capacity has both global and per-Recipient configured limits. If either limit prevents atomic acceptance, hookrelay creates neither a deduplication record nor a partial message and returns a retryable platform response, normally `503`. It never deletes already accepted queue messages or redirects overflow into relay scope. Production Valkey uses `noeviction`; capacity metrics and alerts must fire before hard rejection.
+Queue capacity has both global and per-Recipient configured limits:
+
+```text
+max_queued_messages_global        = 100_000
+max_queued_messages_per_recipient = 1_000
+```
+
+If either limit prevents atomic acceptance, hookrelay creates neither a deduplication record nor a partial message and returns a retryable platform response, normally `503`. It never deletes already accepted queue messages or redirects overflow into relay scope. Bot- and relay-scoped queues use the same per-Recipient limit. Production Valkey uses `noeviction`; capacity metrics and alerts must fire before hard rejection.
+
+New-message acceptance stops at 90% of configured Valkey `maxmemory`, while acknowledgement, delivery, cleanup, and retention transitions continue so the system can recover. Crossing this hard threshold makes hookrelay not-ready for general ingestion. The limits are configurable and must be validated against production payload size and traffic rather than treated as a promise that 100,000 maximum-size payloads fit in memory.
 
 ## Attempt history and dead-letter
 
@@ -193,7 +208,8 @@ After attempt four fails, the message moves atomically to the Recipient's dead-l
 
 Operator replay:
 
-- returns the same Canonical Message to the head of its Recipient queue;
+- returns the same Canonical Message before all not-yet-started messages for its Recipient;
+- does not interrupt an already leased head or a head waiting for retry, and in that case inserts the replayed message immediately after the current head;
 - preserves `message_id` and payload;
 - starts a new Delivery Cycle with attempt one;
 - issues a new Delivery Token;

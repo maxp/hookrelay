@@ -51,17 +51,27 @@ When Valkey is unavailable, hookrelay cannot prove a duplicate and must return a
 
 ## Retention and capacity
 
-Deduplication uses:
+Deduplication uses the initial configurable defaults:
 
-- a configured global retention target;
-- an optional retention override by Webhook Type;
-- a configured minimum effective retention;
-- a global maximum number of deduplication records;
-- Valkey memory monitoring with `noeviction` rather than arbitrary eviction of queue data.
+```text
+dedup_retention_ms     =   604_800_000  # 7 days
+dedup_min_retention_ms =    86_400_000  # 24 hours
+max_dedup_records      =     1_000_000
+```
+
+Webhook Types may override the target when their documented redelivery windows differ. The minimum effective retention is the lower bound under capacity pressure, not the normal target. Valkey memory is monitored with `noeviction` rather than arbitrary eviction of queue data.
 
 Under capacity pressure, hookrelay may delete the globally oldest deduplication records before their target retention, but never intentionally below the configured minimum window. If capacity cannot preserve the minimum window, new ingestion is rejected with a retryable response instead of silently reducing deduplication to zero.
 
 The configured retention is not permanently changed under pressure. As traffic or stored volume falls, effective retention naturally returns toward the configured target.
+
+Production configuration includes `expected_peak_rate`. Startup validates:
+
+```text
+max_dedup_records >= expected_peak_rate * dedup_min_retention_seconds
+```
+
+An incompatible production configuration blocks readiness. Hookrelay also reports the supported rate implied by record capacity and minimum retention. Runtime pressure and early eviction remain observable even after startup validation.
 
 Required capacity signals include:
 
