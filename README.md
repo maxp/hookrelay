@@ -1,6 +1,6 @@
-# hookrouter
+# hookrelay
 
-Webhook router that distributes incoming events to users through ordered delivery channels.
+Webhook relay that distributes incoming events to recipients through ordered delivery channels.
 
 ## Status
 

@@ -22,7 +22,7 @@ The SHA-256 input is the exact limited HTTP request body. It is calculated durin
 
 The same request-body digest is recorded to detect a conflicting duplicate: the same Deduplication Identity with different bytes remains a duplicate, is not enqueued again, and increments a conflict metric with a safe structured log.
 
-Chat-, bot-, and router-scoped messages all use the same deduplication process.
+Chat-, bot-, and relay-scoped messages all use the same deduplication process.
 
 ## Atomic acceptance
 
@@ -36,7 +36,7 @@ For a new message, one atomic Valkey operation must:
 6. add the Recipient to the ready index when the queue becomes available;
 7. return an accepted result.
 
-The operation may not leave a deduplication record without a queued message, a stored message without a queue reference, or a newly ready queue missing from its index.
+The operation may not leave a deduplication record without a queued message, a stored message without a queue reference, or a newly ready queue missing from its index. After this single script succeeds, the message is visible to consumers and the webhook adapter may return success; there is no separate durability-confirmation or activation phase in the first version.
 
 The application generates the candidate UUIDv7 before this operation. If the request is duplicate, that unused candidate ID is discarded. A duplicate does not store another Canonical Message or modify the Delivery Queue and receives the normal platform success response.
 
@@ -47,7 +47,7 @@ A deduplication record contains at least:
 - digest of the original request body;
 - expiry information.
 
-When Valkey is unavailable, hookrouter cannot prove a duplicate and must return a retryable failure rather than use process-local state or accept the message only in memory.
+When Valkey is unavailable, hookrelay cannot prove a duplicate and must return a retryable failure rather than use process-local state or accept the message only in memory.
 
 ## Retention and capacity
 
@@ -59,7 +59,7 @@ Deduplication uses:
 - a global maximum number of deduplication records;
 - Valkey memory monitoring with `noeviction` rather than arbitrary eviction of queue data.
 
-Under capacity pressure, hookrouter may delete the globally oldest deduplication records before their target retention, but never intentionally below the configured minimum window. If capacity cannot preserve the minimum window, new ingestion is rejected with a retryable response instead of silently reducing deduplication to zero.
+Under capacity pressure, hookrelay may delete the globally oldest deduplication records before their target retention, but never intentionally below the configured minimum window. If capacity cannot preserve the minimum window, new ingestion is rejected with a retryable response instead of silently reducing deduplication to zero.
 
 The configured retention is not permanently changed under pressure. As traffic or stored volume falls, effective retention naturally returns toward the configured target.
 

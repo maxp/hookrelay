@@ -1,6 +1,6 @@
-# Webhook Routing
+# Webhook Relay
 
-This context receives heterogeneous webhooks, normalizes them into a common message model, removes duplicates, and routes messages to ordered recipient queues.
+This context receives heterogeneous webhooks, converts them into a common message envelope, removes duplicates, and relays messages to ordered recipient queues.
 
 ## Language
 
@@ -41,27 +41,27 @@ The webhook-type-specific policy that authenticates a webhook request by checkin
 _Avoid_: Validator, parser
 
 **Converter**:
-The webhook-type-specific transformation from one verified webhook request into exactly one canonical message for exactly one recipient. The converter forms the recipient identity from the verified endpoint's bot identity and message-specific data. It classifies the recipient scope as chat-level for an identified chat, bot-level for a known event that inherently applies to the bot, or router-level when a verified valid JSON payload cannot be mapped to a known chat-level or bot-level structure. Bot-level and router-level messages use separate shared reserved chat identifiers. The converter preserves the full platform-specific payload for the queue consumer.
-_Avoid_: Verifier, router, payload formatter
+The webhook-type-specific transformation from one verified webhook request into exactly one canonical message for exactly one recipient. The converter forms the recipient identity from the verified endpoint's bot identity and message-specific data. It classifies the recipient scope as chat-level for an identified chat, bot-level for a known event that inherently applies to the bot, or relay-level when a verified valid JSON payload cannot be mapped to a known chat-level or bot-level structure. Bot-level and relay-level messages use separate shared reserved chat identifiers. The converter preserves the full platform-specific payload for the queue consumer.
+_Avoid_: Verifier, queue router, payload formatter
 
 **Canonical Message**:
-The common envelope produced before deduplication and routing. It contains hookrouter metadata, exactly one recipient identity, a platform event type, and the full bot-platform-specific payload needed by the queue consumer. Each verified webhook request produces exactly one canonical message.
+The common envelope produced before deduplication and routing. It contains hookrelay metadata, exactly one recipient identity, a platform event type, and the full bot-platform-specific payload needed by the queue consumer. Each verified webhook request produces exactly one canonical message.
 _Avoid_: Raw webhook request, normalized cross-platform payload, message batch
 
 **Canonical Payload**:
-The complete bot-platform-specific JSON value from the webhook request, preserved without discarding unknown fields. Its semantic JSON content is part of the message; exact source bytes, whitespace, and object-key order are not. A verified valid JSON value of an unexpected top-level shape is preserved as one payload and routed to the router-level recipient.
+The complete bot-platform-specific JSON value from the webhook request, preserved without discarding unknown fields. Its semantic JSON content is part of the message; exact source bytes, whitespace, and object-key order are not. A verified valid JSON value of an unexpected top-level shape is preserved as one payload and routed to the relay-level recipient.
 _Avoid_: Normalized payload, selected fields, exact HTTP body, automatically split batch
 
 **Platform Event Type**:
-The bot-platform-specific classification of the source event. It is preserved without cross-platform normalization. When a verified valid JSON payload has an unknown structure, hookrouter preserves the best safely extractable platform event type or uses a documented reserved unknown value and delivers the message to the router-level recipient.
+The bot-platform-specific classification of the source event. It is preserved without cross-platform normalization. When a verified valid JSON payload has an unknown structure, hookrelay preserves the best safely extractable platform event type or uses a documented reserved unknown value and delivers the message to the relay-level recipient.
 _Avoid_: Webhook type, bot platform, canonical event type
 
 **Routing Issue**:
-A bounded machine-readable code explaining why a canonical message was sent to the router-level recipient, such as an unknown event structure, missing chat identifier, invalid chat identifier type, or unexpected JSON shape. It contains no free-form error text or payload data. The canonical JSON field is `routing_issue.code`.
+A bounded machine-readable code explaining why a canonical message was sent to the relay-level recipient, such as an unknown event structure, missing chat identifier, invalid chat identifier type, or unexpected JSON shape. It contains no free-form error text or payload data. The canonical JSON field is `routing_issue.code`.
 _Avoid_: Exception message, stack trace, conversion failure
 
 **Message Identifier**:
-A hookrouter-generated UUIDv7 that uniquely identifies one canonical message and remains unchanged across all of its delivery attempts.
+A hookrelay-generated UUIDv7 that uniquely identifies one canonical message and remains unchanged across all of its delivery attempts.
 _Avoid_: Source event identifier, deduplication key, delivery token
 
 **Source Event Identifier**:
@@ -73,7 +73,7 @@ The bot-platform-specific opaque value produced by the converter to identify rep
 _Avoid_: Message identifier, source event identifier, arbitrary reserialized payload hash
 
 **Received Time**:
-The UTC Unix epoch time, in integer milliseconds, at which hookrouter began receiving the webhook request. It is recorded in the canonical message as `received_ms` and does not determine delivery-queue order.
+The UTC Unix epoch time, in integer milliseconds, at which hookrelay began receiving the webhook request. It is recorded in the canonical message as `received_ms` and does not determine delivery-queue order.
 _Avoid_: Platform event time, acceptance order
 
 **Occurred Time**:
@@ -107,11 +107,11 @@ The combination of bot platform and bot identifier that uniquely identifies a bo
 _Avoid_: Webhook identity, subscription identity
 
 **Chat Identifier**:
-An opaque identifier for a chat within the context of one bot identity. A chat may represent a direct conversation, group, channel, or another platform-specific conversation destination. The bot-platform-specific converter produces its canonical string form. Bot-level and router-level messages use distinct shared documented reserved values so they still have recipients and independent ordered delivery queues.
+An opaque identifier for a chat within the context of one bot identity. A chat may represent a direct conversation, group, channel, or another platform-specific conversation destination. The bot-platform-specific converter produces its canonical string form. Bot-level and relay-level messages use distinct shared documented reserved values so they still have recipients and independent ordered delivery queues.
 _Avoid_: User identifier, globally unique chat ID, internal recipient ID
 
 **Recipient Scope**:
-How hookrouter determined the destination represented by a recipient. A `chat` recipient uses a platform-provided chat identifier. A `bot` recipient represents a known event that inherently applies to the bot and uses the shared reserved bot-level chat identifier. A `router` recipient represents a verified valid JSON payload whose structure cannot be mapped to a known chat-level or bot-level event and uses the shared reserved router-level chat identifier. The canonical JSON field is `recipient.scope`.
+How hookrelay determined the destination represented by a recipient. A `chat` recipient uses a platform-provided chat identifier. A `bot` recipient represents a known event that inherently applies to the bot and uses the shared reserved bot-level chat identifier. A `relay` recipient represents a verified valid JSON payload whose structure cannot be mapped to a known chat-level or bot-level event and uses the shared reserved relay-level chat identifier. The canonical JSON field is `recipient.scope`.
 _Avoid_: Bot platform, event type, queue type, conversion status
 
 **Recipient**:

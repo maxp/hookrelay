@@ -4,7 +4,7 @@ Guidance for humans and coding agents working in this repository.
 
 ## Project purpose
 
-`hookrouter` receives heterogeneous webhooks, resolves their type and identifier from the request route, verifies and converts them into canonical messages, deduplicates them, and routes new messages to ordered recipient queues. The design must preserve ordering where promised and make failures observable and recoverable.
+`hookrelay` receives heterogeneous webhooks, resolves their type and identifier from the request route, verifies and converts them into canonical messages, deduplicates them, and routes new messages to ordered recipient queues. The design must preserve ordering where promised and make failures observable and recoverable.
 
 Project goals describe required behavior without prescribing infrastructure or implementation technologies. Use the canonical domain vocabulary from `CONTEXT.md`.
 
@@ -40,8 +40,8 @@ Project goals describe required behavior without prescribing infrastructure or i
 
 - Use focused commits with imperative messages.
 - Do not rewrite shared branch history without explicit approval.
-- Primary remote: `origin` (`git@github.com:maxp/hookrouter.git`).
-- Secondary remote: `craft` (`ssh://ssh.sourcecraft.dev/maxp/hookrouter.git`).
+- Primary remote: `origin` (`git@github.com:maxp/hookrelay.git`).
+- Secondary remote: `craft` (`ssh://ssh.sourcecraft.dev/maxp/hookrelay.git`).
 - Keep the primary branch synchronized across both remotes.
 
 ## Definition of done

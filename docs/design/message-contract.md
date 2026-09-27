@@ -38,11 +38,11 @@ Bot Identifier and platform-provided Chat Identifier are opaque, case-sensitive 
 
 - `chat`: a known event for a platform-provided Chat Identifier;
 - `bot`: a known event that inherently applies to the Bot Identity rather than a chat;
-- `router`: a verified valid JSON payload that cannot be mapped to a known chat-level or bot-level structure.
+- `relay`: a verified valid JSON payload that cannot be mapped to a known chat-level or bot-level structure.
 
-Bot and router scopes use distinct, shared, typed reserved Chat Identifier values. The implementation must prevent those values from colliding with platform-provided identifiers. There is one bot-scoped queue and one router-scoped fallback queue per Bot Identity. Those queues do not block any chat-scoped queue.
+Bot and relay scopes use distinct, shared, typed reserved Chat Identifier values. The implementation must prevent those values from colliding with platform-provided identifiers. There is one bot-scoped queue and one relay-scoped fallback queue per Bot Identity. Those queues do not block any chat-scoped queue.
 
-Only verified payloads that are valid JSON may enter the router scope. An unknown endpoint, failed verification, invalid JSON, or an oversized body does not create a Canonical Message.
+Only verified payloads that are valid JSON may enter the relay scope. An unknown endpoint, failed verification, invalid JSON, or an oversized body does not create a Canonical Message.
 
 ## Canonical Message
 
@@ -82,15 +82,15 @@ Optional fields:
 
 - `occurred_ms`;
 - `source_event_id`;
-- `routing_issue`, for router-scoped messages.
+- `routing_issue`, for relay-scoped messages.
 
 `message_id` is generated as UUIDv7 before the atomic acceptance operation. `occurred_ms`, when present, is the Bot Platform's event time and does not determine Delivery Queue order.
 
-The Canonical Payload is the complete platform-specific JSON value. Unknown object fields are retained. Exact source bytes, whitespace, and key order are not retained as the payload representation. A valid unexpected top-level JSON value is preserved as one payload and sent to router scope.
+The Canonical Payload is the complete platform-specific JSON value. Unknown object fields are retained. Exact source bytes, whitespace, and key order are not retained as the payload representation. A valid unexpected top-level JSON value is preserved as one payload and sent to relay scope.
 
 `platform_event_type` remains platform-specific. For an unknown structure, the Converter preserves the best safely extractable type or uses a reserved unknown value.
 
-A router-scoped message may contain:
+A relay-scoped message may contain:
 
 ```json
 {
@@ -114,7 +114,7 @@ The HTTP request body hard limit is 256 KiB. Accepted, duplicate, and rejected r
 | Body is invalid JSON | reject with `400` |
 | Verified known chat event | accept into `chat` scope |
 | Verified known bot event | accept into `bot` scope |
-| Verified valid JSON with unknown or incomplete structure | accept into `router` scope |
+| Verified valid JSON with unknown or incomplete structure | accept into `relay` scope |
 | Valkey cannot atomically accept the message | retryable failure, normally `503` |
 
 A successful platform response is returned only after the message has been atomically accepted or proven duplicate. The Webhook Type adapter maps internal accepted, duplicate, permanent-rejection, and transient-failure results to platform-compatible responses. Accepted and duplicate results normally produce the same empty `200` response.
