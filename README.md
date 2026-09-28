@@ -64,9 +64,35 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 
 ## Repository layout
 
-The source layout will be added together with the first implementation milestone.
+- `cmd/hookrelay` — the single executable entry point;
+- `internal/app` — composition root, listeners, readiness, graceful shutdown;
+- `internal/config` — flags, environment, defaults, and startup validation;
+- `internal/observability` — structured logging and the private metrics registry;
+- `internal/cli` — serve, version, generate, and healthcheck commands;
+- `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
+- `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
 
 ## Development
+
+Build and test with the pinned Go toolchain (see `go.mod`):
+
+```sh
+go build ./...
+go test ./...
+```
+
+Generate local shared secrets and run the Compose stack (pinned Valkey with
+AOF `everysec` and `noeviction`):
+
+```sh
+go run ./cmd/hookrelay generate consumer-secret --output-file .secrets/consumer
+go run ./cmd/hookrelay generate admin-secret --output-file .secrets/admin
+chmod 600 .secrets/consumer .secrets/admin
+docker compose up --build
+```
+
+Health endpoints live on the administrative listener:
+`/health/live`, `/health/ready`, `/health/accepting-webhooks`, `/metrics`.
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
 

@@ -1,3 +1,6 @@
+# Local shared secrets (generated, mounted read-only)
+.secrets/
+
 # Environment and local configuration
 .env
 .env.*

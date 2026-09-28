@@ -1,0 +1,97 @@
+# Local development stack. The pinned Valkey release must match the version
+# used by integration tests and CI (see docs/design/deployment.md).
+#
+# Local shared secrets live in the ignored .secrets/ directory (mode 0600):
+#   hookrelay generate consumer-secret --output-file .secrets/consumer
+#   hookrelay generate admin-secret --output-file .secrets/admin
+#
+# An observability profile adds Prometheus and Grafana:
+#   docker compose --profile observability up
+
+services:
+  valkey:
+    image: valkey/valkey:9.1.2
+    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    stop_grace_period: 35s
+
+  hookrelay:
+    build:
+      context: .
+      args:
+        VERSION: ${HOOKRELAY_VERSION:-dev}
+    # File-backed compose secrets inherit the source file's permissions
+    # (0600, owned by the host user), so run the container under the host
+    # user instead of the image default. Any numeric uid is nonroot.
+    user: "${HOOKRELAY_CONTAINER_UID:-1000}:${HOOKRELAY_CONTAINER_GID:-1000}"
+    depends_on:
+      valkey:
+        condition: service_healthy
+    environment:
+      HOOKRELAY_ENVIRONMENT: ${HOOKRELAY_ENVIRONMENT:-development}
+      HOOKRELAY_VALKEY_URL: valkey://valkey:6379/0
+      # Bind the administrative listener to all interfaces inside the private
+      # Compose network; the loopback-only port publish is the exposure
+      # control (per the deployment design).
+      HOOKRELAY_ADMIN_ADDRESS: 0.0.0.0:8081
+      # Explicitly configured secure cookie: the non-loopback in-container
+      # bind requires it (the exposure control stays the loopback publish).
+      HOOKRELAY_ADMIN_COOKIE_SECURE: "true"
+      HOOKRELAY_CONSUMER_SECRET_FILE: /run/secrets/consumer
+      HOOKRELAY_ADMIN_SECRET_FILE: /run/secrets/admin
+    secrets:
+      - consumer
+      - admin
+    ports:
+      # Public listener published to loopback; the administrative listener is
+      # bound to loopback only and is never published publicly.
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "/hookrelay", "healthcheck", "--url", "http://127.0.0.1:8081/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
+    stop_grace_period: 35s
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    profiles: ["observability"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.2.3
+    profiles: ["observability"]
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  valkey-data:
+
+secrets:
+  consumer:
+    file: ./.secrets/consumer
+  admin:
+    file: ./.secrets/admin

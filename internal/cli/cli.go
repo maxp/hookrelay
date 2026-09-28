@@ -1,0 +1,253 @@
+// Package cli implements the hookrelay command families: serve, version,
+// generate, and healthcheck. The entry point only delegates here; HTTP,
+// domain, Valkey, and observability logic live in the feature modules.
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/maxp/hookrelay/internal/app"
+	"github.com/maxp/hookrelay/internal/config"
+	"github.com/maxp/hookrelay/internal/observability"
+)
+
+// Exit codes per the lifecycle contract: controlled clean shutdown 0,
+// runtime/internal failure 1, configuration or CLI usage failure 2.
+const (
+	ExitOK    = 0
+	ExitError = 1
+	ExitUsage = 2
+)
+
+// version is the embedded build identity; real values are injected via
+// linker flags at build time.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+	dirty     = "unknown"
+)
+
+// Main is the process entry point; it returns the process exit code.
+func Main(args []string) int {
+	if len(args) == 0 {
+		usage(os.Stderr)
+		return ExitUsage
+	}
+	switch args[0] {
+	case "serve":
+		return Serve(args[1:])
+	case "version":
+		return Version(args[1:], os.Stdout)
+	case "generate":
+		return Generate(args[1:])
+	case "healthcheck":
+		return Healthcheck(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "hookrelay: unknown command %q\n", args[0])
+		usage(os.Stderr)
+		return ExitUsage
+	}
+}
+
+func usage(w io.Writer) {
+	fmt.Fprint(w, `hookrelay — webhook relay that distributes incoming events to recipients through ordered delivery channels
+
+Usage:
+  hookrelay serve        run the hookrelay server
+  hookrelay version      print build information (human or --json)
+  hookrelay generate     generate consumer-secret | admin-secret | webhook-id
+  hookrelay healthcheck  probe a health endpoint (container healthcheck)
+`)
+}
+
+// Serve runs the server until a termination signal. Configuration failures
+// exit 2; runtime failures exit 1.
+func Serve(args []string) int {
+	cfg, err := config.Load(args, os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
+		return ExitUsage
+	}
+
+	consumerSecret, err := config.LoadSecrets(cfg.ConsumerSecret, cfg.ConsumerSecretFile, config.OSReadFile, "consumer secret")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
+		return ExitUsage
+	}
+	adminSecret, err := config.LoadSecrets(cfg.AdminSecret, cfg.AdminSecretFile, config.OSReadFile, "admin secret")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
+		return ExitUsage
+	}
+	// Secrets are validated and length-checked here; the API slices consume
+	// them through composition. They are never logged.
+	_, _ = consumerSecret, adminSecret
+
+	observability.SetBuildVersion(version)
+	log := observability.NewLogger(cfg.LogLevel)
+	registry := observability.NewMetricsRegistry()
+	application := app.New(app.Deps{
+		Config:    cfg,
+		Logger:    log,
+		Registry:  registry,
+		Readiness: &app.Readiness{},
+	})
+
+	log.Info("hookrelay starting",
+		"event", "startup",
+		"environment", string(cfg.Environment),
+		"public_address", cfg.PublicAddress,
+		"admin_address", cfg.AdminAddress,
+		"valkey_url", cfg.RedactedValkeyURL(),
+	)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		// A second signal forces termination.
+		stop()
+		select {
+		case <-time.After(shutdownGraceForSecondSignal()):
+			fmt.Fprintln(os.Stderr, "hookrelay: forced termination on second signal")
+			os.Exit(ExitError)
+		case <-time.After(time.Second):
+		}
+	}()
+
+	adminLn, err := net.Listen("tcp", cfg.AdminAddress)
+	if err != nil {
+		log.Error("admin listener failed", "event", "listener_failed", "error_code", "internal_error", "listener", "admin")
+		return ExitError
+	}
+	publicLn, err := net.Listen("tcp", cfg.PublicAddress)
+	if err != nil {
+		log.Error("public listener failed", "event", "listener_failed", "error_code", "internal_error", "listener", "public")
+		adminLn.Close()
+		return ExitError
+	}
+
+	if err := application.Run(ctx, adminLn, publicLn); err != nil {
+		log.Error("server failure", "event", "server_failed", "error_code", "internal_error")
+		return ExitError
+	}
+	return ExitOK
+}
+
+func shutdownGraceForSecondSignal() time.Duration { return time.Second }
+
+// Version prints build information in human-readable or JSON form.
+func Version(args []string, stdout io.Writer) int {
+	fs := flag.NewFlagSet("hookrelay version", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "print machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(map[string]string{
+			"version": version, "commit": commit, "build_time": buildTime, "dirty": dirty,
+		}); err != nil {
+			return ExitError
+		}
+		return ExitOK
+	}
+	fmt.Fprintf(stdout, "hookrelay %s\ncommit: %s\nbuild time: %s\ndirty: %s\n", version, commit, buildTime, dirty)
+	return ExitOK
+}
+
+// Generate produces the operator secrets and identifiers. Generated values go
+// only to standard output or --output-file; existing files are never
+// overwritten without --force.
+func Generate(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: hookrelay generate consumer-secret|admin-secret|webhook-id [--output-file path] [--force]")
+		return ExitUsage
+	}
+	kind := args[0]
+	fs := flag.NewFlagSet("hookrelay generate", flag.ContinueOnError)
+	output := fs.String("output-file", "", "write the generated value to this file instead of standard output")
+	force := fs.Bool("force", false, "allow overwriting an existing output file")
+	if err := fs.Parse(args[1:]); err != nil {
+		return ExitUsage
+	}
+
+	var value string
+	switch kind {
+	case "consumer-secret", "admin-secret":
+		v, err := randomSecret()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hookrelay generate: %v\n", err)
+			return ExitError
+		}
+		value = v
+	case "webhook-id":
+		v, err := randomWebhookID()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hookrelay generate: %v\n", err)
+			return ExitError
+		}
+		value = v
+	default:
+		fmt.Fprintf(os.Stderr, "hookrelay generate: unknown kind %q (want consumer-secret, admin-secret, or webhook-id)\n", kind)
+		return ExitUsage
+	}
+
+	if *output == "" {
+		fmt.Fprintln(os.Stdout, value)
+		return ExitOK
+	}
+	if _, err := os.Stat(*output); err == nil && !*force {
+		fmt.Fprintf(os.Stderr, "hookrelay generate: %s already exists (use --force to overwrite)\n", *output)
+		return ExitUsage
+	}
+	if err := os.MkdirAll(filepath.Dir(*output), 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay generate: %v\n", err)
+		return ExitError
+	}
+	if err := os.WriteFile(*output, []byte(value+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay generate: %v\n", err)
+		return ExitError
+	}
+	return ExitOK
+}
+
+// Healthcheck is the container healthcheck: it probes a health endpoint with
+// a short timeout, exits successfully only for a 2xx response, prints nothing
+// on success, and writes a safe diagnostic to standard error on failure.
+func Healthcheck(args []string) int {
+	fs := flag.NewFlagSet("hookrelay healthcheck", flag.ContinueOnError)
+	urlFlag := fs.String("url", "http://127.0.0.1:8081/health/live", "health endpoint to probe")
+	timeout := fs.Duration("timeout", 3*time.Second, "probe timeout")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+
+	client := &http.Client{Timeout: *timeout}
+	resp, err := client.Get(*urlFlag)
+	if err != nil {
+		// Keep the diagnostic minimal; the probe URL is operator-supplied
+		// and must never mask the failure class.
+		fmt.Fprintf(os.Stderr, "hookrelay healthcheck: probe failed: %v\n", err)
+		return ExitError
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		fmt.Fprintf(os.Stderr, "hookrelay healthcheck: endpoint returned %d\n", resp.StatusCode)
+		return ExitError
+	}
+	return ExitOK
+}
