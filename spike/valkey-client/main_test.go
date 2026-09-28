@@ -35,12 +35,12 @@ const (
 	scriptBody = "return {KEYS[1], ARGV[1]}"
 )
 
-func envOr(t *testing.T, key, fallback string) string {
+// requiredEnv returns a mandatory spike environment variable. Callers must
+// first pass the key through requireEnv so the test skips cleanly when the
+// spike environment is absent.
+func requiredEnv(t *testing.T, key string) string {
 	t.Helper()
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return os.Getenv(key)
 }
 
 func requireEnv(t *testing.T, keys ...string) {
@@ -70,7 +70,7 @@ func newMainClient(t *testing.T, mutate func(*valkey.ClientOption)) valkey.Clien
 	t.Helper()
 	requireEnv(t, "HR_SPIKE_ADDR")
 	opt := valkey.ClientOption{
-		InitAddress: []string{envOr(t, "HR_SPIKE_ADDR", "127.0.0.1:3039")},
+		InitAddress: []string{requiredEnv(t, "HR_SPIKE_ADDR")},
 	}
 	if mutate != nil {
 		mutate(&opt)
@@ -252,37 +252,83 @@ func TestServerErrorAndTransportErrorClasses(t *testing.T) {
 
 // --- Timeouts ---------------------------------------------------------------
 
-// TestContextTimeoutOutcomeIsAmbiguous proves that a context timeout while a
-// write command is in flight does NOT prove non-execution: after the server
-// unpauses, the command is found applied. This is the exact reason the design
-// forbids blind retries of uncertain operations.
+// TestContextTimeoutOutcomeIsAmbiguous pins the timeout/ambiguity contract in
+// two deterministic parts:
+//
+//   - Part A: the server holds and then applies a command that arrives during
+//     a client pause — the response is simply late, and the write lands.
+//   - Part B: a context-canceled wait returns a context error, but the
+//     canceled command may have been flushed (applied) or dropped before
+//     flush (never sent) — the client actively drops not-yet-flushed
+//     commands on cancellation, so the outcome is genuinely unknowable from
+//     the error alone.
+//
+// Together these are the exact reason the design forbids blind retries of
+// uncertain operations: a timeout or cancellation never proves
+// non-execution, and it also never proves execution.
 func TestContextTimeoutOutcomeIsAmbiguous(t *testing.T) {
 	requireEnv(t, "HR_SPIKE_ADDR")
 	victim := newMainClient(t, nil)
 	pauser := newMainClient(t, nil)
 	ctx := context.Background()
 
-	// Valkey 9: CLIENT PAUSE <ms> pauses client commands; the pausing
-	// connection itself is unaffected. Verified server-side in the spike.
-	mustDo(t, pauser, pauser.B().ClientPause().Timeout(700).Build())
+	// Warm the victim's connection (lazy dial + handshake) BEFORE any pause:
+	// otherwise the handshake itself is paused and commands never reach the
+	// socket until it lifts.
+	mustDo(t, victim, victim.B().Ping().Build())
 
+	// Part A — the server holds a command sent during the pause and applies
+	// it when the pause lifts; the caller just waits out the response.
+	mustDo(t, pauser, pauser.B().ClientPause().Timeout(900).Build())
 	start := time.Now()
-	reqCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
-	_, err := victim.Do(reqCtx, victim.B().Set().Key("hrspike:paused").Value("applied").Build()).ToMessage()
-	cancel()
+	res, err := victim.Do(ctx, victim.B().Set().Key("hrspike:held").Value("applied").Build()).ToMessage()
 	elapsed := time.Since(start)
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context deadline error, got %v", err)
+	if err != nil {
+		t.Fatalf("held SET failed: %v", err)
 	}
-	if elapsed >= 700*time.Millisecond {
-		t.Fatalf("command returned only after unpause (%v) — timeout not enforced client-side", elapsed)
+	if s, _ := res.ToString(); s != "OK" {
+		t.Fatalf("held SET replied %q", s)
+	}
+	if elapsed < 850*time.Millisecond {
+		t.Fatalf("held SET returned after %v — pause did not hold the command", elapsed)
+	}
+	got := mustDo(t, victim, victim.B().Get().Key("hrspike:held").Build())
+	if s, _ := got.ToString(); s != "applied" {
+		t.Fatalf("held SET was not applied: %q", s)
 	}
 
-	// Wait out the pause, then prove the timed-out command actually executed.
-	time.Sleep(800 * time.Millisecond)
-	got := mustDo(t, victim, victim.B().Get().Key("hrspike:paused").Build())
-	if s, _ := got.ToString(); s != "applied" {
-		t.Fatalf("timed-out SET was not applied: %q", s)
+	// Part B — cancel the wait mid-pause. The error class is context, but
+	// whether the command was flushed is racy: both applied and missing are
+	// acceptable outcomes, and neither is provable from the error.
+	mustDo(t, pauser, pauser.B().ClientPause().Timeout(1200).Build())
+	reqCtx, cancel := context.WithCancel(ctx)
+	resCh := make(chan error, 1)
+	go func() {
+		_, err := victim.Do(reqCtx, victim.B().Set().Key("hrspike:maybe").Value("maybe").Build()).ToMessage()
+		resCh <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	err = <-resCh
+	if err == nil {
+		t.Fatal("expected context error from the cancelled wait")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context deadline/cancel error, got %v", err)
+	}
+
+	// Wait out the pause, then record the unknowable outcome without
+	// asserting which side of the race occurred.
+	time.Sleep(1300 * time.Millisecond)
+	m, gerr := victim.Do(ctx, victim.B().Get().Key("hrspike:maybe").Build()).ToMessage()
+	switch {
+	case valkey.IsValkeyNil(gerr):
+		t.Logf("canceled write outcome: dropped before flush (key absent) — ambiguous as designed")
+	case gerr != nil:
+		t.Fatalf("GET after canceled write: %v", gerr)
+	default:
+		s, _ := m.ToString()
+		t.Logf("canceled write outcome: flushed and applied (key = %q) — ambiguous as designed", s)
 	}
 }
 
@@ -300,7 +346,7 @@ func TestReconnectAfterServerSideClientKill(t *testing.T) {
 	// Establish the pooled connections first.
 	mustDo(t, c, c.B().Ping().Build())
 	killer, err := valkey.NewClient(valkey.ClientOption{
-		InitAddress: []string{envOr(t, "HR_SPIKE_ADDR", "127.0.0.1:3039")},
+		InitAddress: []string{requiredEnv(t, "HR_SPIKE_ADDR")},
 		// The killer must not be killed by TYPE normal; use a dedicated
 		// blocking-pool connection marker via client name and exclude it.
 		ClientName: "hrspike-killer",
@@ -312,8 +358,10 @@ func TestReconnectAfterServerSideClientKill(t *testing.T) {
 	mustDo(t, killer, killer.B().Ping().Build())
 
 	// Kill every normal connection whose name is not the killer's.
-	// valkey-go pipeline connections are unnamed. The listing is a RESP3
-	// verbatim string with a "txt:" prefix on the first line.
+	// The victim client sets no ClientName, so its connections appear
+	// unnamed in CLIENT LIST output (valkey-go applies HELLO SETNAME on
+	// every dial when ClientOption.ClientName is set). The listing is a
+	// RESP3 verbatim string with a "txt:" prefix on the first line.
 	listing := stripVerbatim(mustString(t, killer, killer.B().ClientList().Build()))
 	killed := 0
 	for _, line := range strings.Split(strings.TrimSpace(listing), "\n") {
@@ -430,12 +478,15 @@ func TestConnectionModelLimits(t *testing.T) {
 	}
 
 	// Bounded: PipelineMultiplex=0 → 1 pipeline connection; BlockingPoolSize=2
-	// caps blocking-pool growth; BlockingPoolMinSize=1 prewarms one idle.
+	// caps blocking-pool growth. Connections are fully lazy: BlockingPoolMinSize
+	// does not prewarm connections at construction — it only bounds how many
+	// idle blocking connections survive cleanup.
 	small := newMainClient(t, func(o *valkey.ClientOption) {
 		o.ClientName = "hrspike-obs-small"
 		o.PipelineMultiplex = 0
 		o.BlockingPoolSize = 2
 		o.BlockingPoolMinSize = 1
+		o.BlockingPoolCleanup = time.Second
 	})
 	mustDo(t, small, small.B().Ping().Build())
 	if n := countByName(small, "hrspike-obs-small"); n != 1 {
@@ -455,23 +506,34 @@ func TestConnectionModelLimits(t *testing.T) {
 		}()
 	}
 	bwg.Wait()
+	// The pool must not exceed BlockingPoolSize even under concurrent blocking
+	// calls. After the burst and the cleanup window, blocking-pool connections
+	// are gone again at this API level: Do-level blocking commands (BLPOP) do
+	// not retain pooled connections past use, so BlockingPoolMinSize idle
+	// retention is NOT observable through them. Recorded as an adapter-ticket
+	// finding: the long-poll implementation must verify retention behavior
+	// with Dedicated()/B() connections when it lands.
 	time.Sleep(100 * time.Millisecond)
 	if n := countByName(small, "hrspike-obs-small"); n > 1+2 {
 		t.Errorf("connection count after 5 concurrent blocking calls = %d, want <= 3 (1 pipeline + BlockingPoolSize=2)", n)
+	}
+	time.Sleep(1600 * time.Millisecond)
+	if n := countByName(small, "hrspike-obs-small"); n > 2 {
+		t.Errorf("connection count after cleanup = %d, want <= 2 (pipeline only, blocking pool released; never above 1 pipeline + cap 2)", n)
 	}
 }
 
 // --- Auth + TLS ---------------------------------------------------------------
 
 // TestAuthAndTLSContract runs against the TLS+auth instance: correct
-// credentials over TLS succeed; wrong password fails with a server-error-class
-// WRONGPASS; a wrong CA fails the TLS handshake (transport class, no
-// application error). Missing credentials surface NOAUTH on first use.
+// credentials over TLS succeed; wrong password fails eagerly at construction
+// (WRONGPASS); an unrelated CA fails the TLS handshake (transport class, no
+// application error); missing credentials fail eagerly (NOAUTH).
 func TestAuthAndTLSContract(t *testing.T) {
 	requireEnv(t, "HR_SPIKE_SECURE_ADDR", "HR_SPIKE_SECURE_PASSWORD", "HR_SPIKE_TLS_CA")
-	addr := envOr(t, "HR_SPIKE_SECURE_ADDR", "127.0.0.1:3040")
-	password := envOr(t, "HR_SPIKE_SECURE_PASSWORD", "hr-spike-secret-0f3a9c")
-	caPath := envOr(t, "HR_SPIKE_TLS_CA", "/tmp/hr-spike-tls/ca.crt")
+	addr := requiredEnv(t, "HR_SPIKE_SECURE_ADDR")
+	password := requiredEnv(t, "HR_SPIKE_SECURE_PASSWORD")
+	caPath := requiredEnv(t, "HR_SPIKE_TLS_CA")
 
 	caPEM, err := os.ReadFile(caPath)
 	if err != nil {
@@ -565,7 +627,7 @@ func mustParseCert(t *testing.T, pem []byte) *x509.Certificate {
 // without recreation once space is freed.
 func TestOomUnderNoeviction(t *testing.T) {
 	requireEnv(t, "HR_SPIKE_OOM_ADDR")
-	c := newMainClientT(t, envOr(t, "HR_SPIKE_OOM_ADDR", "127.0.0.1:3041"))
+	c := newMainClientT(t, requiredEnv(t, "HR_SPIKE_OOM_ADDR"))
 	ctx := context.Background()
 
 	value := strings.Repeat("x", 1<<20) // 1 MiB per SET
