@@ -12,7 +12,7 @@ The application builds one executable from:
 cmd/hookrelay/main.go
 ```
 
-It provides the accepted `serve`, `admin`, and `generate` command families. The entry point only delegates to the command and application composition modules; it does not contain HTTP, domain, Valkey, or observability logic.
+It provides the accepted `serve`, `admin`, and `generate` command families plus the `version` and `healthcheck` commands used by releases and containers. The entry point only delegates to the command and application composition modules; it does not contain HTTP, domain, Valkey, or observability logic.
 
 ## Initial module map
 

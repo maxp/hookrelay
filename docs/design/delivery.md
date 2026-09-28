@@ -42,8 +42,8 @@ Rules:
 - cancellation before a lease is created abandons the wait;
 - if lease creation races with disconnect, repeating the same operation recovers the lease;
 - multiple claims under the shared consumer secret are allowed;
-- configurable global limits apply to active consumer leases and waiting claims;
-- initial defaults are 100 active leases and 20 waiting claims;
+- a configurable work-pool-wide limit applies to active consumer leases, while a separate process-local limit applies to waiting HTTP claims;
+- initial defaults are 100 active leases work-pool-wide and 20 waiting claims per process;
 - exceeding either limit returns `429 Too Many Requests` with `Retry-After: 1`;
 - a notification channel may wake polls, but Valkey's ready index is the source of truth and is always rechecked atomically.
 
@@ -82,7 +82,7 @@ Optional absent fields are omitted rather than encoded as `null`.
 
 ## Lease and token semantics
 
-Each Delivery Attempt receives a new opaque cryptographically random Delivery Token with at least 128 bits of entropy. Because every Consumer Instance uses the same configured secret, any authenticated Consumer Instance may acknowledge, negatively acknowledge, or extend any current token. The token is not bound to a particular instance.
+Each Delivery Attempt receives a new opaque cryptographically random Delivery Token with at least 128 bits of entropy. Because every Consumer Instance uses one shared authorization scope, any Consumer Instance authenticated with the currently accepted secret may acknowledge, negatively acknowledge, or extend any current token. The token is not bound to a particular instance or to the literal secret value present when it was claimed: after coordinated secret rotation, the new secret authorizes existing live tokens and the old secret authorizes nothing.
 
 The token is sent in JSON request bodies, never in a URL. It is redacted from logs and is not derivable from `message_id`.
 
@@ -150,10 +150,10 @@ An index entry is only a locator. Every maintenance transition atomically checks
 Maintenance is cooperative: every hookrelay replica may process due entries, and no maintenance leader is elected. Atomic idempotent transitions ensure that only one replica applies a state change. Initial configurable defaults are:
 
 ```text
-maintenance_interval_ms        = 1_000
-maintenance_interval_jitter_ms = 250
-maintenance_batch_size         = 100
-max_continuous_batches         = 5
+maintenance_interval             = 1s
+maintenance_interval_jitter      = 250ms
+maintenance_batch_size           = 100
+maintenance_max_continuous_batches = 5
 ```
 
 Lease expiries and retry activations use separate batches of at most 100 entries. A full batch may trigger another immediate batch, but a replica yields after at most five continuous batches so maintenance does not monopolize Valkey or application capacity.
@@ -170,7 +170,7 @@ Startup reconciliation repairs only safely derivable differences such as missing
 hr1:q:<recipient_identity>
 ```
 
-The marker contains only `detected_ms` and a bounded `reason_code`. While it exists, the Recipient is absent from ready and deadline indexes, cannot be claimed, and cannot accept new messages; affected webhook requests receive a retryable response. Other Recipients continue normally. Hookrelay emits a critical metric and structured log. The first version has no general repair engine or quarantine UI: an operator diagnoses the stored state, performs the documented manual recovery procedure, and removes the marker only after invariants have been verified.
+The marker contains only `detected_ms` and a bounded `reason_code`. While it exists, the Recipient is absent from ready and deadline indexes, cannot be claimed, and cannot accept new messages; affected webhook requests receive a retryable response. Other Recipients continue normally. Hookrelay emits a critical metric and structured log. The first version has no general repair engine or quarantine UI: an operator must follow the recovery runbook, verify the stored-state invariants, and only then remove the marker. The exact runbook is still an explicit open design deliverable and must exist before this recovery path is operated.
 
 Once the corresponding expiry and retry transitions are implemented, after a Valkey restore hookrelay starts not-ready, rebuilds safe derived indexes, processes overdue leases through the normal expiry transition, activates due retries, and creates block markers for ambiguous Recipient state. It becomes ready when general new operations are safe; individual blocked Recipients remain unavailable until operator recovery.
 

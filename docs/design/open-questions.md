@@ -11,7 +11,10 @@ The following questions remain intentionally unresolved. The Milestone 1 choices
 
 - Exact OpenAPI representation for the accepted Consumer and Admin API contracts after DTOs stabilize, and whether later versions need generated clients; neither blocks Milestone 1.
 - Operational procedures for coordinated single-secret rotation of Consumer and Admin secrets.
+- Exact non-plaintext mechanism by which an Admin Secret change invalidates every existing browser session and can be detected/audited; this must be selected before the browser-session slice.
 - Per-operation reconciliation details for later administrative DLQ and session mutations after uncertain Lua execution; the accepted policy already forbids blind retries and false success claims.
+- Milestone 1 interim behavior for a valid claim with `wait_ms > 0`, because the final Consumer API accepts 0–30,000 while long-poll waiting is scheduled for Milestone 3. The milestone must either implement compliant waiting earlier or be explicitly treated as a non-deployable API subset without weakening the final contract.
+- Milestone 1 handling of an active lease that reaches its deadline or survives a process restart before lease-expiry/retry transitions arrive in Milestone 2. This intermediate state must not be represented as production-ready or silently repaired with different attempt semantics.
 
 ## Valkey schema and durability
 

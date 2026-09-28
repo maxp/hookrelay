@@ -145,7 +145,7 @@ The interface through which a queue consumer waits for the next available messag
 _Avoid_: Valkey API, delivery worker
 
 **Message Lease**:
-A time-bounded exclusive claim for the head message of one recipient's delivery queue. Each delivery attempt has a distinct opaque cryptographically random token bound to the consumer credential that claimed it and used to acknowledge, negatively acknowledge, or extend the lease. The lease may be extended only up to its maximum lifetime. After expiry its token is stale, and the message follows the retry policy.
+A time-bounded exclusive claim for the head message of one recipient's delivery queue. Each delivery attempt has a distinct opaque cryptographically random token usable only through the shared authenticated Consumer API scope to acknowledge, negatively acknowledge, or extend the lease. It is not bound to one Consumer Instance or to the literal shared-secret value in effect when the claim was made. The lease may be extended only up to its maximum lifetime. After expiry its token is stale, and the message follows the retry policy.
 _Avoid_: Lock, acknowledgement, message identifier, consumer instance identity
 
 **Acknowledgement**:
@@ -161,7 +161,7 @@ One message lease and its resulting acknowledgement, negative acknowledgement, o
 _Avoid_: Webhook retry, HTTP request, delivery cycle
 
 **Delivery Token**:
-The opaque secret identifying one delivery attempt. It is bound to the consumer credential that claimed the message, is transmitted only in request bodies, and cannot be derived from the message identifier. After acknowledgement, negative acknowledgement, or expiry, its recorded outcome supports idempotent retries for a bounded period.
+The opaque secret identifying one delivery attempt. It is authorized within the shared Consumer API scope, is transmitted only in request bodies, and cannot be derived from the message identifier. Any Consumer Instance authenticated with the currently accepted shared secret may use it; rotating that secret does not itself change or reissue the token. After acknowledgement, negative acknowledgement, or expiry, its recorded outcome supports idempotent retries for a bounded period.
 _Avoid_: Message identifier, consumer credential, URL identifier
 
 **Lease Extension**:

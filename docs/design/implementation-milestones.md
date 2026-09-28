@@ -77,12 +77,12 @@ claim
 → operator replay
 ```
 
-This milestone completes the core ordering and recovery semantics. Startup reconciliation expands to the newly introduced lease, retry, and DLQ state before readiness can be reported; it cannot defer safety for those structures to a later milestone.
+This milestone completes the core ordering and recovery semantics. Startup reconciliation expands from recognizing Milestone 1 lease state to executing the newly implemented lease-expiry, retry, and DLQ recovery transitions before readiness can be reported; it cannot defer safety for those structures to a later milestone.
 
 ## Later milestones
 
 3. Long polling, wake-up notifications, cooperative maintenance, and remaining Admin CRUD/CLI.
-4. Administrative browser sessions, operational UI, audit views, and DLQ operations.
+4. Administrative browser sessions, operational UI, audit views, and the remaining DLQ inspection and permanent-deletion operations; replay already exists from Milestone 2.
 5. Cross-slice reconciliation hardening and recovery tests for the complete first-version storage model; evaluate periodic consistency checking separately after implementation experience. Each earlier milestone extends startup checks as it introduces new persisted state.
 
 The spec and tickets must include the client spike and first-slice script/storage contract before the scaffold and transition code, respectively. Operational backup and restore design remains deferred rather than becoming an implicit first-slice acceptance criterion.

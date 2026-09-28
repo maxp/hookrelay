@@ -172,12 +172,25 @@ HOOKRELAY_MAX_DELIVERY_ATTEMPTS=4
 HOOKRELAY_RETRY_DELAYS=1s,5s,30s
 HOOKRELAY_RETRY_JITTER_MIN=0.5
 HOOKRELAY_RETRY_JITTER_MAX=1.0
+HOOKRELAY_MAX_ACTIVE_LEASES=100
+HOOKRELAY_MAX_WAITING_CLAIMS=20
 ```
 
-The retry-delay count must equal maximum attempts minus one. Jitter satisfies:
+The active-lease limit applies across the shared Valkey-backed work pool. The waiting-claim limit is process-local because waiting HTTP requests live in one hookrelay process; the first version has one process. The retry-delay count must equal maximum attempts minus one. Jitter satisfies:
 
 ```text
 0 <= min <= max <= 1
 ```
+
+## Delivery maintenance
+
+```text
+HOOKRELAY_MAINTENANCE_INTERVAL=1s
+HOOKRELAY_MAINTENANCE_INTERVAL_JITTER=250ms
+HOOKRELAY_MAINTENANCE_BATCH_SIZE=100
+HOOKRELAY_MAINTENANCE_MAX_CONTINUOUS_BATCHES=5
+```
+
+Lease-expiry and retry-activation processing use the same batch-size limit. The inline pre-long-poll maintenance pass remains a fixed maximum of 10 entries in the first version rather than another configuration setting.
 
 All invalid or contradictory configuration is rejected at startup rather than silently corrected.

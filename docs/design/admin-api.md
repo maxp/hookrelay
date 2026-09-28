@@ -42,7 +42,7 @@ with creation, last-seen, idle-expiry, absolute-expiry, and the CSRF token store
 
 `DELETE /admin/v1/session` prioritizes revocation over audit persistence. After confirmed deletion or absence of the session, it clears the cookie and returns `204`; repeating logout also returns `204`. Audit of actual logout and session expiry is best effort and must not prevent revocation or keep an expired session valid. If Valkey is unavailable or revocation cannot be confirmed, logout returns `503` rather than claiming successful server-side revocation.
 
-Login attempts use process-local per-source-IP and global token buckets. Initial limits are 5 attempts per minute with burst 5 per IP and 60 attempts per minute with burst 20 globally. Outcomes are recorded in `hookrelay_admin_login_attempts_total{outcome}` with bounded success, failure, and rate-limited values and without IP labels.
+Login attempts use process-local per-source-IP and global token buckets. Initial limits are 5 attempts per minute with burst 5 per IP and 60 attempts per minute with burst 20 globally. A rejected rate-limited attempt returns `429 rate_limit_exceeded` with a bounded `Retry-After`. If the 100-session capacity is exhausted after expired-session cleanup, a valid new login returns `429 session_capacity_exceeded` without evicting an existing session. Outcomes are recorded in `hookrelay_admin_login_attempts_total{outcome}` with bounded success, failure, and rate-limited values and without IP labels. Failed CSRF or `Origin` validation returns `403 forbidden`.
 
 ## Runtime configuration inspection
 
@@ -244,6 +244,8 @@ invalid_request
 invalid_cursor
 unauthenticated
 forbidden
+rate_limit_exceeded
+session_capacity_exceeded
 webhook_endpoint_not_found
 webhook_identifier_conflict
 unsupported_webhook_type
