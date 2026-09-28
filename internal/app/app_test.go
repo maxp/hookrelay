@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -114,9 +115,9 @@ func TestPublicListenerServesNothingYet(t *testing.T) {
 // cancellation drains without error within the deadline.
 func TestRunGatesPublicListener(t *testing.T) {
 	deps := testDeps(t)
-	gateOK := false
+	gateOK := &atomic.Bool{}
 	deps.Gate = func(context.Context) error {
-		if gateOK {
+		if gateOK.Load() {
 			return nil
 		}
 		return errors.New("gate failed")
@@ -131,10 +132,10 @@ func TestRunGatesPublicListener(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	opened := false
+	opened := &atomic.Bool{}
 	go func() {
 		errCh <- app.Run(ctx, adminLn, func(context.Context) (net.Listener, error) {
-			opened = true
+			opened.Store(true)
 			return net.Listen("tcp", "127.0.0.1:0")
 		})
 	}()
@@ -147,24 +148,24 @@ func TestRunGatesPublicListener(t *testing.T) {
 		t.Fatalf("ready during failed gate: %v %v", resp, err)
 	}
 	resp.Body.Close()
-	if opened {
+	if opened.Load() {
 		t.Fatal("public listener opened before the gate succeeded")
 	}
 
 	// The gate succeeds: readiness flips and the public listener opens.
-	gateOK = true
+	gateOK.Store(true)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := http.Get("http://" + adminLn.Addr().String() + "/health/ready")
 		if err == nil {
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && opened {
+			if resp.StatusCode == http.StatusOK && opened.Load() {
 				break
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if !opened {
+	if !opened.Load() {
 		t.Fatal("public listener did not open after the gate succeeded")
 	}
 
