@@ -6,8 +6,10 @@ package valkey
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"strconv"
@@ -18,34 +20,38 @@ import (
 )
 
 // Script is one versioned Lua contract: its embedded body, the body's local
-// SHA-256 identity digest, and the bounded first-position status codes the
-// typed parser accepts.
+// SHA-256 identity digest, the SHA-1 digest Valkey must report on load, and
+// the bounded first-position status codes with the number of positional
+// fields each carries.
 type Script struct {
-	Name     string
-	Version  int // contract version; the filename suffix must match
-	Body     string
-	BodySHA  string // lowercase hex of the exact embedded body
-	Statuses []string
+	Name    string
+	Version int // contract version; the filename suffix must match
+	Body    string
+	BodySHA string // lowercase hex SHA-256 of the exact embedded body
+	LoadSHA string // lowercase hex SHA-1 of the body: the EVALSHA identity
+	Arity   map[string]int
 }
 
 // registry holds every versioned script by name.
 var registry map[string]*Script
 
-// register embeds a script body and computes its identity digest at init.
-// The version must match the "_v<N>" filename suffix, making changed
-// contracts explicit.
-func register(name string, version int, statusList string) {
+// register embeds a script body and computes its digests at init. The
+// version must match the "_v<N>" filename suffix, making changed contracts
+// explicit. arity maps every accepted status to its positional field count.
+func register(name string, version int, arity map[string]int) {
 	if !strings.HasSuffix(name, "_v"+strconv.Itoa(version)) {
 		panic(fmt.Sprintf("valkey: script %s registry version %d does not match the filename suffix", name, version))
 	}
 	body := mustScript(name)
 	sum := sha256.Sum256([]byte(body))
+	loadSum := sha1.Sum([]byte(body))
 	registry[name] = &Script{
-		Name:     name,
-		Version:  version,
-		Body:     body,
-		BodySHA:  hex.EncodeToString(sum[:]),
-		Statuses: splitStatuses(statusList),
+		Name:    name,
+		Version: version,
+		Body:    body,
+		BodySHA: hex.EncodeToString(sum[:]),
+		LoadSHA: hex.EncodeToString(loadSum[:]),
+		Arity:   arity,
 	}
 }
 
@@ -55,25 +61,6 @@ func mustScript(name string) string {
 		panic(fmt.Sprintf("valkey: embedded script %s: %v", name, err))
 	}
 	return string(body)
-}
-
-func splitStatuses(s string) []string {
-	var out []string
-	cur := ""
-	for _, r := range s {
-		if r == ' ' {
-			if cur != "" {
-				out = append(out, cur)
-				cur = ""
-			}
-			continue
-		}
-		cur += string(r)
-	}
-	if cur != "" {
-		out = append(out, cur)
-	}
-	return out
 }
 
 // Adapter owns the client connection and the loaded script registry.
@@ -126,8 +113,9 @@ func (a *Adapter) Ping(ctx context.Context) error {
 	return nil
 }
 
-// LoadScripts runs SCRIPT LOAD for every registered script and verifies the
-// embedded digest bookkeeping. A load failure fails readiness.
+// LoadScripts runs SCRIPT LOAD for every registered script and verifies that
+// the digest Valkey reports equals the locally computed SHA-1 of the embedded
+// body. A load failure or digest mismatch fails readiness.
 func (a *Adapter) LoadScripts(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -137,13 +125,22 @@ func (a *Adapter) LoadScripts(ctx context.Context) error {
 			return fmt.Errorf("valkey: script load %s: %w", name, err)
 		}
 		sha, err := resp.ToString()
-		if err != nil || sha == "" {
-			return fmt.Errorf("valkey: script load %s: empty digest", name)
+		if err != nil {
+			return fmt.Errorf("valkey: script load %s: digest is not a string: %w", name, err)
 		}
-		a.shaByName[name] = sha
+		if !strings.EqualFold(sha, script.LoadSHA) {
+			return fmt.Errorf("valkey: script load %s: server digest %q does not match embedded body digest %q", name, sha, script.LoadSHA)
+		}
+		a.shaByName[name] = script.LoadSHA
 	}
 	return nil
 }
+
+// ErrNotDispatched marks a RunScript failure that happened before any
+// command was sent: the script certainly did not run. Every other RunScript
+// error is an uncertain outcome — the script may have run, fully or
+// partially — and callers must not report it as a definite failure.
+var ErrNotDispatched = errors.New("valkey: script not dispatched")
 
 // RunScript executes a registered script by EVALSHA with one EVAL reload of
 // the same embedded body on NOSCRIPT. Ambiguous transport errors are returned
@@ -152,13 +149,13 @@ func (a *Adapter) LoadScripts(ctx context.Context) error {
 func (a *Adapter) RunScript(ctx context.Context, name string, keys, args []string) (*Result, error) {
 	script, ok := registry[name]
 	if !ok {
-		return nil, fmt.Errorf("valkey: unknown script %q", name)
+		return nil, fmt.Errorf("%w: unknown script %q", ErrNotDispatched, name)
 	}
 	a.mu.RLock()
 	sha := a.shaByName[name]
 	a.mu.RUnlock()
 	if sha == "" {
-		return nil, fmt.Errorf("valkey: script %s not loaded", name)
+		return nil, fmt.Errorf("%w: script %s not loaded", ErrNotDispatched, name)
 	}
 
 	run := func(evalSHA bool) (*Result, error) {
@@ -176,7 +173,7 @@ func (a *Adapter) RunScript(ctx context.Context, name string, keys, args []strin
 		if err != nil {
 			return nil, err
 		}
-		return parseResult(name, script.Statuses, msg)
+		return parseResult(name, script.Arity, msg)
 	}
 
 	res, err := run(true)

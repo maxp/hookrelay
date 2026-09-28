@@ -3,6 +3,7 @@ package valkey
 import (
 	"embed"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/valkey-io/valkey-go"
@@ -13,27 +14,24 @@ var scriptsFS embed.FS
 
 func init() {
 	registry = map[string]*Script{}
-	register("endpoint_create_v1", 1, "created conflict bot_endpoint_limit wrong_type")
+	register("endpoint_create_v1", 1, map[string]int{
+		"created":            2, // created_ms, updated_ms
+		"conflict":           0,
+		"bot_endpoint_limit": 0,
+		"wrong_type":         0,
+	})
 }
 
 // Result is a typed script result: the bounded status code plus the
 // documented positional fields for that status. The parser rejects unknown
-// statuses and invalid shapes.
+// statuses and tuples whose field count differs from the registered arity.
 type Result struct {
 	Script string
 	Status string
 	Fields []valkey.ValkeyMessage
 }
 
-// Field returns the i-th positional field (0-based, after the status).
-func (r *Result) Field(i int) (valkey.ValkeyMessage, error) {
-	if i < 0 || i >= len(r.Fields) {
-		return valkey.ValkeyMessage{}, fmt.Errorf("valkey: script %s status %s: missing field %d", r.Script, r.Status, i)
-	}
-	return r.Fields[i], nil
-}
-
-func parseResult(script string, statuses []string, msg valkey.ValkeyMessage) (*Result, error) {
+func parseResult(script string, arity map[string]int, msg valkey.ValkeyMessage) (*Result, error) {
 	items, err := msg.ToArray()
 	if err != nil {
 		return nil, fmt.Errorf("valkey: script %s: result is not an array: %w", script, err)
@@ -45,10 +43,17 @@ func parseResult(script string, statuses []string, msg valkey.ValkeyMessage) (*R
 	if err != nil {
 		return nil, fmt.Errorf("valkey: script %s: status is not a string: %w", script, err)
 	}
-	for _, known := range statuses {
-		if status == known {
-			return &Result{Script: script, Status: status, Fields: items[1:]}, nil
+	want, known := arity[status]
+	if !known {
+		statuses := make([]string, 0, len(arity))
+		for s := range arity {
+			statuses = append(statuses, s)
 		}
+		sort.Strings(statuses)
+		return nil, fmt.Errorf("valkey: script %s: unknown status %q (expected one of: %s)", script, status, strings.Join(statuses, ", "))
 	}
-	return nil, fmt.Errorf("valkey: script %s: unknown status %q (expected one of: %s)", script, status, strings.Join(statuses, ", "))
+	if got := len(items) - 1; got != want {
+		return nil, fmt.Errorf("valkey: script %s status %s: invalid shape: %d fields, want %d", script, status, got, want)
+	}
+	return &Result{Script: script, Status: status, Fields: items[1:]}, nil
 }

@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
+
+	"github.com/maxp/hookrelay/internal/observability"
 )
 
 // EndpointView is the safe read model: credential kind and configured state,
@@ -26,46 +30,41 @@ type EndpointView struct {
 
 // Bounded identifier validation from the message contract.
 var (
-	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
-	botIDPattern      = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
+	webhookTypePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+	identifierPattern  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	botIDPattern       = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
 )
 
 // Telegram credential rules from the adapter design.
-const (
-	telegramSecretTokenPattern = `^[A-Za-z0-9_-]{1,256}$`
-	telegramPlatform           = "telegram"
-)
+const telegramPlatform = "telegram"
 
-// CreateWebhook is the validated create use case. It returns the created
-// record and the HTTP-mappable outcome string.
-func (s *Service) CreateWebhook(ctx context.Context, req CreateRequest, requestID string) (Endpoint, error) {
+// maxEndpointsPerBot is the Bot Identity endpoint cap enforced by the
+// endpoint_create_v1 transition.
+const maxEndpointsPerBot = 100
+
+// CreateWebhook is the validated create use case. It returns the safe view
+// of the created endpoint or an apiError.
+func (s *Service) CreateWebhook(ctx context.Context, req CreateRequest, requestID string) (EndpointView, error) {
 	if err := s.validateCreate(req); err != nil {
-		return Endpoint{}, BadRequestError{msg: err.Error()}
+		return EndpointView{}, BadRequestError{msg: err.Error()}
 	}
 
 	platform, kinds, ok := s.catalog.Lookup(req.WebhookType)
 	if !ok {
-		return Endpoint{}, BadRequestError{msg: "unsupported webhook type", code: "unsupported_webhook_type"}
+		return EndpointView{}, BadRequestError{msg: "unsupported webhook type", code: "unsupported_webhook_type"}
 	}
-	kindAllowed := false
-	for _, k := range kinds {
-		if k == req.Credential.Kind {
-			kindAllowed = true
-			break
-		}
+	if !slices.Contains(kinds, req.Credential.Kind) {
+		return EndpointView{}, BadRequestError{msg: "unsupported credential kind", code: "unsupported_credential_kind"}
 	}
-	if !kindAllowed {
-		return Endpoint{}, BadRequestError{msg: "unsupported credential kind", code: "unsupported_credential_kind"}
-	}
-	if err := validateCredentialValue(req.WebhookType, req.Credential.Kind, req.Credential.Value); err != nil {
-		return Endpoint{}, BadRequestError{msg: err.Error()}
+	if err := validateCredentialValue(platform, req.Credential.Kind, req.Credential.Value); err != nil {
+		return EndpointView{}, BadRequestError{msg: err.Error()}
 	}
 
 	identifier := req.WebhookIdentifier
 	if identifier == "" {
 		v, err := s.gen.Base64URL(16)
 		if err != nil {
-			return Endpoint{}, DependencyError{}
+			return EndpointView{}, DependencyError{}
 		}
 		identifier = "wh_" + v
 	}
@@ -80,26 +79,71 @@ func (s *Service) CreateWebhook(ctx context.Context, req CreateRequest, requestI
 		CredentialValue: req.Credential.Value,
 		GenerationID:    s.gen.UUIDv7(),
 	}
-	createdMs, updatedMs, result := s.repo.CreateEndpoint(ctx, e, s.gen.UUIDv7(), "webhook_endpoint_created", requestID)
+	createdMs, updatedMs, result := s.repo.CreateEndpoint(ctx, e, s.gen.UUIDv7(), opWebhookEndpointCreated, requestID)
 	switch result {
 	case CreateOK:
 		e.CreatedMs = createdMs
 		e.UpdatedMs = updatedMs
-		e.ConfigVersion = 1
-		return e, nil
+		e.ConfigVersion = 1 // fixed by the endpoint_create_v1 contract
+		s.metrics.auditEvents.WithLabelValues(opWebhookEndpointCreated, outcomeSuccess).Inc()
+		observability.LogEvent(s.log, slog.LevelInfo, opWebhookEndpointCreated, "webhook endpoint created",
+			"request_id", requestID,
+			"webhook_type", e.Type,
+			"webhook_identifier", e.Identifier,
+			"bot_platform", e.BotPlatform,
+			"bot_id", e.BotID,
+			"credential_kind", e.CredentialKind,
+			"enabled", e.Enabled,
+		)
+		return viewOf(&e), nil
 	case CreateConflict:
-		return Endpoint{}, ConflictError{msg: "webhook identifier already exists", code: "webhook_identifier_conflict"}
+		return EndpointView{}, ConflictError{msg: "webhook identifier already exists", code: "webhook_identifier_conflict"}
 	case CreateBotLimit:
-		return Endpoint{}, ConflictError{msg: "this bot already has 100 webhook endpoints", code: "bot_endpoint_limit_exceeded"}
+		return EndpointView{}, ConflictError{msg: fmt.Sprintf("this bot already has %d webhook endpoints", maxEndpointsPerBot), code: "bot_endpoint_limit_exceeded"}
 	case CreateWrongType:
-		return Endpoint{}, DependencyError{detail: "stored structure has an unexpected type"}
+		s.logCreateFailure(requestID, e, "wrong_type")
+		return EndpointView{}, DependencyError{detail: "stored structure has an unexpected type"}
+	case CreateUncertain:
+		s.logCreateFailure(requestID, e, "outcome_uncertain")
+		return EndpointView{}, DependencyError{detail: "create outcome is uncertain: read the endpoint and audit before retrying"}
 	default:
-		return Endpoint{}, DependencyError{}
+		s.logCreateFailure(requestID, e, "dependency_unavailable")
+		return EndpointView{}, DependencyError{}
 	}
 }
 
-// GetWebhook returns the safe read model for one endpoint.
+// logCreateFailure records a bounded error event for a create that could not
+// be confirmed. It never carries the credential value.
+func (s *Service) logCreateFailure(requestID string, e Endpoint, reason string) {
+	observability.LogEvent(s.log, slog.LevelError, "webhook_endpoint_create_failed", "webhook endpoint create not confirmed",
+		"request_id", requestID,
+		"webhook_type", e.Type,
+		"webhook_identifier", e.Identifier,
+		"error_code", "dependency_unavailable",
+		"reason_code", reason,
+	)
+}
+
+// recordRejectedAuth appends the best-effort rejected-authentication audit
+// event and counts its outcome. It never changes the refusal.
+func (s *Service) recordRejectedAuth(ctx context.Context, requestID string) {
+	if s.audit == nil {
+		return
+	}
+	if err := s.audit.AppendRejectedAuth(ctx, s.gen.UUIDv7(), requestID, "admin_api"); err != nil {
+		s.metrics.auditWriteFailures.WithLabelValues(opAdminAuthRejected).Inc()
+		return
+	}
+	s.metrics.auditEvents.WithLabelValues(opAdminAuthRejected, outcomeFailure).Inc()
+}
+
+// GetWebhook returns the safe read model for one endpoint. The Bot Platform
+// is not stored; it is derived from the one-to-one Webhook Type mapping.
 func (s *Service) GetWebhook(ctx context.Context, webhookType, identifier string) (EndpointView, error) {
+	platform, _, ok := s.catalog.Lookup(webhookType)
+	if !ok {
+		return EndpointView{}, NotFoundError{}
+	}
 	e, err := s.repo.GetEndpoint(ctx, webhookType, identifier)
 	if err != nil {
 		if errors.Is(err, ErrStoredWrongType) {
@@ -110,6 +154,12 @@ func (s *Service) GetWebhook(ctx context.Context, webhookType, identifier string
 	if e == nil {
 		return EndpointView{}, NotFoundError{}
 	}
+	e.BotPlatform = platform
+	return viewOf(e), nil
+}
+
+// viewOf maps a stored record to the safe read model.
+func viewOf(e *Endpoint) EndpointView {
 	return EndpointView{
 		Type:           e.Type,
 		Identifier:     e.Identifier,
@@ -122,7 +172,7 @@ func (s *Service) GetWebhook(ctx context.Context, webhookType, identifier string
 		ConfigVersion:  e.ConfigVersion,
 		CreatedMs:      e.CreatedMs,
 		UpdatedMs:      e.UpdatedMs,
-	}, nil
+	}
 }
 
 // validateCreate enforces the bounded request validation.
@@ -140,7 +190,7 @@ func (s *Service) validateCreate(req CreateRequest) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
 	}
-	if !isValidWebhookType(req.WebhookType) {
+	if !webhookTypePattern.MatchString(req.WebhookType) {
 		return fmt.Errorf("webhook_type must match [a-z][a-z0-9_-]{0,31}")
 	}
 	if req.WebhookIdentifier != "" && !identifierPattern.MatchString(req.WebhookIdentifier) {
@@ -152,27 +202,11 @@ func (s *Service) validateCreate(req CreateRequest) error {
 	return nil
 }
 
-func isValidWebhookType(t string) bool {
-	if len(t) == 0 || len(t) > 32 {
-		return false
-	}
-	if t[0] < 'a' || t[0] > 'z' {
-		return false
-	}
-	for i := 1; i < len(t); i++ {
-		c := t[i]
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
-			return false
-		}
-	}
-	return true
-}
-
-func validateCredentialValue(webhookType, kind, value string) error {
+func validateCredentialValue(platform, kind, value string) error {
 	if len(value) < 1 || len(value) > 8192 {
 		return fmt.Errorf("credential.value must be 1–8192 bytes")
 	}
-	if webhookType == telegramPlatform && kind == "secret_token" {
+	if platform == telegramPlatform && kind == "secret_token" {
 		// 1–256 characters from A-Z, a-z, 0-9, _, and -.
 		if len(value) > 256 {
 			return fmt.Errorf("telegram secret_token must be 1–256 characters")

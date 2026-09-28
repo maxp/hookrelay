@@ -2,6 +2,7 @@ package valkey
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -218,21 +219,58 @@ func TestCreateEndpointTuplesAndKeys(t *testing.T) {
 	if got, err := a.GetEndpoint(ctx, "telegram", "wh_over"); err != nil || got != nil {
 		t.Errorf("over-limit endpoint stored: %v %v", got, err)
 	}
+	for key, want := range map[string]int64{
+		"hr1:bot:telegram:123456789:webhooks": 100,
+		"hr1:webhooks":                        100,
+		auditKey:                              100,
+	} {
+		if got := cardinality(t, a, key); got != want {
+			t.Errorf("over-limit create changed %s: %d members, want %d", key, got, want)
+		}
+	}
 
-	// Wrong type: poison the bot set key, expect wrong_type and no writes.
-	flushAll(t, a)
-	if _, err := a.client.Do(ctx, a.client.B().Set().Key("hr1:bot:telegram:123456789:webhooks").Value("poison").Build()).ToMessage(); err != nil {
+	// Wrong type: poison each key in turn, expect wrong_type and no writes
+	// to any of the other keys.
+	keys := map[string]string{
+		"endpoint": "hr1:wh:telegram:wh_test1",
+		"bot":      "hr1:bot:telegram:123456789:webhooks",
+		"listing":  "hr1:webhooks",
+		"audit":    auditKey,
+	}
+	for name, poisoned := range keys {
+		flushAll(t, a)
+		if _, err := a.client.Do(ctx, a.client.B().Set().Key(poisoned).Value("poison").Build()).ToMessage(); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, r := a.CreateEndpoint(ctx, endpointFixture(), "event-3", "webhook_endpoint_created", "req-3"); r != CreateWrongType {
+			t.Errorf("poisoned %s: create = %s, want wrong_type", name, r)
+		}
+		if n, _ := a.client.Do(ctx, a.client.B().Dbsize().Build()).ToMessage(); nInt(n) != 1 {
+			t.Errorf("poisoned %s: %d keys after refusal, want only the poisoned key", name, nInt(n))
+		}
+	}
+}
+
+// cardinality returns the member count of a Set, Sorted Set, or Stream key.
+func cardinality(t *testing.T, a *Adapter, key string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	kind, err := a.keyType(ctx, key)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, r := a.CreateEndpoint(ctx, endpointFixture(), "event-3", "webhook_endpoint_created", "req-3"); r != CreateWrongType {
-		t.Fatalf("poisoned key create = %s, want wrong_type", r)
+	var cmd = a.client.B().Scard().Key(key).Build()
+	switch kind {
+	case "zset":
+		cmd = a.client.B().Zcard().Key(key).Build()
+	case "stream":
+		cmd = a.client.B().Xlen().Key(key).Build()
 	}
-	if got, err := a.GetEndpoint(ctx, "telegram", "wh_test1"); err != nil || got != nil {
-		t.Errorf("wrong_type path stored the endpoint: %v %v", got, err)
+	n, err := a.client.Do(ctx, cmd).ToMessage()
+	if err != nil {
+		t.Fatalf("cardinality %s: %v", key, err)
 	}
-	if n, _ := a.client.Do(ctx, a.client.B().Xlen().Key("hr1:audit").Build()).ToMessage(); nInt(n) != 0 {
-		t.Errorf("wrong_type path appended audit events: %d", nInt(n))
-	}
+	return nInt(n)
 }
 
 // TestGetEndpointAbsenceAndWrongType covers the read path statuses.
@@ -269,7 +307,7 @@ func TestParserRejectsUnknownStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msg); err == nil || !strings.Contains(err.Error(), "unknown status") {
+	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Arity, msg); err == nil || !strings.Contains(err.Error(), "unknown status") {
 		t.Fatalf("unknown status accepted: %v", err)
 	}
 
@@ -279,7 +317,7 @@ func TestParserRejectsUnknownStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msgInt); err == nil || !strings.Contains(err.Error(), "not an array") {
+	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Arity, msgInt); err == nil || !strings.Contains(err.Error(), "not an array") {
 		t.Fatalf("non-array result accepted: %v", err)
 	}
 
@@ -289,30 +327,84 @@ func TestParserRejectsUnknownStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msgEmpty); err == nil || !strings.Contains(err.Error(), "empty result") {
+	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Arity, msgEmpty); err == nil || !strings.Contains(err.Error(), "empty result") {
 		t.Fatalf("empty result accepted: %v", err)
 	}
 
-	// Shape rejection: a known status with missing positional fields is
-	// refused at Field access.
-	shortArr := client.Do(ctx, client.B().Arbitrary("EVAL", `return {'created'}`, "0").Build())
-	msgShort, err := shortArr.ToMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msgShort)
-	if err != nil {
-		t.Fatalf("short tuple should parse, fields rejected later: %v", err)
-	}
-	if _, err := res.Field(0); err == nil {
-		t.Fatal("missing positional field accepted")
+	// Shape rejection: a known status whose field count differs from the
+	// registered arity is refused by the parser itself.
+	for _, body := range []string{
+		`return {'created'}`,
+		`return {'created', 1, 2, 3}`,
+		`return {'conflict', 1}`,
+	} {
+		msg, err := client.Do(ctx, client.B().Arbitrary("EVAL", body, "0").Build()).ToMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Arity, msg); err == nil || !strings.Contains(err.Error(), "invalid shape") {
+			t.Errorf("%s: wrong-arity tuple accepted: %v", body, err)
+		}
 	}
 
 	// Registry contract: versions match filename suffixes and digests are set.
 	for name, s := range registry {
-		if s.Version < 1 || s.BodySHA == "" {
-			t.Errorf("script %s: incomplete registry entry (version %d, sha %q)", name, s.Version, s.BodySHA)
+		if s.Version < 1 || len(s.BodySHA) != 64 || len(s.LoadSHA) != 40 || len(s.Arity) == 0 {
+			t.Errorf("script %s: incomplete registry entry (version %d, sha256 %q, sha1 %q)", name, s.Version, s.BodySHA, s.LoadSHA)
 		}
+	}
+}
+
+// TestScriptLoadVerifiesDigest pins that the digest Valkey reports equals
+// the locally computed digest of the embedded body.
+func TestScriptLoadVerifiesDigest(t *testing.T) {
+	a := testAdapter(t, false)
+	gate(t, a, false)
+	for name, s := range registry {
+		if got := a.shaByName[name]; got != s.LoadSHA {
+			t.Errorf("script %s loaded as %q, want embedded digest %q", name, got, s.LoadSHA)
+		}
+	}
+}
+
+// TestCreateBeforeScriptLoadIsDefiniteFailure pins that a script that was
+// never dispatched is a definite dependency failure, not an uncertain one.
+func TestCreateBeforeScriptLoadIsDefiniteFailure(t *testing.T) {
+	a := testAdapter(t, false)
+	flushAll(t, a)
+	if _, _, r := a.CreateEndpoint(context.Background(), endpointFixture(), "event-1", "webhook_endpoint_created", "req-1"); r != CreateUnavailable {
+		t.Fatalf("create without loaded scripts = %s, want %s", r, CreateUnavailable)
+	}
+}
+
+// TestCreateScriptRejectsInvalidArguments pins argument validation before
+// the first write: a malformed call errors out and leaves no keys behind.
+func TestCreateScriptRejectsInvalidArguments(t *testing.T) {
+	a := testAdapter(t, false)
+	ctx := context.Background()
+	flushAll(t, a)
+	gate(t, a, false)
+
+	keys := []string{"hr1:wh:telegram:wh_a", "hr1:bot:telegram:1:webhooks", "hr1:webhooks", auditKey}
+	valid := []string{"telegram", "wh_a", "telegram", "1", "1", "secret_token", "value", "gen", "event", "op", "req"}
+	with := func(i int, v string) []string {
+		args := append([]string(nil), valid...)
+		args[i] = v
+		return args
+	}
+	for name, args := range map[string][]string{
+		"too few arguments": valid[:10],
+		"empty argument":    with(6, ""),
+		"enabled not 0/1":   with(4, "true"),
+		"key mismatch":      with(1, "wh_b"),
+	} {
+		_, err := a.RunScript(ctx, "endpoint_create_v1", keys, args)
+		if err == nil || errors.Is(err, ErrNotDispatched) {
+			t.Errorf("%s: err = %v, want a script error", name, err)
+		}
+	}
+	if n, _ := a.client.Do(ctx, a.client.B().Dbsize().Build()).ToMessage(); nInt(n) != 0 {
+		t.Errorf("rejected arguments left %d keys behind", nInt(n))
 	}
 }
 

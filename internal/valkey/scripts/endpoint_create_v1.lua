@@ -1,6 +1,6 @@
 -- endpoint_create_v1: create one Webhook Endpoint with its mandatory
--- administrative audit append in one atomic operation. Validates key types
--- and preconditions before any write; Valkey TIME is authoritative for
+-- administrative audit append in one atomic operation. Validates arguments,
+-- key types, and preconditions before any write; Valkey TIME is authoritative for
 -- created_ms, updated_ms, and the audit timestamp.
 --
 -- KEYS[1] endpoint hash   hr1:wh:<webhook_type>:<webhook_identifier>
@@ -25,6 +25,24 @@
 --   {"conflict"}                                   endpoint already exists
 --   {"bot_endpoint_limit"}                         bot set at the 100 cap
 --   {"wrong_type"}                                 a key has an unexpected type
+
+-- Argument validation before any read or write. A violation is a caller
+-- bug, reported as a script error rather than a bounded status.
+if #KEYS ~= 4 or #ARGV ~= 11 then
+  return redis.error_reply('ERR endpoint_create_v1: expected 4 keys and 11 arguments')
+end
+for i = 1, #ARGV do
+  if ARGV[i] == '' then
+    return redis.error_reply('ERR endpoint_create_v1: argument ' .. i .. ' is empty')
+  end
+end
+if ARGV[5] ~= '0' and ARGV[5] ~= '1' then
+  return redis.error_reply('ERR endpoint_create_v1: enabled must be 0 or 1')
+end
+if KEYS[1] ~= 'hr1:wh:' .. ARGV[1] .. ':' .. ARGV[2]
+    or KEYS[2] ~= 'hr1:bot:' .. ARGV[3] .. ':' .. ARGV[4] .. ':webhooks' then
+  return redis.error_reply('ERR endpoint_create_v1: keys do not match the endpoint identity')
+end
 
 local endpointKey = KEYS[1]
 local botKey = KEYS[2]

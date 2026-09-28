@@ -146,14 +146,19 @@ func Serve(args []string) int {
 	}
 	defer adapter.Close()
 
-	catalog := typeCatalog{registry: types}
-	svc := administration.NewService(
-		valkey.NewEndpointStore(adapter),
-		catalog,
-		valkey.NewAuditSink(adapter),
-		adminSecret,
-		gen.Crypto{},
-	)
+	svc, err := administration.NewService(administration.ServiceDeps{
+		Repo:        valkey.NewEndpointStore(adapter),
+		Catalog:     typeCatalog{registry: types},
+		Audit:       valkey.NewAuditSink(adapter),
+		AdminSecret: adminSecret,
+		Gen:         gen.Crypto{},
+		Logger:      log,
+		Registerer:  registry,
+	})
+	if err != nil {
+		log.Error("administration wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
 
 	readiness := &app.Readiness{}
 	gate := func(ctx context.Context) error {
@@ -166,7 +171,7 @@ func Serve(args []string) int {
 		Logger:    log,
 		Registry:  registry,
 		Readiness: readiness,
-		AdminAPI:  administration.Handler(svc, gen.Crypto{}),
+		AdminAPI:  administration.Handler(svc),
 		Gate:      gate,
 	})
 

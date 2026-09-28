@@ -84,7 +84,7 @@ func (a *Adapter) configGet(ctx context.Context, params ...string) (map[string]s
 // readiness.
 func (a *Adapter) checkStructures(ctx context.Context) error {
 	for key, allowed := range map[string][]string{
-		"hr1:audit":    {"none", "stream"},
+		auditKey:       {"none", "stream"},
 		"hr1:webhooks": {"none", "zset"},
 	} {
 		t, err := a.keyType(ctx, key)

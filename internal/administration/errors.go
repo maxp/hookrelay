@@ -1,11 +1,25 @@
 package administration
 
-import "fmt"
+import (
+	"fmt"
+	"net/http"
+)
 
-// BadRequestError maps to 400 invalid_request (or the given bounded code).
+// apiError is a use-case or transport failure with its bounded error code
+// and HTTP status. Every error type below implements it, so the transport
+// maps failures in one place.
+type apiError interface {
+	error
+	ErrorCode() string
+	HTTPStatus() int
+}
+
+// BadRequestError maps to 400 invalid_request, or to the given bounded code
+// and status (413 request_too_large, 415 unsupported_media_type).
 type BadRequestError struct {
-	msg  string
-	code string
+	msg    string
+	code   string
+	status int
 }
 
 func (e BadRequestError) Error() string { return e.msg }
@@ -15,12 +29,19 @@ func (e BadRequestError) ErrorCode() string {
 	}
 	return "invalid_request"
 }
+func (e BadRequestError) HTTPStatus() int {
+	if e.status != 0 {
+		return e.status
+	}
+	return http.StatusBadRequest
+}
 
 // NotFoundError maps to 404 webhook_endpoint_not_found.
 type NotFoundError struct{}
 
 func (NotFoundError) Error() string     { return "webhook endpoint not found" }
 func (NotFoundError) ErrorCode() string { return "webhook_endpoint_not_found" }
+func (NotFoundError) HTTPStatus() int   { return http.StatusNotFound }
 
 // ConflictError maps to 409 with its bounded code.
 type ConflictError struct {
@@ -35,6 +56,7 @@ func (e ConflictError) ErrorCode() string {
 	}
 	return "internal_error"
 }
+func (ConflictError) HTTPStatus() int { return http.StatusConflict }
 
 // DependencyError maps to 503 dependency_unavailable. detail never carries
 // credential or key material.
@@ -49,9 +71,11 @@ func (e DependencyError) Error() string {
 	return "dependency unavailable"
 }
 func (DependencyError) ErrorCode() string { return "dependency_unavailable" }
+func (DependencyError) HTTPStatus() int   { return http.StatusServiceUnavailable }
 
 // UnexpectedError maps to 500 internal_error.
 type UnexpectedError struct{ Err error }
 
 func (e UnexpectedError) Error() string   { return fmt.Sprintf("internal error: %v", e.Err) }
 func (UnexpectedError) ErrorCode() string { return "internal_error" }
+func (UnexpectedError) HTTPStatus() int   { return http.StatusInternalServerError }

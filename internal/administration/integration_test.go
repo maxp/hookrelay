@@ -97,10 +97,7 @@ func TestAdminCreateGetOverRealValkey(t *testing.T) {
 	a := testAdapter(t, false)
 	flushAll(t, a)
 
-	repo := valkey.NewEndpointStore(a)
-	audit := valkey.NewAuditSink(a)
-	svc := administration.NewService(repo, builtinCatalog{}, audit, "admin-secret-value-016", gen.Crypto{})
-	h := administration.Handler(svc, gen.Crypto{})
+	h := composedHandler(t, a)
 
 	// Create through HTTP.
 	rec := doJSON(t, h, http.MethodPost, "/admin/v1/webhooks", "admin-secret-value-016", validCreate)
@@ -133,6 +130,12 @@ func TestAdminCreateGetOverRealValkey(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "telegram-secret-001") {
 		t.Error("credential value leaked in read response")
+	}
+	var read struct {
+		BotPlatform string `json:"bot_platform"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &read); err != nil || read.BotPlatform != "telegram" {
+		t.Errorf("read bot_platform = %q (%v), want telegram", read.BotPlatform, err)
 	}
 
 	// The create appended exactly one audit event for this endpoint.
@@ -178,9 +181,7 @@ func TestAdminCreateGetOverRealValkey(t *testing.T) {
 	// Restart persistence: a fresh adapter over the same Valkey still serves
 	// the endpoint and the audit history is intact.
 	reopened := testAdapter(t, false)
-	repo2 := valkey.NewEndpointStore(reopened)
-	svc2 := administration.NewService(repo2, builtinCatalog{}, valkey.NewAuditSink(reopened), "admin-secret-value-016", gen.Crypto{})
-	h2 := administration.Handler(svc2, gen.Crypto{})
+	h2 := composedHandler(t, reopened)
 	rec = doJSON(t, h2, http.MethodGet, "/admin/v1/webhooks/telegram/"+created.WebhookIdentifier, "admin-secret-value-016", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("post-restart get = %d: %s", rec.Code, rec.Body.String())
@@ -188,6 +189,23 @@ func TestAdminCreateGetOverRealValkey(t *testing.T) {
 	if rec.Header().Get("ETag") != wantETag {
 		t.Errorf("post-restart ETag = %q", rec.Header().Get("ETag"))
 	}
+}
+
+// composedHandler wires the administrative HTTP handler over the real
+// adapter, mirroring the application composition.
+func composedHandler(t *testing.T, a *valkey.Adapter) http.Handler {
+	t.Helper()
+	svc, err := administration.NewService(administration.ServiceDeps{
+		Repo:        valkey.NewEndpointStore(a),
+		Catalog:     builtinCatalog{},
+		Audit:       valkey.NewAuditSink(a),
+		AdminSecret: "admin-secret-value-016",
+		Gen:         gen.Crypto{},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	return administration.Handler(svc)
 }
 
 // builtinCatalog adapts the ingestion registry to the narrow TypeCatalog

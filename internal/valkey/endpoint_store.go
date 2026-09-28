@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/maxp/hookrelay/internal/administration"
@@ -31,6 +32,9 @@ type Endpoint struct {
 // current slice does not repair.
 var ErrWrongType = errors.New("valkey: stored structure has an unexpected type")
 
+// auditKey is the administrative audit Stream.
+const auditKey = "hr1:audit"
+
 // CreateEndpointResult is the bounded outcome of the create transition.
 type CreateEndpointResult string
 
@@ -40,6 +44,10 @@ const (
 	CreateBotLimit    CreateEndpointResult = "bot_endpoint_limit"
 	CreateWrongType   CreateEndpointResult = "wrong_type"
 	CreateUnavailable CreateEndpointResult = "dependency_unavailable"
+	// CreateUncertain: the script may have run, fully or partially. Neither
+	// success nor failure may be reported; the caller reconciles by reading
+	// persisted state and audit.
+	CreateUncertain CreateEndpointResult = "uncertain"
 )
 
 // CreateEndpoint runs the endpoint_create_v1 transition: endpoint Hash, Bot
@@ -54,7 +62,7 @@ func (a *Adapter) CreateEndpoint(ctx context.Context, e Endpoint, eventID, opera
 		"hr1:wh:" + e.Type + ":" + e.Identifier,
 		"hr1:bot:" + e.BotPlatform + ":" + e.BotID + ":webhooks",
 		"hr1:webhooks",
-		"hr1:audit",
+		auditKey,
 	}
 	args := []string{
 		e.Type,
@@ -72,50 +80,51 @@ func (a *Adapter) CreateEndpoint(ctx context.Context, e Endpoint, eventID, opera
 
 	res, err := a.RunScript(ctx, "endpoint_create_v1", keys, args)
 	if err != nil {
-		return 0, 0, CreateUnavailable
+		if errors.Is(err, ErrNotDispatched) {
+			return 0, 0, CreateUnavailable
+		}
+		return 0, 0, CreateUncertain
 	}
 	switch CreateEndpointResult(res.Status) {
 	case CreateOK:
-		created, err1 := res.Field(0)
-		updated, err2 := res.Field(1)
+		// The parser guarantees both positional fields; a non-integer value
+		// still means the script ran, so the outcome is uncertain.
+		c, err1 := res.Fields[0].AsInt64()
+		u, err2 := res.Fields[1].AsInt64()
 		if err1 != nil || err2 != nil {
-			return 0, 0, CreateUnavailable
-		}
-		c, err1 := created.AsInt64()
-		u, err2 := updated.AsInt64()
-		if err1 != nil || err2 != nil {
-			return 0, 0, CreateUnavailable
+			return 0, 0, CreateUncertain
 		}
 		return c, u, CreateOK
 	case CreateConflict, CreateBotLimit, CreateWrongType:
 		return 0, 0, CreateEndpointResult(res.Status)
 	default:
-		return 0, 0, CreateUnavailable
+		return 0, 0, CreateUncertain
 	}
 }
 
-// GetEndpoint reads one endpoint. It returns (nil, nil) when absent.
+// GetEndpoint reads one endpoint in a single HGETALL. It returns (nil, nil)
+// when absent. BotPlatform is not stored; the caller derives it from the
+// Webhook Type mapping.
 func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier string) (*Endpoint, error) {
 	key := "hr1:wh:" + webhookType + ":" + identifier
-	t, err := a.keyType(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	switch t {
-	case "none":
-		return nil, nil
-	case "hash":
-	default:
-		return nil, ErrWrongType
-	}
-
 	msg, err := a.client.Do(ctx, a.client.B().Hgetall().Key(key).Build()).ToMessage()
 	if err != nil {
+		if isWrongType(err) {
+			return nil, ErrWrongType
+		}
 		return nil, fmt.Errorf("valkey: hgetall %s: %w", key, err)
 	}
 	fields, err := msg.AsStrMap()
 	if err != nil {
 		return nil, fmt.Errorf("valkey: hgetall %s shape: %w", key, err)
+	}
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	for _, required := range []string{"bot_id", "enabled", "credential_kind", "credential_value", "generation_id"} {
+		if fields[required] == "" {
+			return nil, fmt.Errorf("valkey: %s: missing field %s", key, required)
+		}
 	}
 	e := &Endpoint{
 		Type:            webhookType,
@@ -138,25 +147,35 @@ func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier strin
 	return e, nil
 }
 
+// isWrongType reports a Valkey WRONGTYPE server error.
+func isWrongType(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "WRONGTYPE")
+}
+
 // AppendRejectedAuth records a rejected administrative authentication attempt
-// in the audit stream, best effort: failures are swallowed because rejected
-// authentication stays rejected regardless of audit availability. The
-// timestamp uses authoritative Valkey TIME, matching the Lua-path entries.
-func (a *Adapter) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) {
+// in the audit stream, best effort: the caller counts the returned error but
+// never changes the refusal. The timestamp uses authoritative Valkey TIME,
+// matching the Lua-path entries; without it nothing is appended rather than
+// an entry with a fabricated timestamp.
+func (a *Adapter) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) error {
 	auditCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	timestampMs := int64(0)
-	if msg, err := a.client.Do(auditCtx, a.client.B().Time().Build()).ToMessage(); err == nil {
-		if parts, err := msg.ToArray(); err == nil && len(parts) == 2 {
-			sec, e1 := parts[0].AsInt64()
-			usec, e2 := parts[1].AsInt64()
-			if e1 == nil && e2 == nil {
-				timestampMs = sec*1000 + usec/1000
-			}
-		}
+	msg, err := a.client.Do(auditCtx, a.client.B().Time().Build()).ToMessage()
+	if err != nil {
+		return fmt.Errorf("valkey: audit time: %w", err)
 	}
-	a.client.Do(auditCtx, a.client.B().Arbitrary(
-		"XADD", "hr1:audit", "MAXLEN", "~", "1000000", "*",
+	parts, err := msg.ToArray()
+	if err != nil || len(parts) != 2 {
+		return fmt.Errorf("valkey: audit time shape")
+	}
+	sec, e1 := parts[0].AsInt64()
+	usec, e2 := parts[1].AsInt64()
+	if e1 != nil || e2 != nil {
+		return fmt.Errorf("valkey: audit time shape")
+	}
+	timestampMs := sec*1000 + usec/1000
+	_, err = a.client.Do(auditCtx, a.client.B().Arbitrary(
+		"XADD", auditKey, "MAXLEN", "~", "1000000", "*",
 		"event_id", eventID,
 		"timestamp_ms", strconv.FormatInt(timestampMs, 10),
 		"actor", "admin_bearer",
@@ -164,7 +183,11 @@ func (a *Adapter) AppendRejectedAuth(ctx context.Context, eventID, requestID, ta
 		"target", target,
 		"request_id", requestID,
 		"outcome", "failure",
-	).Build())
+	).Build()).ToMessage()
+	if err != nil {
+		return fmt.Errorf("valkey: audit xadd: %w", err)
+	}
+	return nil
 }
 
 // --- administration glue -----------------------------------------------------
@@ -198,8 +221,10 @@ func (s *endpointStore) CreateEndpoint(ctx context.Context, e administration.End
 		return 0, 0, administration.CreateBotLimit
 	case CreateWrongType:
 		return 0, 0, administration.CreateWrongType
-	default:
+	case CreateUnavailable:
 		return 0, 0, administration.CreateUnavailable
+	default:
+		return 0, 0, administration.CreateUncertain
 	}
 }
 
@@ -234,15 +259,15 @@ type auditSink struct{ a *Adapter }
 // NewAuditSink returns the administration best-effort audit implementation.
 func NewAuditSink(a *Adapter) administration.AuditSink { return &auditSink{a: a} }
 
-func (s *auditSink) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) {
-	s.a.AppendRejectedAuth(ctx, eventID, requestID, target)
+func (s *auditSink) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) error {
+	return s.a.AppendRejectedAuth(ctx, eventID, requestID, target)
 }
 
 // AuditEntries reads the bounded recent administrative audit stream. It backs
 // the later audit listing surfaces and gives integration tests one seam for
 // asserting exactly-once audit behavior.
 func (a *Adapter) AuditEntries(ctx context.Context, count int64) ([]map[string]string, error) {
-	msg, err := a.client.Do(ctx, a.client.B().Xrange().Key("hr1:audit").Start("-").End("+").Count(count).Build()).ToMessage()
+	msg, err := a.client.Do(ctx, a.client.B().Xrange().Key(auditKey).Start("-").End("+").Count(count).Build()).ToMessage()
 	if err != nil {
 		return nil, fmt.Errorf("valkey: audit xrange: %w", err)
 	}
