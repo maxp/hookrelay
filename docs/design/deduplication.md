@@ -22,7 +22,7 @@ The SHA-256 input is the exact limited HTTP request body. It is calculated durin
 
 The same request-body digest is recorded to detect a conflicting duplicate: the same Deduplication Identity with different bytes remains a duplicate, is not enqueued again, and increments a conflict metric with a safe structured log.
 
-Chat-, bot-, and relay-scoped messages all use the same deduplication process.
+Chat-, user-, bot-, and relay-scoped messages all use the same deduplication process.
 
 ## Atomic acceptance
 

@@ -12,7 +12,7 @@ The secret is sent as an HTTP Bearer token, compared in constant time, and never
 
 Delivery is at least once. Hookrelay guarantees that message `N+1` is not issued for a Recipient until message `N` is acknowledged or moved to dead-letter. It cannot guarantee the order of external effects after a lease is lost, so consumers must be idempotent and must stop or fence work when they lose a lease.
 
-Recipient selection is approximate round-robin with no priorities. A Recipient with remaining work returns to the end of the ready index. Chat-, bot-, and relay-scoped queues participate equally. Retry backoff removes a Recipient from the ready index until its head becomes eligible again.
+Recipient selection is approximate round-robin with no priorities. A Recipient with remaining work returns to the end of the ready index. Chat-, user-, bot-, and relay-scoped queues participate equally. Retry backoff removes a Recipient from the ready index until its head becomes eligible again.
 
 ## Consumer API
 
@@ -36,8 +36,9 @@ Rules:
 - default and maximum wait are 30 seconds;
 - an empty completed poll returns `204 No Content`;
 - `operation_id` is a consumer-generated UUIDv7 unique within the shared consumer authorization scope;
-- repeating the same operation returns the same message and Delivery Token, or the same empty outcome;
-- claim results are retained for 10 minutes;
+- repeating the same operation returns the same empty outcome, or the same message and Delivery Token only while the claimed Delivery Attempt remains active;
+- after acknowledgement, negative acknowledgement, or expiry, repeating the claim operation returns `409 claim_no_longer_active` and never creates a new lease;
+- claim operation markers are retained for 10 minutes;
 - cancellation before a lease is created abandons the wait;
 - if lease creation races with disconnect, repeating the same operation recovers the lease;
 - multiple claims under the shared consumer secret are allowed;
@@ -163,15 +164,15 @@ Before a claim enters long polling with an empty ready index, it performs one in
 
 Canonical Messages, each Recipient's ordered message sequence, queue-head state, the current Delivery Attempt, Delivery Cycle history, and dead-letter entries are authoritative state. Ready, lease-deadline, retry-deadline, global dead-letter, and deduplication indexes are derived accelerators and must be rebuildable from authoritative state.
 
-Startup reconciliation repairs only safely derivable differences such as missing or stale ready and deadline index entries. Ambiguous authoritative state is never guessed or silently rewritten. Instead, hookrelay creates a minimal persistent block marker:
+Startup reconciliation repairs only safely derivable differences such as missing or stale ready and deadline index entries. The first slice validates the queue, head state, message, and derived structures it implements before readiness; as lease expiry, retries, and dead-letter handling arrive, their startup checks and safe repairs join this same gate. An inconsistency that the current slice cannot handle safely does not pass readiness. Ambiguous authoritative Recipient state is never guessed or silently rewritten. Instead, hookrelay creates a minimal persistent block marker:
 
 ```text
-hr1:q:<platform>:<bot>:<chat>
+hr1:q:<recipient_identity>
 ```
 
 The marker contains only `detected_ms` and a bounded `reason_code`. While it exists, the Recipient is absent from ready and deadline indexes, cannot be claimed, and cannot accept new messages; affected webhook requests receive a retryable response. Other Recipients continue normally. Hookrelay emits a critical metric and structured log. The first version has no general repair engine or quarantine UI: an operator diagnoses the stored state, performs the documented manual recovery procedure, and removes the marker only after invariants have been verified.
 
-After a Valkey restore, hookrelay starts not-ready, rebuilds safe derived indexes, processes overdue leases through the normal expiry transition, activates due retries, and creates block markers for ambiguous Recipient state. It becomes ready when general new operations are safe; individual blocked Recipients remain unavailable until operator recovery.
+Once the corresponding expiry and retry transitions are implemented, after a Valkey restore hookrelay starts not-ready, rebuilds safe derived indexes, processes overdue leases through the normal expiry transition, activates due retries, and creates block markers for ambiguous Recipient state. It becomes ready when general new operations are safe; individual blocked Recipients remain unavailable until operator recovery.
 
 An active Delivery Queue record is removed when its final normal message is acknowledged or moved to dead-letter. Recipient dead-letter state and operational history may outlive an empty normal queue.
 
@@ -182,7 +183,7 @@ max_queued_messages_global        = 100_000
 max_queued_messages_per_recipient = 1_000
 ```
 
-If either limit prevents atomic acceptance, hookrelay creates neither a deduplication record nor a partial message and returns a retryable platform response, normally `503`. It never deletes already accepted queue messages or redirects overflow into relay scope. Bot- and relay-scoped queues use the same per-Recipient limit. Production Valkey uses `noeviction`; capacity metrics and alerts must fire before hard rejection.
+If either limit prevents atomic acceptance, hookrelay creates neither a deduplication record nor a partial message and returns a retryable platform response, normally `503`. It never deletes already accepted queue messages or redirects overflow into relay scope. Chat-, user-, bot-, and relay-scoped queues use the same per-Recipient limit. Production Valkey uses `noeviction`; capacity metrics and alerts must fire before hard rejection.
 
 New-message acceptance stops at 90% of configured Valkey `maxmemory`, while acknowledgement, delivery, cleanup, and retention transitions continue so the system can recover. Crossing this hard threshold makes hookrelay not-ready for general ingestion. The limits are configurable and must be validated against production payload size and traffic rather than treated as a promise that 100,000 maximum-size payloads fit in memory.
 
@@ -219,6 +220,6 @@ Operator replay:
 
 Dead-letter messages are stored in one global DLQ ordered by `dead_lettered_ms`. Each entry retains its Recipient Identity and queue context so replay can atomically return it to the correct queue head. The global sequence is an operational listing order, not an ordering guarantee between Recipients.
 
-After successful acknowledgement, the Canonical Payload and active queue state are deleted. Compact delivery metadata is retained for 24 hours, including `message_id`, recipient scope, Bot Platform, received and acknowledged times, delivery cycle, attempt count, and a safe Consumer identifier. Delivery Token tombstones and deduplication records retain their independently configured lifetimes.
+After successful acknowledgement, the Canonical Payload and active queue state are deleted. Compact delivery metadata is retained for 24 hours, including `message_id`, recipient scope, Bot Platform, received and acknowledged times, delivery cycle, attempt count, and a safe Consumer identifier. It deliberately omits Bot, Chat, and User identifiers. Delivery Token tombstones and deduplication records retain their independently configured lifetimes.
 
-The first operational UI supports safe metadata inspection, privileged payload inspection with audit, replay to the queue head, and confirmed permanent deletion.
+The first operational UI supports safe metadata inspection, privileged payload inspection gated by a confirmed audit append, replay in the order described above, and confirmed permanent deletion. Payload inspection returns `503` without disclosing payload content if its audit cannot be confirmed. The audit event denotes authorized access beginning, not proof of client receipt; see [Admin API audit policies](admin-api.md#audit-failure-policies).

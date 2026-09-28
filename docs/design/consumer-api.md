@@ -20,11 +20,11 @@ Consumer-Instance-Id: worker-7c9f6
 
 It is not an authorization identity.
 
-Consumer API request bodies are limited to 16 KiB and strictly validated:
+Consumer API request bodies are limited to 16 KiB, maximum JSON nesting depth 40, and strictly validated:
 
 - the top-level JSON value is an object;
 - unknown fields are rejected;
-- duplicate JSON keys are rejected;
+- duplicate JSON keys follow Go `encoding/json` last-value-wins behavior and are not rejected;
 - trailing non-whitespace data is rejected;
 - required strings are non-empty;
 - UUIDv7 fields are validated syntactically;
@@ -57,7 +57,7 @@ Request:
 
 `operation_id` is mandatory and unique across the shared Consumer API authorization scope. `wait_ms` is optional, defaults to 30,000, and is constrained to 0–30,000 milliseconds. Zero requests an immediate check.
 
-Repeating an operation with the same arguments returns the recorded message response or empty outcome. Reusing the identifier with different arguments returns `409 operation_conflict`.
+Repeating an operation with the same arguments returns the recorded empty outcome or, while the claimed Delivery Attempt is still active, the recorded message response with the same Delivery Token. If that Delivery Attempt has already completed by acknowledgement, negative acknowledgement, or expiry, repeating the claim returns `409 claim_no_longer_active`; it never creates another lease and never returns a completed attempt's token. Reusing the identifier with different arguments returns `409 operation_conflict`.
 
 A successful claim returns `200 OK`:
 
@@ -93,7 +93,7 @@ Other outcomes include:
 
 - `400` invalid request;
 - `401` missing or invalid Consumer Secret;
-- `409` operation conflict;
+- `409` operation conflict or a completed claim replay (`claim_no_longer_active`);
 - `429` active-lease or waiting-claim limit exceeded, with `Retry-After: 1`;
 - `503` temporary dependency or Consumer API unavailability, optionally with `Retry-After`;
 - `500` unexpected internal error.
@@ -215,6 +215,7 @@ The initial bounded error-code allowlist is:
 invalid_request
 unauthenticated
 operation_conflict
+claim_no_longer_active
 consumer_limit_exceeded
 delivery_token_not_found
 stale_delivery_token

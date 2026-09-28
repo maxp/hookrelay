@@ -1,6 +1,6 @@
 # Open design questions
 
-The following questions remain intentionally unresolved. They should be answered before or during specification of the affected implementation slice.
+The following questions remain intentionally unresolved. The Milestone 1 choices for Admin CLI recovery, PATCH-only HTTP enable/disable, Markdown API contracts, Lua result encoding and registry, mixed Valkey records, first-slice audit, incremental startup reconciliation, version pinning at scaffold, and a pre-scaffold client spike are accepted in their respective design documents. Exact first-slice fields, script tuples, and startup validation/repair procedures are specification work before coding, not invitations to choose different policies.
 
 ## Queue maintenance and recovery
 
@@ -9,21 +9,19 @@ The following questions remain intentionally unresolved. They should be answered
 
 ## API and authorization
 
-- Final OpenAPI representation and generated-client policy for the accepted Consumer API contract.
-- Exact `HOOKRELAY_...` configuration keys and CLI command used to generate the shared Consumer secret.
-- Operational procedure for coordinated single-secret rotation.
-- Exact `HOOKRELAY_...` configuration keys and coordinated rotation procedure for the single Admin Secret.
-- Detailed admin API and CLI contract.
+- Exact OpenAPI representation for the accepted Consumer and Admin API contracts after DTOs stabilize, and whether later versions need generated clients; neither blocks Milestone 1.
+- Operational procedures for coordinated single-secret rotation of Consumer and Admin secrets.
+- Per-operation reconciliation details for later administrative DLQ and session mutations after uncertain Lua execution; the accepted policy already forbids blind retries and false success claims.
 
 ## Valkey schema and durability
 
-- Exact field encodings and Lua argument/return contracts for the accepted `hr1:...` structures.
-- Exact version identifiers, loading, testing, and rollout procedure for Lua scripts.
+- Exact fields, `KEYS`/`ARGV`, status tuple shapes, and script preconditions for **later** storage slices, to be fixed before each is coded; Milestone 1 requires these in its specification.
+- Rollout and rollback of later incompatible script contracts against existing persisted `hr1:` state; the embedded registry, startup load, `EVALSHA`/`NOSCRIPT`, and v1 testing policy are already selected.
 - Future `hr2` cutover and backup compatibility if an incompatible storage format is ever introduced.
-- Backup schedule and retention, restore objectives, and disk-exhaustion runbook.
+- Backup and restore are explicitly deferred at this stage: schedule, retention, backup medium, RPO/RTO, restore drills, selective restore, and disk-exhaustion runbook remain undefined.
 
 ## Operations
 
 - Validation and possible recalibration of the accepted initial SLOs and alert thresholds using production-like load tests.
-- Access-control policy for logs containing clear-text Bot Identifier and Chat Identifier fields.
-- Production container base image, supported architectures, and profiling access policy.
+- Access-control policy for logs containing clear-text Bot Identifier, Chat Identifier, User Identifier, and source IP fields.
+- Operational handling, secure transfer, and retention of secret-bearing pprof artifacts; access policy is selected.
