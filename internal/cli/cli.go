@@ -1,5 +1,5 @@
-// Package cli implements the hookrelay command families: serve, version,
-// generate, and healthcheck. The entry point only delegates here; HTTP,
+// Package cli implements the hookrelay command families: serve, admin,
+// version, generate, and healthcheck. The entry point only delegates here; HTTP,
 // domain, Valkey, and observability logic live in the feature modules.
 package cli
 
@@ -75,6 +75,8 @@ func Main(args []string) int {
 	switch args[0] {
 	case "serve":
 		return Serve(args[1:])
+	case "admin":
+		return Admin(args[1:])
 	case "version":
 		return Version(args[1:], os.Stdout)
 	case "generate":
@@ -93,6 +95,7 @@ func usage(w io.Writer) {
 
 Usage:
   hookrelay serve        run the hookrelay server
+  hookrelay admin        Admin API client: webhook create | get
   hookrelay version      print build information (human or --json)
   hookrelay generate     generate consumer-secret | admin-secret | webhook-id
   hookrelay healthcheck  probe a health endpoint (container healthcheck)

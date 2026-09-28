@@ -4,7 +4,7 @@ Webhook relay that distributes incoming events to recipients through ordered del
 
 ## Status
 
-Milestone 1 (the tracer-bullet vertical slice) is in progress. Done so far: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey. The ingestion, delivery, and Consumer API slices are pending. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/).
+Milestone 1 (the tracer-bullet vertical slice) is in progress. Done so far: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey — and the Admin CLI (`hookrelay admin webhook create|get`) on top of that API. The ingestion, delivery, and Consumer API slices are pending. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/).
 
 ## Goals
 
@@ -68,7 +68,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/app` — composition root, listeners, readiness gate, graceful shutdown;
 - `internal/config` — flags, environment, defaults, and startup validation;
 - `internal/observability` — structured logging and the private metrics registry;
-- `internal/cli` — serve, version, generate, and healthcheck commands;
+- `internal/cli` — serve, admin, version, generate, and healthcheck commands;
 - `internal/administration` — Admin API service and HTTP transport;
 - `internal/valkey` — Valkey adapter: embedded versioned Lua scripts, readiness gate, endpoint store;
 - `internal/ingestion` — Webhook Type registry (verification and conversion seams);
@@ -136,6 +136,39 @@ Lua operation, logs a feature event such as `webhook_endpoint_created`, and
 is counted in `hookrelay_audit_events_total`; failed best-effort audit
 appends are counted in `hookrelay_audit_write_failures_total`. The full contract lives in
 [`docs/design/admin-api.md`](docs/design/admin-api.md).
+
+## Admin CLI
+
+`hookrelay admin` is an HTTP client for the Admin API; it never touches
+Valkey directly.
+
+```sh
+export HOOKRELAY_ADMIN_SECRET_FILE=.secrets/admin
+hookrelay admin webhook create --type telegram --bot-id 123456 --credential-file telegram-secret
+hookrelay admin webhook get --type telegram --identifier wh_...
+```
+
+- Admin URL: `--admin-url`, then `HOOKRELAY_ADMIN_URL`, then
+  `http://127.0.0.1:8081`.
+- Admin Secret: `--admin-secret-file`, then `HOOKRELAY_ADMIN_SECRET_FILE`,
+  then `HOOKRELAY_ADMIN_SECRET`, then a hidden prompt on a terminal. It is
+  never accepted as a command-line value.
+- Webhook credential: `--credential-file` or `HOOKRELAY_WEBHOOK_CREDENTIAL`
+  (not both). `--credential-kind` defaults to the only kind of the Webhook
+  Type (`secret_token` for Telegram).
+- Output: `--output table|json`; table on a terminal, JSON otherwise. Results
+  go to standard output, warnings and errors to standard error; secrets are
+  never printed.
+- Exit codes: `0` success, `1` failure (including every unconfirmed create),
+  `2` usage error.
+
+`create` generates the `wh_…` identifier before sending unless `--identifier`
+is given. If the response is lost or the server fails (transport error or
+`5xx`), the CLI never retries: it reads the endpoint by that identifier and
+prints `{"outcome": "desired_state_observed" | "uncertain", ...}` with a
+warning. Observing the requested state does not confirm the create or its
+audit event; check the audit before any further mutation, and reuse the same
+`--identifier` if a retry is ever needed.
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
 

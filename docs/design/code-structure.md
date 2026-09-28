@@ -120,6 +120,7 @@ UUIDv7 and random-token generation are provided through injectable generators. P
 - UUIDv7 generation uses `github.com/google/uuid` behind the local generator interface when the selected version provides `NewV7`.
 - JSON request decoding and validation use `encoding/json` plus explicit field validation. Hookrelay does not reject duplicate object keys: standard last-value-wins decoder behavior applies to Consumer, Admin, and webhook JSON. This behavior must be documented in public contracts and tests so it is not mistaken for strict duplicate-key rejection.
 - Prometheus exposition uses `github.com/prometheus/client_golang` with private registries and explicit registration rather than global defaults.
+- The Admin CLI's hidden Admin Secret prompt and terminal detection use `golang.org/x/term`.
 - Structured logging uses standard `log/slog` with JSON output and centralized attribute conventions and redaction.
 - HTTP tests use `testing`, `net/http/httptest`, and focused golden JSON only for stable public contracts.
 - Tests initially use standard `testing`, small helpers with `t.Helper`, and handwritten fakes for caller-owned interfaces. No assertion or mocking framework is added.
