@@ -6,6 +6,7 @@ package gen
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -37,25 +38,7 @@ func (Crypto) Base64URL(n int) (string, error) {
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("crypto/rand failed: %w", err)
 	}
-	return base64URL(buf), nil
-}
-
-func base64URL(buf []byte) string {
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	out := make([]byte, 0, (len(buf)*8+5)/6)
-	var bits, acc int
-	for _, b := range buf {
-		acc = acc<<8 | int(b)
-		bits += 8
-		for bits >= 6 {
-			bits -= 6
-			out = append(out, alphabet[(acc>>bits)&0x3f])
-		}
-	}
-	if bits > 0 {
-		out = append(out, alphabet[(acc<<(6-bits))&0x3f])
-	}
-	return string(out)
+	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 // Fixed is a deterministic generator for tests.
