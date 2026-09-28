@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -21,6 +22,7 @@ import (
 // typed parser accepts.
 type Script struct {
 	Name     string
+	Version  int // contract version; the filename suffix must match
 	Body     string
 	BodySHA  string // lowercase hex of the exact embedded body
 	Statuses []string
@@ -30,11 +32,17 @@ type Script struct {
 var registry map[string]*Script
 
 // register embeds a script body and computes its identity digest at init.
-func register(name, statusList string) {
+// The version must match the "_v<N>" filename suffix, making changed
+// contracts explicit.
+func register(name string, version int, statusList string) {
+	if !strings.HasSuffix(name, "_v"+strconv.Itoa(version)) {
+		panic(fmt.Sprintf("valkey: script %s registry version %d does not match the filename suffix", name, version))
+	}
 	body := mustScript(name)
 	sum := sha256.Sum256([]byte(body))
 	registry[name] = &Script{
 		Name:     name,
+		Version:  version,
 		Body:     body,
 		BodySHA:  hex.EncodeToString(sum[:]),
 		Statuses: splitStatuses(statusList),

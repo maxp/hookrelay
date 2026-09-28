@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -146,6 +147,9 @@ func TestAdminCreateGetOverRealValkey(t *testing.T) {
 	if last["operation"] != "webhook_endpoint_created" || last["target"] != "telegram:"+created.WebhookIdentifier || last["outcome"] != "success" {
 		t.Errorf("create audit = %+v", last)
 	}
+	if ts, err := strconv.ParseInt(last["timestamp_ms"], 10, 64); err != nil || ts <= 0 {
+		t.Errorf("create audit timestamp_ms = %q, want positive Valkey TIME millis", last["timestamp_ms"])
+	}
 
 	// Duplicate identifier through HTTP → 409.
 	dup := strings.Replace(validCreate, `"enabled": true`, `"enabled": true, "webhook_identifier": "`+created.WebhookIdentifier+`"`, 1)
@@ -166,6 +170,9 @@ func TestAdminCreateGetOverRealValkey(t *testing.T) {
 	last = entries[len(entries)-1]
 	if last["operation"] != "admin_auth_rejected" || last["outcome"] != "failure" {
 		t.Errorf("rejected-auth audit = %+v", last)
+	}
+	if ts, err := strconv.ParseInt(last["timestamp_ms"], 10, 64); err != nil || ts <= 0 {
+		t.Errorf("rejected-auth audit timestamp_ms = %q, want positive Valkey TIME millis", last["timestamp_ms"])
 	}
 
 	// Restart persistence: a fresh adapter over the same Valkey still serves

@@ -272,6 +272,48 @@ func TestParserRejectsUnknownStatus(t *testing.T) {
 	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msg); err == nil || !strings.Contains(err.Error(), "unknown status") {
 		t.Fatalf("unknown status accepted: %v", err)
 	}
+
+	// Shape rejection: a non-array result is refused.
+	nonArray := client.Do(ctx, client.B().Arbitrary("EVAL", `return 1`, "0").Build())
+	msgInt, err := nonArray.ToMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msgInt); err == nil || !strings.Contains(err.Error(), "not an array") {
+		t.Fatalf("non-array result accepted: %v", err)
+	}
+
+	// Shape rejection: an empty array is refused.
+	emptyArr := client.Do(ctx, client.B().Arbitrary("EVAL", `return {}`, "0").Build())
+	msgEmpty, err := emptyArr.ToMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msgEmpty); err == nil || !strings.Contains(err.Error(), "empty result") {
+		t.Fatalf("empty result accepted: %v", err)
+	}
+
+	// Shape rejection: a known status with missing positional fields is
+	// refused at Field access.
+	shortArr := client.Do(ctx, client.B().Arbitrary("EVAL", `return {'created'}`, "0").Build())
+	msgShort, err := shortArr.ToMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := parseResult("endpoint_create_v1", registry["endpoint_create_v1"].Statuses, msgShort)
+	if err != nil {
+		t.Fatalf("short tuple should parse, fields rejected later: %v", err)
+	}
+	if _, err := res.Field(0); err == nil {
+		t.Fatal("missing positional field accepted")
+	}
+
+	// Registry contract: versions match filename suffixes and digests are set.
+	for name, s := range registry {
+		if s.Version < 1 || s.BodySHA == "" {
+			t.Errorf("script %s: incomplete registry entry (version %d, sha %q)", name, s.Version, s.BodySHA)
+		}
+	}
 }
 
 // TestReadinessGateProductionPersistence pins the production persistence

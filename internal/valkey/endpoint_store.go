@@ -140,13 +140,25 @@ func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier strin
 
 // AppendRejectedAuth records a rejected administrative authentication attempt
 // in the audit stream, best effort: failures are swallowed because rejected
-// authentication stays rejected regardless of audit availability.
+// authentication stays rejected regardless of audit availability. The
+// timestamp uses authoritative Valkey TIME, matching the Lua-path entries.
 func (a *Adapter) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) {
 	auditCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
+	timestampMs := int64(0)
+	if msg, err := a.client.Do(auditCtx, a.client.B().Time().Build()).ToMessage(); err == nil {
+		if parts, err := msg.ToArray(); err == nil && len(parts) == 2 {
+			sec, e1 := parts[0].AsInt64()
+			usec, e2 := parts[1].AsInt64()
+			if e1 == nil && e2 == nil {
+				timestampMs = sec*1000 + usec/1000
+			}
+		}
+	}
 	a.client.Do(auditCtx, a.client.B().Arbitrary(
 		"XADD", "hr1:audit", "MAXLEN", "~", "1000000", "*",
 		"event_id", eventID,
+		"timestamp_ms", strconv.FormatInt(timestampMs, 10),
 		"actor", "admin_bearer",
 		"operation", "admin_auth_rejected",
 		"target", target,

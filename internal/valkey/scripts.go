@@ -13,7 +13,7 @@ var scriptsFS embed.FS
 
 func init() {
 	registry = map[string]*Script{}
-	register("endpoint_create_v1", "created conflict bot_endpoint_limit wrong_type")
+	register("endpoint_create_v1", 1, "created conflict bot_endpoint_limit wrong_type")
 }
 
 // Result is a typed script result: the bounded status code plus the
