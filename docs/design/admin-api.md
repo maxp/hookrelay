@@ -1,6 +1,6 @@
 # Administrative API
 
-The administrative API is exposed only on the protected administrative listener and requires the shared Admin Secret or an authenticated administrative browser session. All field names use `snake_case`. State-changing requests are audited without credentials, payloads, Authorization headers, or complete request bodies. Administrative mutations also emit feature events under the [structured-log contract](platform.md#structured-log-contract); Webhook Endpoint events may include credential kind but not credential values, lengths, or fingerprints. Critical administrative mutations require a successful Valkey audit append in the same Lua operation as the state change: this covers Webhook Endpoint creation, enablement, disablement, and deletion, and administrative DLQ replay and permanent deletion. The API confirms success only after both state and audit are written. Standard-output logging remains best effort and cannot substitute for the Valkey audit record. Lua errors and lost responses can leave an uncertain outcome rather than an automatic rollback; see the [audit storage contract](storage.md#administrative-audit).
+The administrative API is exposed only on the protected administrative listener and requires the shared Admin Secret or an authenticated administrative browser session. All field names use `snake_case`. State-changing requests are audited without credentials, payloads, Authorization headers, or complete request bodies. Administrative mutations also emit feature events under the [structured-log contract](platform.md#structured-log-contract); Webhook Endpoint events may include credential kind but not credential values, lengths, or fingerprints. Critical administrative mutations require a successful Valkey audit append in the same Lua operation as the state change: this covers Webhook Endpoint creation, enablement, disablement, and deletion, administrative DLQ replay and permanent deletion, Admin Secret generation changes, and preconditioned clearing of a Recipient block. The API confirms success only after both state and audit are written. Standard-output logging remains best effort and cannot substitute for the Valkey audit record. Lua errors and lost responses can leave an uncertain outcome rather than an automatic rollback; see the [audit storage contract](storage.md#administrative-audit).
 
 ## Audit failure policies
 
@@ -20,7 +20,7 @@ DELETE /admin/v1/session
 
 The administrative session cookie is named `hookrelay_admin`. In production it is set with `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, and no `Domain`. Local HTTP development may omit `Secure`; this mode must be explicitly configured and the administrative listener must bind only to loopback. The first version deliberately uses a normal cookie name rather than a `__Host-` prefix for consistent localhost behavior.
 
-Login accepts a JSON body limited to 4 KiB:
+Login accepts a JSON body limited to 16 KiB so the configured maximum 8192-byte Admin Secret plus JSON framing always fits:
 
 ```json
 {
@@ -36,9 +36,11 @@ The session token is 256 random bits encoded as base64url without padding. Only 
 hr1:admin_session:<session_digest>
 ```
 
-with creation, last-seen, idle-expiry, absolute-expiry, and the CSRF token stored in plaintext. The session token itself is stored only as a SHA-256 digest; the CSRF token is never logged, included in audit, or returned anywhere except `GET /admin/v1/session` for that authenticated browser session. Sessions are not bound to IP address or User-Agent. The one-hour idle expiry is refreshed no more frequently than every five minutes; the twelve-hour absolute expiry never moves. An expired session is invalid regardless of whether cleanup or its best-effort audit event has completed.
+with creation, last-seen, idle-expiry, absolute-expiry, Admin Secret `generation_id`, and the CSRF token stored in plaintext. The session digest also belongs to the `hr1:admin_sessions` expiry/capacity index; session creation, refresh, and logout maintain the Hash and index atomically. The session token itself is stored only as a SHA-256 digest; the CSRF token is never logged, included in audit, or returned anywhere except `GET /admin/v1/session` for that authenticated browser session. Sessions are not bound to IP address or User-Agent. The one-hour idle expiry is refreshed no more frequently than every five minutes; the twelve-hour absolute expiry never moves. An expired session or a session whose generation differs from the current `hr1:admin_auth` generation is invalid regardless of cleanup.
 
-`GET /admin/v1/session` returns authentication state, idle and absolute expiry, and a stable random 128-bit CSRF token for the session. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests require that token in `X-CSRF-Token` and require an exact allowed `Origin`. Bearer-authenticated requests do not require CSRF. Safe `GET` and `HEAD` requests never change state.
+At startup, hookrelay derives an HMAC-SHA-256 generation tag from the configured Admin Secret, the persistent random generation salt, and the fixed context `hookrelay-admin-session-generation-v1`. A mismatch with `hr1:admin_auth` means the Admin Secret changed. One bounded Lua operation replaces the generation ID and tag, removes every indexed session and session Hash, and appends the mandatory rotation audit event before readiness. No plaintext secret or reusable secret value is stored. An uncertain or partially observed rotation prevents readiness pending operator reconciliation.
+
+`GET /admin/v1/session` returns authentication state, idle and absolute expiry, and a stable random 128-bit CSRF token for the session. Cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` requests require that token in `X-CSRF-Token` and require an exact allowed `Origin`. Bearer-authenticated requests do not require CSRF. Safe `GET` and `HEAD` requests never mutate application resources; successful authentication may perform the documented throttled update of session access metadata and its expiry index.
 
 `DELETE /admin/v1/session` prioritizes revocation over audit persistence. After confirmed deletion or absence of the session, it clears the cookie and returns `204`; repeating logout also returns `204`. Audit of actual logout and session expiry is best effort and must not prevent revocation or keep an expired session valid. If Valkey is unavailable or revocation cannot be confirmed, logout returns `503` rather than claiming successful server-side revocation.
 
@@ -54,12 +56,14 @@ This read-only diagnostic route is exposed only on the administrative listener a
 
 ## Command-line client
 
-The main binary includes the server, administrative client, and generators:
+The main binary includes the server, administrative client, generators, version reporting, and container healthcheck:
 
 ```text
 hookrelay serve
 hookrelay admin ...
 hookrelay generate ...
+hookrelay version
+hookrelay healthcheck ...
 ```
 
 `hookrelay admin` is an HTTP client for the Admin API and never edits Valkey directly.
@@ -76,6 +80,22 @@ hookrelay admin webhook enable
 hookrelay admin webhook disable
 hookrelay admin webhook delete
 hookrelay admin bot webhooks
+```
+
+Operational commands mirror the accepted Admin routes as their milestones arrive:
+
+```text
+hookrelay admin operations summary
+hookrelay admin recipients list --status ...
+hookrelay admin recipients inspect-block
+hookrelay admin recipients clear-block
+hookrelay admin message delivery-state
+hookrelay admin dlq list
+hookrelay admin dlq get
+hookrelay admin dlq payload
+hookrelay admin dlq replay
+hookrelay admin dlq delete
+hookrelay admin audit list
 ```
 
 Create accepts credential input from `--credential-file` or `HOOKRELAY_WEBHOOK_CREDENTIAL`; configuring both is an error. A command-line credential value flag is not provided. Environment input is intended for automation but remains sensitive process configuration and must not be printed or logged.
@@ -142,7 +162,7 @@ If the identifier is omitted, hookrelay generates:
 wh_<base64url-128-bit-random>
 ```
 
-The operation creates the endpoint Hash, adds membership to the Bot Identity Set, adds the endpoint to the global listing index, and appends the required audit event in the same Lua operation. Identifier conflicts return `409`.
+The operation checks the Bot Identity membership Set before its first write. If it already contains 100 endpoints, creation returns `409 bot_endpoint_limit_exceeded`. Otherwise the operation creates the endpoint Hash, adds membership to the Bot Identity Set, adds the endpoint to the global listing index, and appends the required audit event in the same Lua operation. Identifier conflicts return `409`.
 
 Success returns `201 Created`, a `Location` header, an entity `ETag`, and a body:
 
@@ -223,6 +243,83 @@ GET /admin/v1/bots/{bot_platform}/{bot_id}/webhooks
 
 This endpoint reads the Bot Identity membership Set and returns safe metadata for every associated Webhook Endpoint. It supports the create-new-endpoint credential replacement flow. The first version does not paginate this normally small collection but enforces a hard maximum of 100 endpoints per Bot Identity.
 
+## Operational and DLQ API surface
+
+The accepted administrative route inventory is:
+
+```http
+GET    /admin/v1/operations/summary
+GET    /admin/v1/recipient-states?status=<ready|leased|retry_wait|blocked>&limit=<n>&cursor=<opaque>
+POST   /admin/v1/recipient-blocks/inspect
+POST   /admin/v1/recipient-blocks/clear
+GET    /admin/v1/messages/{message_id}/delivery-state
+GET    /admin/v1/dead-letters?limit=<n>&cursor=<opaque>
+GET    /admin/v1/dead-letters/{message_id}
+POST   /admin/v1/dead-letters/{message_id}/payload
+POST   /admin/v1/dead-letters/{message_id}/replay
+DELETE /admin/v1/dead-letters/{message_id}
+GET    /admin/v1/audit?limit=<n>&cursor=<opaque>
+```
+
+Safe `GET` routes return metadata only and never payloads, credentials, Delivery Tokens, or unredacted secret-bearing diagnostics. Recipient-state results use structured Recipient fields rather than exposing internal `hr1:` keys. The `blocked` filter pages over the derived `hr1:blocked` index ordered by detection time. List routes use the common default limit 50 and range 1–200 with stable opaque cursors.
+
+The block inspection request contains one structured Recipient:
+
+```json
+{
+  "recipient": {
+    "scope": "chat",
+    "bot_platform": "telegram",
+    "bot_id": "123456",
+    "chat_id": "987654"
+  }
+}
+```
+
+It returns the marker, bounded queue-head and state metadata, presence of the referenced Canonical Message, memberships in the ready/lease/retry/blocked indexes, and a bounded list of violated invariants. It never returns payload or Delivery Token data. The clear request contains the same Recipient plus exact marker preconditions:
+
+```json
+{
+  "recipient": {
+    "scope": "chat",
+    "bot_platform": "telegram",
+    "bot_id": "123456",
+    "chat_id": "987654"
+  },
+  "expected_detected_ms": 1740000000000,
+  "expected_reason_code": "head_message_missing"
+}
+```
+
+It succeeds with `204 No Content` only if those preconditions and all authoritative-state invariants match; it never repairs authoritative state. One Lua operation removes the marker, restores exactly the derived index implied by the verified state, and appends the mandatory audit event. See the [Recipient block recovery runbook](../runbooks/recipient-block-recovery.md).
+
+`GET /admin/v1/messages/{message_id}/delivery-state` returns only `message_id`, `delivery_cycle`, the bounded state `queued`, `leased`, `retry_wait`, `dead_lettered`, or `acknowledged`, and safe queue-position classification. It exists in Milestone 2 so a replay with a lost response can be reconciled without exposing payloads or Delivery Tokens.
+
+Payload inspection is deliberately `POST`, because it appends the mandatory access audit before returning the Canonical Message and therefore is not a safe read. Replay and permanent deletion use the mandatory state-change-plus-audit transitions. A missing Dead-letter Message returns `404 dead_letter_not_found`; an existing Recipient block returns `409 recipient_blocked`. Permanent deletion is idempotent for an absent message and returns `204` without another audit event, subject to the same uncertain-outcome warning as other administrative deletion.
+
+Replay accepts:
+
+```json
+{
+  "deduplication_conflict_resolution": "reject"
+}
+```
+
+The field defaults to `reject`. If the original Deduplication Identity points to another message, `reject` returns `409 deduplication_conflict`; the explicit `keep_current` value permits replay while leaving the newer mapping unchanged. Replay never repoints that mapping to the older message. Success returns:
+
+```json
+{
+  "status": "replayed",
+  "message_id": "0195...",
+  "delivery_cycle": 2,
+  "queue_position": "head",
+  "replayed_ms": 1740000000000,
+  "deduplication_resolution": "not_conflicting"
+}
+```
+
+`queue_position` is `head` or `after_active_head`; `deduplication_resolution` is `not_conflicting` or `kept_current`. Before replay, the CLI reads the current Delivery Cycle. After a lost response it never retries blindly: it reads the DLQ entry and delivery-state route. A newer cycle outside the DLQ is reported as desired state observed with audit confirmation still required; every other inconclusive combination is an uncertain outcome handled by the reconciliation runbook. The remaining operational views, payload command, permanent deletion, and audit UI contracts are completed with their later milestone rather than guessed by the storage adapter.
+
 ## Error envelope
 
 Errors use:
@@ -242,15 +339,23 @@ The initial bounded allowlist is:
 ```text
 invalid_request
 invalid_cursor
+request_too_large
+unsupported_media_type
 unauthenticated
 forbidden
 rate_limit_exceeded
 session_capacity_exceeded
+bot_endpoint_limit_exceeded
 webhook_endpoint_not_found
 webhook_identifier_conflict
 unsupported_webhook_type
 unsupported_credential_kind
 endpoint_must_be_disabled
+dead_letter_not_found
+deduplication_conflict
+recipient_blocked
+recipient_block_not_found
+recipient_state_ambiguous
 precondition_required
 precondition_failed
 dependency_unavailable

@@ -20,7 +20,7 @@ Consumer-Instance-Id: worker-7c9f6
 
 It is not an authorization identity.
 
-Consumer API request bodies are limited to 16 KiB, maximum JSON nesting depth 40, and strictly validated:
+Consumer API request bodies are limited to 16 KiB and maximum JSON nesting depth 40. A larger body receives `413 request_too_large`. Bodies are strictly validated:
 
 - the top-level JSON value is an object;
 - unknown fields are rejected;
@@ -30,7 +30,7 @@ Consumer API request bodies are limited to 16 KiB, maximum JSON nesting depth 40
 - UUIDv7 fields are validated syntactically;
 - integers are not accepted as strings;
 - fractional integer fields are rejected;
-- non-JSON content types receive `415 Unsupported Media Type`.
+- non-JSON content types receive `415 unsupported_media_type`.
 
 Every response contains an internal UUIDv7 request identifier in:
 
@@ -56,6 +56,8 @@ Request:
 ```
 
 `operation_id` is mandatory and unique across the shared Consumer API authorization scope. `wait_ms` is optional, defaults to 30,000, and is constrained to 0–30,000 milliseconds. Zero requests an immediate check.
+
+The initial implementation supports the complete waiting contract without requiring the later notification optimization. After an empty atomic check it rechecks the ready index on a process-local 250 ms interval with 0–50 ms uniform jitter until work appears, the request is cancelled, or the deadline expires. Every recheck is atomic and Valkey remains the source of truth. Milestone 3 may add a notification channel to wake claims earlier, but notification loss never replaces periodic rechecking or changes this HTTP contract.
 
 Repeating an operation with the same arguments returns the recorded empty outcome or, while the claimed Delivery Attempt is still active, the recorded message response with the same Delivery Token. If that Delivery Attempt has already completed by acknowledgement, negative acknowledgement, or expiry, repeating the claim returns `409 claim_no_longer_active`; it never creates another lease and never returns a completed attempt's token. Reusing the identifier with different arguments returns `409 operation_conflict`.
 
@@ -93,6 +95,8 @@ Other outcomes include:
 
 - `400` invalid request;
 - `401` missing or invalid Consumer Secret;
+- `413` request body larger than 16 KiB (`request_too_large`);
+- `415` non-JSON content type (`unsupported_media_type`);
 - `409` operation conflict or a completed claim replay (`claim_no_longer_active`);
 - `429` active-lease or waiting-claim limit exceeded, with `Retry-After: 1`;
 - `503` temporary dependency or Consumer API unavailability, optionally with `Retry-After`;
@@ -213,6 +217,8 @@ The initial bounded error-code allowlist is:
 
 ```text
 invalid_request
+request_too_large
+unsupported_media_type
 unauthenticated
 operation_conflict
 claim_no_longer_active

@@ -60,6 +60,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - [`docs/design/telegram-adapter.md`](docs/design/telegram-adapter.md) defines Telegram verification, update identity, and recipient extraction policy.
 - [`docs/design/storage.md`](docs/design/storage.md) defines the accepted internal Valkey data structures and key namespace.
 - [`docs/design/open-questions.md`](docs/design/open-questions.md) lists decisions that remain open.
+- [`docs/runbooks/recipient-block-recovery.md`](docs/runbooks/recipient-block-recovery.md) defines safe diagnosis and clearing of an ambiguous Recipient block.
 
 ## Repository layout
 

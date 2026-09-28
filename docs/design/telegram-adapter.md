@@ -33,7 +33,7 @@ The full Deduplication Identity also includes Webhook Type and Bot Identity. If 
 
 ## Platform Event Type
 
-Telegram `Update` contains `update_id` and at most one event payload field. The known nonempty event-field name becomes `platform_event_type`. No known event field produces `$unknown` and relay scope with `unknown_event_type`. Multiple event fields produce relay scope with `unknown_event_structure`. The complete `Update` remains the Canonical Payload.
+Telegram `Update` contains `update_id` and normally at most one non-null event payload field. Exactly one known field uses its documented name as `platform_event_type`. Exactly one unknown field preserves that field's name as `platform_event_type`, uses relay scope, and records `unknown_event_type`. No non-null event field uses `$unknown` with `unknown_event_type`; multiple non-null fields use `$unknown` with `unknown_event_structure`. The complete `Update` remains the Canonical Payload.
 
 ## Recipient extraction
 
@@ -55,20 +55,7 @@ relay = (telegram, bot_id, relay)
 
 The adapter never takes an arbitrary nested `User.id`; every event type has an explicit extraction rule.
 
-Initial user fallback rules, used only when no applicable `chat.id` exists, are:
-
-| Telegram event | User or chat fallback |
-|---|---|
-| `inline_query` | `inline_query.from.id` as user |
-| `chosen_inline_result` | `chosen_inline_result.from.id` as user |
-| inline `callback_query` | `callback_query.from.id` as user |
-| `shipping_query` | `shipping_query.from.id` as user |
-| `pre_checkout_query` | `pre_checkout_query.from.id` as user |
-| `purchased_paid_media` | `purchased_paid_media.from.id` as user |
-| `business_connection` | `business_connection.user.id` as user |
-| `subscription` | `subscription.user.id` as user |
-| `managed_bot` | `managed_bot.user.id` as user |
-| `poll_answer` | `poll_answer.voter_chat.id` as chat when present; otherwise `poll_answer.user.id` as user |
+User fallback is used only when no applicable `chat.id` exists. The per-event rules, including the user fallbacks for inline, payment, business-connection, subscription, and poll-answer events, are defined once in the [event-to-Recipient table](#event-to-recipient-table).
 
 For `callback_query`, `callback_query.message.chat.id` has priority when available; `from.id` is only the inline/no-chat fallback. The complete extraction table is expanded and tested with the adapter implementation.
 

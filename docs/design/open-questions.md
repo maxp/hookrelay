@@ -4,17 +4,15 @@ The following questions remain intentionally unresolved. The Milestone 1 choices
 
 ## Queue maintenance and recovery
 
-- Operator runbook for diagnosing and clearing an `hr1:q:...` ambiguous Recipient block marker.
 - Whether a periodic consistency checker is needed after experience with startup reconciliation.
 
 ## API and authorization
 
 - Exact OpenAPI representation for the accepted Consumer and Admin API contracts after DTOs stabilize, and whether later versions need generated clients; neither blocks Milestone 1.
 - Operational procedures for coordinated single-secret rotation of Consumer and Admin secrets.
-- Exact non-plaintext mechanism by which an Admin Secret change invalidates every existing browser session and can be detected/audited; this must be selected before the browser-session slice.
+- Encoded-character constraints or larger login-body handling needed to guarantee that every accepted 8192-byte Admin Secret can be represented in JSON without exceeding the current 16 KiB login limit; the same question applies to future credential kinds that permit the full 8192-byte value.
 - Per-operation reconciliation details for later administrative DLQ and session mutations after uncertain Lua execution; the accepted policy already forbids blind retries and false success claims.
-- Milestone 1 interim behavior for a valid claim with `wait_ms > 0`, because the final Consumer API accepts 0–30,000 while long-poll waiting is scheduled for Milestone 3. The milestone must either implement compliant waiting earlier or be explicitly treated as a non-deployable API subset without weakening the final contract.
-- Milestone 1 handling of an active lease that reaches its deadline or survives a process restart before lease-expiry/retry transitions arrive in Milestone 2. This intermediate state must not be represented as production-ready or silently repaired with different attempt semantics.
+- Precedence when one Telegram Update simultaneously has an invalid `update_id` and another routing problem, because the Canonical Message currently carries one `routing_issue`.
 
 ## Valkey schema and durability
 
@@ -25,6 +23,7 @@ The following questions remain intentionally unresolved. The Milestone 1 choices
 
 ## Operations
 
+- Exact metric additions needed to make every stated latency objective and promised internal-failure signal directly measurable, including accepted/duplicate webhook latency, ready-to-claim latency, timestamp extraction failures, log-write failures, and recovered panics.
 - Validation and possible recalibration of the accepted initial SLOs and alert thresholds using production-like load tests.
 - Access-control policy for logs containing clear-text Bot Identifier, Chat Identifier, User Identifier, and source IP fields.
 - Operational handling, secure transfer, and retention of secret-bearing pprof artifacts; access policy is selected.

@@ -54,6 +54,26 @@ hr1:ready_seq
 
 A claim takes the Recipient with the smallest score. If an acknowledgement exposes another message for that Recipient, the Recipient receives a new sequence and returns to the end of the ready index. A Recipient has at most one member in the index.
 
+## Lease and retry deadline indexes
+
+Scheduled transitions are located through two derived Sorted Sets keyed by Recipient Identity:
+
+```text
+hr1:leases
+  score  = lease_expires_ms
+  member = <recipient_identity>
+
+hr1:retries
+  score  = retry_at_ms
+  member = <recipient_identity>
+```
+
+A Recipient is a member of `hr1:leases` only while its head state is `leased` and of `hr1:retries` only while its head state is `retry_wait`; it is never in both, and never in either while it is in `hr1:ready` or blocked. Each score equals the corresponding deadline field in `hr1:r:<recipient_identity>:s`. Claim, extension, acknowledgement, negative acknowledgement, expiry, retry activation, and dead-letter transitions update these memberships atomically with head state. Entries are locators only: maintenance rechecks head state, Delivery Token, attempt, and deadline before any transition, and startup reconciliation rebuilds both indexes from head state.
+
+## Consumer limit accounting
+
+The atomic claim transition enforces the work-pool-wide active-lease limit using authoritative Valkey time and the count of members whose score is later than that time. Due entries are not counted as active even when maintenance has not removed them; the claim transition still validates queue-head state before leasing. No separate global active-lease counter is stored. Waiting claims are HTTP requests held in one process, so their limit is process-local and requires no Valkey key. Process metrics expose both counts.
+
 ## Canonical Message
 
 A Canonical Message is stored as one JSON blob:
@@ -102,7 +122,9 @@ Completed Delivery Attempts are appended as compact JSON entries to a Valkey Lis
 hr1:a:<message_id>
 ```
 
-After successful acknowledgement, full attempt history is removed after producing the accepted compact success metadata. For a Dead-letter Message, full history remains available until the message is replayed, deleted, or reaches its eventual DLQ retention policy.
+Attempt entries contain `kind = "attempt"`. When the 10-cycle retention limit archives older cycles, the same List retains at most one leading compact entry with `kind = "archived_cycles_summary"` and the aggregate fields documented below; this is the accepted location of archived message-delivery metadata and no separate unspecified message-metadata key exists.
+
+After successful acknowledgement, full attempt history and any archived summary are removed after producing the accepted compact success metadata. For a Dead-letter Message, retained attempt history and its optional archived summary remain available until the message is replayed, deleted, or reaches its eventual DLQ retention policy.
 
 ## Delivery Token and idempotent operation records
 
@@ -112,7 +134,7 @@ The active Delivery Token is stored in plaintext as `delivery_token` in the Reci
 hr1:op:<operation_id>
 ```
 
-The claim-operation record has a 10-minute TTL and stores the request-argument digest. For an empty completed poll, it stores the recorded empty outcome until expiry. For a successful claim, it temporarily stores the completed response, including the plaintext token and payload reference needed to replay a lost HTTP response while the Delivery Attempt remains active. After acknowledgement, negative acknowledgement, or expiry of that attempt, the plaintext token and replayable payload response are removed from the claim-operation record, leaving only a marker that causes repeat claim requests to return `409 claim_no_longer_active` until the original 10-minute TTL expires. The token itself is never written to logs, metrics, URLs, attempt history, audit records, or compact success metadata.
+Claim and extension operation records share this namespace, include an operation kind and request-argument digest, and have a 10-minute TTL. An extension record stores its bounded completed deadline result for idempotent replay. For an empty completed claim poll, the record stores the empty outcome until expiry. For a successful claim, it temporarily stores the completed response, including the plaintext token and payload reference needed to replay a lost HTTP response while the Delivery Attempt remains active. After acknowledgement, negative acknowledgement, or expiry of that attempt, the plaintext token and replayable payload response are removed from the claim-operation record, leaving only a marker that causes repeat claim requests to return `409 claim_no_longer_active` until the original 10-minute TTL expires. The token itself is never written to logs, metrics, URLs, attempt history, audit records, or compact success metadata.
 
 After acknowledgement, negative acknowledgement, or expiry, plaintext copies of the token are deleted from active state and operation caches. A one-hour terminal tombstone is keyed by SHA-256 digest:
 
@@ -130,7 +152,27 @@ Administrative browser sessions are stored by session-token digest:
 hr1:admin_session:<session_digest>
 ```
 
-The session token itself is never stored in plaintext. The record contains creation, last-seen, idle-expiry, absolute-expiry, and CSRF token fields. The CSRF token is stored in plaintext so it can be returned by `GET /admin/v1/session`; it is never logged or copied to audit. Successful login creates this record and appends the required audit event in the same Lua operation.
+The session token itself is never stored in plaintext. The Hash contains `created_ms`, `last_seen_ms`, `idle_expires_ms`, `absolute_expires_ms`, `generation_id`, and the plaintext `csrf_token`. The CSRF token can be returned by `GET /admin/v1/session`; it is never logged or copied to audit.
+
+A global expiry and capacity index is:
+
+```text
+hr1:admin_sessions
+  score  = min(idle_expires_ms, absolute_expires_ms)
+  member = <session_digest>
+```
+
+The current Admin Secret generation is stored without the plaintext secret in:
+
+```text
+hr1:admin_auth
+```
+
+Its Hash fields are `generation_salt`, `generation_tag`, `generation_id`, and `updated_ms`. The salt is random. The tag is HMAC-SHA-256 keyed by the configured Admin Secret over `generation_salt || "hookrelay-admin-session-generation-v1"`; it is secret-adjacent verifier material and is never exposed through APIs, logs, metrics, or audit. `generation_id` is UUIDv7.
+
+At startup, a missing record is initialized before browser sessions are accepted. A tag mismatch means the configured Admin Secret changed. Because at most 100 sessions exist, one bounded Lua operation can enumerate `hr1:admin_sessions`, delete every indexed session Hash, clear the index, replace the tag and generation ID, and append the mandatory rotation audit event. Readiness requires a confirmed result; uncertain or inconsistent rotation state requires operator reconciliation rather than accepting old sessions. Every session request compares its stored generation ID with the current record, so an old session is invalid even if stale cleanup has not completed.
+
+Successful login atomically removes expired indexed sessions and their Hashes, checks `ZCARD` against the 100-session limit, creates the session Hash and index member with the current generation ID, and appends the required audit event. Throttled idle-expiry refresh updates both the Hash and score atomically. Logout removes both records. Stale or missing index/Hash pairs are handled by the session slice's startup reconciliation contract.
 
 ## Webhook Endpoint configuration
 
@@ -247,7 +289,7 @@ The global order is only the order of entry into dead-letter; it does not create
 
 Moving a message to dead-letter is one atomic transition that records the final attempt, removes the current queue head, creates the dead-letter Hash and index member, clears active head state, and exposes the next normal queue head if one exists.
 
-Dead-letter replay removes the dead-letter record and index entry, starts a new Delivery Cycle, and returns the same `message_id` before every not-yet-started message for its Recipient. It never interrupts an already leased head or a head waiting for retry: in those cases the replayed message is inserted immediately after that current head. If there is no active or retrying head, it is inserted directly at the queue head. The transition preserves the queue/state head invariant and includes the required administrative audit append in the same Lua operation.
+Dead-letter replay removes the dead-letter record and index entry, starts a new Delivery Cycle, and returns the same `message_id` before every not-yet-started message for its Recipient. It never interrupts an already leased head or a head waiting for retry: in those cases the replayed message is inserted immediately after that current head. If there is no active or retrying head, it is inserted directly at the queue head. The transition checks the original `dedup_identity_digest`: a record that points to another message rejects the default replay, while an explicit `keep_current` resolution proceeds without changing that newer mapping. Replay never restores the older mapping. The transition preserves the queue/state head invariant and includes the required administrative audit append in the same Lua operation.
 
 The dead-letter Hash is authoritative. Startup reconciliation removes stale global index members and restores missing index members. If the Canonical Message is missing or another ambiguity prevents safe repair, hookrelay creates the Recipient block marker described below.
 
@@ -270,7 +312,17 @@ reason_code
 
 Its presence blocks claim, acknowledgement, negative acknowledgement, extension, maintenance transitions, and new ingestion for that Recipient. The Recipient is absent from ready, lease-deadline, and retry-deadline indexes. Other Recipients continue normally.
 
-Hookrelay does not automatically alter ambiguous authoritative state and does not provide a generic repair UI in the first version. Operator recovery requires a runbook that verifies the corrected invariants before the marker is removed; the exact runbook remains an explicit open design deliverable. Detection and recovery are logged, metered, and audited. Audit of ambiguity detection is best effort and must not prevent creation of the protective Recipient block marker. This policy does not authorize automatic repair of ambiguous authoritative state.
+A derived Sorted Set lists blocked Recipients:
+
+```text
+hr1:blocked
+  score  = detected_ms
+  member = <recipient_identity>
+```
+
+The transition that creates a marker adds the index member and removes the Recipient from `hr1:ready`, `hr1:leases`, and `hr1:retries` in the same atomic operation. Marker removal after operator recovery removes the index member in the same operation that restores the Recipient's normal index memberships. The index backs `GET /admin/v1/recipient-states?status=blocked` pagination and the `hookrelay_blocked_recipients` gauge without scanning the keyspace. The marker remains authoritative: startup reconciliation removes index members without a marker and restores members for markers found by a bounded `SCAN` over `hr1:q:*`. A missing marker is never recreated from the index alone.
+
+Hookrelay does not automatically alter ambiguous authoritative state and does not provide a generic repair UI in the first version. The narrow inspection operation reports safe state and invariant results but performs no writes. After an incident-specific reviewed correction of authoritative state, the clear operation requires the marker's exact `detected_ms` and `reason_code`, revalidates every applicable queue/state/message invariant, and refuses ambiguous state. One Lua operation then removes the marker and blocked-index member, restores exactly the ready, lease, retry, or no-index membership implied by verified state, and appends the mandatory audit event. Detection is logged and metered with best-effort audit; clear is a critical audited mutation. The accepted procedure is the [Recipient block recovery runbook](../runbooks/recipient-block-recovery.md).
 
 ## Compact success metadata
 
@@ -296,7 +348,7 @@ It does not retain Bot Identifier, Chat Identifier, payload, Source Event Identi
 
 ## Delivery Cycle history limit
 
-Valkey retains at most the latest 10 Delivery Cycles for a message. Operator replay actions remain in the administrative audit log. When older cycles are removed, the message metadata retains aggregates:
+Valkey retains at most the latest 10 Delivery Cycles for a message. Operator replay actions remain in the administrative audit log. When older cycles are removed, the leading `archived_cycles_summary` entry in `hr1:a:<message_id>` retains aggregates:
 
 ```text
 archived_cycles
@@ -315,7 +367,7 @@ When retention expires, one Lua maintenance operation removes the global DLQ mem
 
 Administrative audit events are stored in the bounded `hr1:audit` Stream. Its accepted retention is at most 30 days or 1,000,000 events, whichever boundary is reached first. Event contents and redaction rules are defined in [platform design](platform.md#components).
 
-For critical administrative mutations, one versioned Lua operation performs the state change and appends the required event with `XADD`. This applies to Webhook Endpoint creation, enablement, disablement, and deletion, and administrative DLQ replay and permanent deletion. The API reports success only after both state and audit writes succeed. A repeated deletion of an already absent endpoint performs no new mutation and creates no additional audit event.
+For critical administrative mutations, one versioned Lua operation performs the state change and appends the required event with `XADD`. This applies to Webhook Endpoint creation, enablement, disablement, and deletion, administrative DLQ replay and permanent deletion, Admin Secret generation changes, and preconditioned clearing of a Recipient block. The API reports success only after both state and audit writes succeed. A repeated deletion of an already absent endpoint performs no new mutation and creates no additional audit event.
 
 Successful administrative login creates its session record and appends the required audit event in the same Lua operation. The server issues the session cookie only after confirmed success. Logout and session-expiry audit is best effort: an audit-write failure must not prevent revocation or keep an expired session valid. Logout returns `204` only after confirmed deletion or absence of the session, and `503` if revocation cannot be confirmed.
 
@@ -335,7 +387,7 @@ The first version does not implement storage migrations or maintain a separate `
 
 ## Milestone 1 storage contract boundary
 
-Before implementing the first vertical slice, its spec fixes exact encodings and Lua contracts for the keys it touches: `hr1:wh:<webhook_type>:<webhook_identifier>`, `hr1:bot:<bot_platform>:<bot_id>:webhooks`, `hr1:webhooks`, `hr1:audit`, `hr1:d:<dedup_identity_digest>`, `hr1:dedup_age`, `hr1:m:<message_id>`, `hr1:r:<recipient_identity>:q`, `hr1:r:<recipient_identity>:s`, `hr1:ready`, `hr1:ready_seq`, `hr1:leases`, `hr1:a:<message_id>`, `hr1:op:<operation_id>`, `hr1:t:<delivery_token_digest>`, `hr1:success:<message_id>`, `hr1:q:<recipient_identity>`, and `hr1:stats:queued_messages`. This covers endpoint creation and audit, atomic acceptance/deduplication, immediate claim, acknowledgement, terminal token result, claim replay state, and the first-slice Recipient ambiguity marker. The spec also fixes startup validation and safe repair for these structures and their derived indexes/counter; it must not reconstruct lost authoritative data or treat an unhandled inconsistency as ready. Later retry, DLQ, session, and maintenance field contracts and startup reconciliation checks are fixed before those slices rather than speculated about now.
+Before implementing the first vertical slice, its spec fixes exact encodings and Lua contracts for the keys it touches: `hr1:wh:<webhook_type>:<webhook_identifier>`, `hr1:bot:<bot_platform>:<bot_id>:webhooks`, `hr1:webhooks`, `hr1:audit`, `hr1:d:<dedup_identity_digest>`, `hr1:dedup_age`, `hr1:m:<message_id>`, `hr1:r:<recipient_identity>:q`, `hr1:r:<recipient_identity>:s`, `hr1:ready`, `hr1:ready_seq`, `hr1:leases`, `hr1:a:<message_id>`, `hr1:op:<operation_id>`, `hr1:t:<delivery_token_digest>`, `hr1:success:<message_id>`, `hr1:q:<recipient_identity>`, `hr1:blocked`, and `hr1:stats:queued_messages`. This covers endpoint creation and audit, atomic acceptance/deduplication, immediate claim, acknowledgement, terminal token result, claim replay state, and the first-slice Recipient ambiguity marker. The spec also fixes startup validation and safe repair for these structures and their derived indexes/counter; it must not reconstruct lost authoritative data or treat an unhandled inconsistency as ready. Later retry, DLQ, session, and maintenance field contracts and startup reconciliation checks are fixed before those slices rather than speculated about now.
 
 ## Accepted key names
 
@@ -355,8 +407,11 @@ hr1:dedup_age                              dedup age ZSET
 hr1:dlq                                    global DLQ ZSET
 hr1:dl:<message_id>                        dead-letter metadata
 hr1:q:<recipient_identity>                 ambiguous Recipient block marker
+hr1:blocked                                blocked Recipient index ZSET
 hr1:success:<message_id>                   compact success metadata
 hr1:admin_session:<session_digest>         administrative browser session
+hr1:admin_sessions                         session expiry/capacity ZSET
+hr1:admin_auth                             Admin Secret generation metadata
 hr1:wh:<webhook_type>:<webhook_identifier> Webhook Endpoint Hash
 hr1:bot:<bot_platform>:<bot_id>:webhooks   Bot Identity membership SET
 hr1:webhooks                               global endpoint listing ZSET

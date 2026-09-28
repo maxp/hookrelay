@@ -34,14 +34,14 @@ It includes:
 - all four Recipient scopes in the shared model;
 - duplicate handling as part of atomic acceptance;
 - the Lua transitions needed for endpoint creation, atomic acceptance, nonblocking claim, and acknowledgement; a minimal `hr1:audit` Stream and required audit append are implemented with endpoint creation from this first slice, never stubbed or replaced by stdout-only audit;
-- claim with `wait_ms=0`, while retaining the accepted request field;
+- claim with the complete `wait_ms=0–30,000` contract, initially implemented through bounded periodic ready-index rechecks; notification-based wake-up remains a later optimization;
 - Delivery Token terminal tombstone and idempotent repeated acknowledgement;
 - minimal startup reconciliation for the persisted structures implemented in this slice: validate authoritative state, repair only safely derivable indexes/counters, and apply the accepted Recipient block-marker policy to ambiguity it can isolate; never open the public listener or report ready before this check succeeds;
 - automatic Compose smoke coverage.
 
 It deliberately excludes:
 
-- long-poll waiting and wake-up;
+- notification-based long-poll wake-up and its tuning; periodic waiting is already compliant;
 - negative acknowledgement, retry, expiry, and DLQ;
 - full Admin CRUD beyond create/get;
 - browser sessions and UI;
@@ -63,6 +63,8 @@ The smoke test:
 
 Integration tests also cover safe repair of first-slice derived indexes/counters and refusal to become ready when a discovered inconsistency cannot be safely handled.
 
+Milestone 1 is an internal tracer-bullet checkpoint, not a production-ready release. In particular, if an active lease reaches its deadline or survives a process restart, Milestone 1 does not invent temporary expiry or retry semantics: it detects the due `hr1:leases` entry, marks readiness false, and leaves state unchanged for diagnosis. The smoke path acknowledges its lease before restart. Milestone 2, which adds the accepted expiry and retry transitions, is the first deployable release candidate.
+
 ## Milestone 2 — complete delivery failure path
 
 Adds:
@@ -77,11 +79,11 @@ claim
 → operator replay
 ```
 
-This milestone completes the core ordering and recovery semantics. Startup reconciliation expands from recognizing Milestone 1 lease state to executing the newly implemented lease-expiry, retry, and DLQ recovery transitions before readiness can be reported; it cannot defer safety for those structures to a later milestone.
+This milestone completes the core ordering and recovery semantics and is the first deployable release candidate. It includes the cooperative background maintenance and bounded inline maintenance needed to execute lease expiry and retry activation; those mechanisms cannot be deferred after their transitions exist. It also includes the accepted Admin Bearer replay API, delivery-state reconciliation read, matching CLI command, and the narrow blocked-Recipient inspection and audited clear operations required by the recovery runbook. Replay rejects a conflicting Deduplication Identity by default and accepts only the explicit `keep_current` override, which never rewrites the newer mapping. Startup reconciliation expands from recognizing Milestone 1 lease state to executing the newly implemented lease-expiry, retry, and DLQ recovery transitions before readiness can be reported.
 
 ## Later milestones
 
-3. Long polling, wake-up notifications, cooperative maintenance, and remaining Admin CRUD/CLI.
+3. Notification-based long-poll wake-up, waiting-claim tuning, and remaining Admin CRUD/CLI; the compliant periodic long-poll contract already exists from Milestone 1.
 4. Administrative browser sessions, operational UI, audit views, and the remaining DLQ inspection and permanent-deletion operations; replay already exists from Milestone 2.
 5. Cross-slice reconciliation hardening and recovery tests for the complete first-version storage model; evaluate periodic consistency checking separately after implementation experience. Each earlier milestone extends startup checks as it introduces new persisted state.
 

@@ -181,5 +181,5 @@ A canonical message removed from normal delivery after exhausting its retry poli
 _Avoid_: Duplicate message, rejected webhook
 
 **Dead-letter Replay**:
-An operator-requested return of a dead-letter message to the head of its recipient's delivery queue. Replay preserves the canonical message and message identifier, starts a new delivery cycle, creates new delivery attempts and tokens, and does not pass through ingestion deduplication. If the original deduplication identity now points to another message, replay requires explicit conflict resolution.
+An operator-requested return of a dead-letter message before all not-yet-started messages in its recipient's delivery queue. Replay does not interrupt a currently leased or retry-wait head and is inserted immediately after that head; otherwise it becomes the queue head. It preserves the canonical message and message identifier, starts a new delivery cycle, creates new delivery attempts and tokens, and does not pass through ingestion duplicate suppression. If the original deduplication identity now points to another message, replay rejects by default; the explicit `keep_current` resolution permits replay without changing the newer mapping.
 _Avoid_: Webhook retry, new canonical message, duplicate acceptance

@@ -44,7 +44,7 @@ HOOKRELAY_ADMIN_SECRET_FILE
 HOOKRELAY_ADMIN_SECRET
 ```
 
-For either secret, specifying both file and direct value is a startup error. Production prefers mounted files; local development may use environment values. Values are non-empty and limited to 8192 bytes. A single trailing newline is removed from file input. Secrets never appear in configuration summaries.
+For either secret, specifying both file and direct value is a startup error. Production prefers mounted files; local development may use environment values. Values are 16–8192 bytes after removal of one trailing newline from file input. Length validation cannot prove entropy: operators must still supply uniformly random values satisfying the accepted entropy requirement. The built-in generators produce 32 random bytes encoded as base64url without padding. Secrets never appear in configuration summaries.
 
 ## Deployment environment
 
@@ -160,7 +160,7 @@ MAX_DEDUP_RECORDS                 = 1000000
 DLQ_RETENTION                     = 720h
 ```
 
-Durations use Go duration syntax. Production requires `EXPECTED_PEAK_RATE` and validates that deduplication capacity can preserve minimum retention.
+Durations use Go duration syntax. `EXPECTED_PEAK_RATE` is a positive decimal number of newly accepted Deduplication Identities per second across all Webhook Types; duplicates do not consume this rate because they create no new record. Production requires it and validates that deduplication capacity can preserve minimum retention. The first version has one global deduplication target and minimum retention; a future per-Webhook-Type override requires an explicit configuration contract rather than an undocumented adapter override.
 
 ## Delivery and retry policy
 
@@ -192,5 +192,20 @@ HOOKRELAY_MAINTENANCE_MAX_CONTINUOUS_BATCHES=5
 ```
 
 Lease-expiry and retry-activation processing use the same batch-size limit. The inline pre-long-poll maintenance pass remains a fixed maximum of 10 entries in the first version rather than another configuration setting.
+
+## Fixed first-version TTLs
+
+The following accepted windows are deliberately fixed rather than configurable in the first version:
+
+```text
+claim and extension operation record = 10m
+terminal Delivery Token tombstone    = 1h
+compact success metadata             = 24h
+administrative session idle timeout  = 1h
+administrative session absolute TTL  = 12h
+administrative audit retention       = 30d or 1000000 events, whichever trims first
+```
+
+Deduplication and DLQ retention remain configurable as documented above. Making another TTL configurable requires adding its `HOOKRELAY_...` setting, validation, observability, and compatibility tests rather than silently reading an undocumented environment variable.
 
 All invalid or contradictory configuration is rejected at startup rather than silently corrected.

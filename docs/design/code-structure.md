@@ -81,7 +81,7 @@ type Definition struct {
 
 Verification, conversion, and platform response mapping remain separate interfaces. A platform package may implement several with one concrete type, but callers learn only the capability they use.
 
-Converters are pure transformations and never persist messages. Atomic acceptance is invoked by the ingestion module through a caller-owned interface such as `MessageAcceptor`, which returns bounded accepted, duplicate, capacity, and dependency results while the Valkey implementation hides deduplication, queues, indexes, counters, and scripts.
+Converters are pure transformations and never persist messages. Atomic acceptance is invoked by the ingestion module through a caller-owned interface such as `MessageAcceptor`, which returns bounded accepted, duplicate, Recipient-blocked, capacity, dependency, and internal-failure results while the Valkey implementation hides deduplication, queues, indexes, counters, and scripts.
 
 ## Valkey scripts and tests
 

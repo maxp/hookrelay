@@ -59,13 +59,13 @@ dedup_min_retention_ms =    86_400_000  # 24 hours
 max_dedup_records      =     1_000_000
 ```
 
-Webhook Types may override the target when their documented redelivery windows differ. The minimum effective retention is the lower bound under capacity pressure, not the normal target. Valkey memory is monitored with `noeviction` rather than arbitrary eviction of queue data.
+The first version uses this one global target and minimum for every Webhook Type. A future per-type override requires an explicit configuration shape and capacity-validation rule. The minimum effective retention is the lower bound under capacity pressure, not the normal target. Valkey memory is monitored with `noeviction` rather than arbitrary eviction of queue data.
 
 Under capacity pressure, hookrelay may delete the globally oldest deduplication records before their target retention, but never intentionally below the configured minimum window. If capacity cannot preserve the minimum window, new ingestion is rejected with a retryable response instead of silently reducing deduplication to zero.
 
 The configured retention is not permanently changed under pressure. As traffic or stored volume falls, effective retention naturally returns toward the configured target.
 
-Production configuration includes `expected_peak_rate`. Startup validates:
+Production configuration includes `expected_peak_rate`, measured as newly accepted Deduplication Identities per second across all Webhook Types. Duplicates create no record and do not consume this rate. Startup validates:
 
 ```text
 max_dedup_records >= expected_peak_rate * dedup_min_retention_seconds
@@ -88,4 +88,4 @@ After a deduplication record expires or is removed under capacity pressure, a re
 
 ## Dead-letter replay distinction
 
-Dead-letter replay is not ingestion. It preserves the original Canonical Message and `message_id`, starts a new Delivery Cycle, and does not check ingestion deduplication. If the original Deduplication Identity currently points to a different, newer message, replay requires explicit operator conflict resolution.
+Dead-letter replay is not ingestion. It preserves the original Canonical Message and `message_id`, starts a new Delivery Cycle, and bypasses ingestion duplicate suppression. It nevertheless checks the stored Deduplication Identity for conflict: if that identity points to a different, newer message, replay rejects by default. The explicit `keep_current` resolution permits replay without changing the newer mapping; replay never repoints the identity to the older message.

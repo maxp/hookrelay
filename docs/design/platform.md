@@ -33,19 +33,19 @@ The initial runtime consists of:
 
 The operational web UI is served by the Go application on the administrative listener. It is an operational panel rather than a full control plane. Webhook Endpoint configuration, Bot Identity mapping, enabled state, and verification credentials are managed through the authenticated Admin API and stored in the dedicated Valkey instance behind an internal repository interface. Webhook ingestion reads the current endpoint record directly from Valkey for every request; the first version has no in-memory configuration cache or cache-invalidation protocol. Administrative access is restricted to a trusted network and a separate shared Admin Secret; the Consumer Secret is never accepted for administrative access.
 
-The Admin Secret is an opaque uniformly random value with at least 64 bits of entropy. Production prefers a mounted secret file, while an environment variable is allowed for local development. Configuring both sources is a startup error. Only one Admin Secret is accepted at a time, it is compared in constant time, and it is never stored in Valkey, logs, metrics, UI output, or URLs. Rotation is a coordinated single-secret update rather than a zero-downtime dual-secret transition.
+The Admin Secret is an opaque uniformly random value with at least 64 bits of entropy and an accepted encoded length of 16–8192 bytes; length validation does not substitute for the entropy requirement. Production prefers a mounted secret file, while an environment variable is allowed for local development. Configuring both sources is a startup error. Only one Admin Secret is accepted at a time, it is compared in constant time, and it is never stored in Valkey, logs, metrics, UI output, or URLs. Rotation is a coordinated single-secret update rather than a zero-downtime dual-secret transition.
 
 The administrative listener hosts the Admin API, operational UI, liveness, readiness, metrics, redacted configuration inspection, and optional profiling endpoints. It uses a separate port and binds only to a trusted interface or network policy; it is not published directly to the public internet. `GET /debug/config` requires Admin authentication and exposes effective non-secret settings, their sources, and secret-configured flags, never secret values; Valkey URL userinfo is redacted.
 
 Go pprof is compiled in but disabled by default. `HOOKRELAY_PPROF_ENABLED=true` explicitly registers selected handlers by hand on the administrative mux; hookrelay never uses a side-effect import that registers them on the default mux. Profiling requires the Admin Secret as a Bearer token; browser sessions are not accepted. At most one profile request runs concurrently, CPU profiles are limited to 30 seconds, traces to 5 seconds, and responses use `Cache-Control: no-store`. Profiling access is logged to standard output and audited in Valkey when available, both best effort. A Valkey outage or audit-write failure does not itself block an otherwise authorized profile request, so profiling remains usable during dependency incidents; Admin Bearer authentication and profiling limits remain mandatory. Heap and goroutine profiles are treated as secret-bearing artifacts because process memory may contain plaintext webhook credentials, shared secrets, Delivery Tokens, payloads, and Recipient identifiers. Block and mutex sampling remain disabled by default.
 
-For browser access, an administrator enters the Admin Secret on a login page. The server creates a session and its required audit event in the same Lua operation, then issues the random administrative session token in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie only after confirmed success. Logout and session-expiry audit is best effort and must not prevent revocation or keep an expired session valid. Logout confirms success only after the session is deleted or known absent; if revocation cannot be confirmed, it returns `503`. Administrative sessions are stored in Valkey by token digest, have a one-hour idle timeout and a twelve-hour absolute timeout, and support immediate logout. At most 100 sessions may be active; capacity does not evict existing sessions, and a valid new login returns `429 session_capacity_exceeded` after expired-session cleanup while the limit remains reached. Every session must become invalid when the Admin Secret changes. The exact persisted generation or equivalent invalidation mechanism is selected before the browser-session slice; plaintext Admin Secret storage remains forbidden. Cookie-authenticated state-changing requests require `Origin` validation and CSRF tokens, and no state is changed through `GET` requests.
+For browser access, an administrator enters the Admin Secret on a login page. The server creates a session and its required audit event in the same Lua operation, then issues the random administrative session token in an `HttpOnly`, `SameSite=Strict`, `Path=/` cookie with no `Domain` only after confirmed success. Production also requires `Secure`; explicitly configured loopback-only local HTTP development may omit it as defined by the Admin API and configuration contracts. Logout and session-expiry audit is best effort and must not prevent revocation or keep an expired session valid. Logout confirms success only after the session is deleted or known absent; if revocation cannot be confirmed, it returns `503`. Administrative sessions are stored in Valkey by token digest, have a one-hour idle timeout and a twelve-hour absolute timeout, and support immediate logout. At most 100 sessions may be active; capacity does not evict existing sessions, and a valid new login returns `429 session_capacity_exceeded` after expired-session cleanup while the limit remains reached. Every session becomes invalid when the Admin Secret changes. A persistent random salt and HMAC-SHA-256 generation tag detect the change at startup; one bounded audited transition replaces the UUIDv7 generation and removes all indexed sessions before readiness. Each session carries that generation ID, and plaintext Admin Secret storage remains forbidden. Cookie-authenticated state-changing requests require `Origin` validation and CSRF tokens. `GET` requests never mutate application resources, although successful session authentication may perform the documented throttled update of session access metadata and its expiry index.
 
 The initial UI polls JSON endpoints every 5–10 seconds and supports operational inspection of health, Valkey, queues, leases, retry backlog, the global DLQ, blocked Recipients, recent compact delivery metadata, and Grafana links. Its actions are privileged DLQ payload inspection, replay, and confirmed deletion. Repair of an ambiguously blocked Recipient is an operator runbook task rather than a general first-version UI action. Webhook, Bot, credential, routing, and runtime-limit configuration are outside the first UI and remain Admin API or CLI responsibilities.
 
 Administrative audit events are written both to a bounded Valkey Stream for recent UI access and to structured standard output for external retention. The Valkey stream retains at most 30 days and 1,000,000 events, trimming whichever boundary is exceeded first. Audit events contain UUIDv7 identity, integer-millisecond time, bounded actor, operation, target, request, outcome, and optional reason codes; they never contain secrets, Delivery Tokens, full payloads, Authorization headers, stack traces, or complete request bodies. Login outcomes, logout and expiry, privileged payload views, replay, deletion, blocked-Recipient recovery, configuration changes, detected secret-generation changes, and reconciliation repairs or unresolved ambiguity are audited. Normal claim, acknowledgement, negative acknowledgement, and extension activity remains in Delivery Attempt history rather than the administrative audit log.
 
-Critical administrative mutations require audit persistence in Valkey. Webhook Endpoint creation, enablement, disablement, and deletion, plus administrative DLQ replay and permanent deletion, change state and append their audit event in the same Lua operation. The API confirms success only after both succeed; a standard-output audit copy remains best effort. Lua preconditions are checked before writes, but runtime errors do not roll back completed writes, and a lost response does not prove that no change occurred. The [storage contract](storage.md#administrative-audit) records these limits.
+Critical administrative mutations require audit persistence in Valkey. Webhook Endpoint creation, enablement, disablement, and deletion, administrative DLQ replay and permanent deletion, Admin Secret generation changes, and preconditioned Recipient-block clearing change state and append their audit event in the same Lua operation. The API confirms success only after both succeed; a standard-output audit copy remains best effort. Lua preconditions are checked before writes, but runtime errors do not roll back completed writes, and a lost response does not prove that no change occurred. The [storage contract](storage.md#administrative-audit) records these limits.
 
 Background DLQ deletion at retention expiry has the same mandatory state-change-plus-audit requirement. Safe derived-index repair and detection of ambiguous Recipient state use best-effort audit: an audit-write failure must not itself block reconciliation or creation of a protective Recipient block marker. This does not permit automatic repair of ambiguous authoritative state.
 
@@ -58,7 +58,7 @@ Privileged DLQ payload inspection requires a confirmed Valkey audit append befor
 - Application logs use standard `log/slog` and are structured JSON written to standard output.
 - Secrets, authorization headers, delivery tokens, and unredacted payloads are never logged.
 - Bot Identifier, Chat Identifier, User Identifier, and source IP are logged in clear text wherever they are known and applicable. Log access and retention must therefore treat these fields as potentially sensitive identifiers.
-- Prometheus labels may use bounded Bot Platform, Webhook Type, Recipient Scope, outcome, reason code, operation kind, and HTTP status class. They must not use Bot Identifier, Chat Identifier, Message Identifier, Webhook Identifier, Source Event Identifier, Delivery Token, operation identifier, or Consumer Instance Identifier.
+- Prometheus labels may use bounded Bot Platform, Webhook Type, Recipient Scope, outcome, reason code, operation kind, HTTP status class, and a per-adapter allowlist of known Platform Event Types in which every unrecognized value is aggregated as `unknown`. They must not use Bot Identifier, Chat Identifier, Message Identifier, Webhook Identifier, Source Event Identifier, Delivery Token, operation identifier, or Consumer Instance Identifier.
 - The administrative listener exposes Prometheus-compatible metrics.
 - Prometheus and Grafana are optional external components rather than runtime dependencies of hookrelay.
 - OpenTelemetry may be added later; the initial metrics path is direct Prometheus exposition.
@@ -157,10 +157,18 @@ hookrelay_webhook_request_body_bytes{webhook_type}
 hookrelay_messages_accepted_total{bot_platform,recipient_scope}
 hookrelay_messages_duplicate_total{webhook_type}
 hookrelay_dedup_conflicts_total{webhook_type}
+hookrelay_dedup_records
+hookrelay_dedup_record_capacity
+hookrelay_dedup_oldest_record_age_seconds
+hookrelay_dedup_effective_retention_seconds
+hookrelay_dedup_early_evictions_total
+hookrelay_dedup_capacity_rejections_total
+hookrelay_webhook_inflight
+hookrelay_accepting_webhooks
 hookrelay_routing_issues_total{bot_platform,reason}
 ```
 
-Webhook outcomes are bounded to accepted, duplicate, unknown endpoint, verification failure, invalid JSON, oversized body, rate limited, Recipient blocked, capacity rejection, dependency unavailable, and internal error.
+`hookrelay_accepting_webhooks` is `1` only while new-message acceptance is enabled; it becomes `0` under the accepted queue, memory, or deduplication stop conditions without implying that Consumer draining is unavailable. Deduplication gauges and counters provide the capacity signals required by the deduplication contract. Webhook outcomes are bounded to accepted, duplicate, unknown endpoint, verification failure, invalid JSON, oversized body, rate limited, Recipient blocked, capacity rejection, dependency unavailable, and internal error.
 
 ### Required delivery metrics
 
@@ -179,9 +187,22 @@ hookrelay_dead_letters_total{recipient_scope,reason}
 hookrelay_dead_letter_replays_total{outcome}
 ```
 
-Delivery attempt outcomes are bounded to acknowledgement, negative acknowledgement, expiry, and dead-letter.
+Delivery attempt outcomes are bounded to acknowledgement, negative acknowledgement, expiry, and dead-letter. Active leases are derived from the unexpired range of `hr1:leases`; waiting claims are counted in process memory.
 
 `hookrelay_queue_messages` is backed by a derived global counter stored as `hr1:stats:queued_messages`. Atomic Lua transitions update it with queue changes. It is not authoritative state. Startup reconciliation compares it with bounded scans and repairs safe differences; whether a periodic consistency checker repeats that work after startup remains open.
+
+### Required administrative metrics
+
+```text
+hookrelay_admin_login_attempts_total{outcome}
+hookrelay_admin_sessions
+hookrelay_webhook_endpoints
+hookrelay_audit_events_total{operation,outcome}
+hookrelay_audit_write_failures_total{operation}
+hookrelay_dlq_payload_inspections_total{outcome}
+```
+
+Administrative labels use only bounded operation and outcome allowlists. They never contain session, endpoint, message, Recipient, or actor identifiers.
 
 ### Required Valkey and maintenance metrics
 
@@ -210,9 +231,11 @@ Valkey operation labels are bounded to accepted operation names such as accept, 
 
 `GET /health/live` performs no Valkey or external dependency checks. It returns `200` while the process and diagnostic HTTP server can respond.
 
-`GET /health/ready` reports whether hookrelay can safely accept general new work. It is not ready when Valkey is unavailable or read-only, production AOF or `noeviction` is missing, Lua scripts cannot execute, startup reconciliation is incomplete, the hard global queue limit is reached, minimum deduplication retention cannot be preserved, or required secret configuration is invalid. A capacity-only not-ready state does not stop the already-running public listener or reject claims, acknowledgements, cleanup, and retention work that can drain stored state; it rejects new webhook acceptance as specified by the capacity policy. A full individual Recipient does not make the whole process unready; requests for that Recipient receive their own retryable capacity response.
+`GET /health/ready` reports whether hookrelay can safely serve its required APIs and allow stored state to drain. It is not ready when Valkey is unavailable or read-only, production AOF or `noeviction` is missing, Lua scripts cannot execute, startup reconciliation is incomplete, or required configuration is invalid. Runtime global queue, memory, or deduplication pressure alone does not make this endpoint fail: it keeps returning `200` while claims, acknowledgements, cleanup, and retention remain safe, and its bounded body includes `"accepting_webhooks": false`. A full individual Recipient likewise does not make the whole process unready; requests for that Recipient receive their own retryable capacity response.
 
-Both endpoints return bounded safe JSON such as `{"status":"ready"}` or a not-ready result with named check outcomes. They never expose Valkey URLs, credentials, internal key names, stack traces, Recipient identifiers, or detailed memory values. They require no Admin Secret because they are available only on the protected administrative listener.
+`GET /health/accepting-webhooks` is the separate ingestion-acceptance signal. It returns `200` while new webhook messages may be accepted and `503` while a global queue, memory, or deduplication stop condition rejects them. Webhook requests receive their documented retryable response independently of health polling. Deployment readiness probes use `/health/ready`; an ingestion-specific upstream or alert may use `/health/accepting-webhooks`, but must not use that endpoint to remove the Consumer API from routing.
+
+All three health endpoints return bounded safe JSON such as `{"status":"ready","accepting_webhooks":true}` or a result with named bounded check outcomes. They never expose Valkey URLs, credentials, internal key names, stack traces, Recipient identifiers, or detailed memory values. They require no Admin Secret because they are available only on the protected administrative listener.
 
 ## Service objectives and alerts
 
@@ -310,7 +333,7 @@ Production deployment must also define and test:
 - latency and capacity targets;
 - AOF rewrite monitoring.
 
-Readiness is false when there is no connection to the writable standalone instance, atomic scripts cannot execute, the `hr1` key namespace contract is incompatible, startup reconciliation is incomplete, production AOF or `noeviction` settings are missing, or the configured persistence contract cannot be verified. Grafana or Prometheus scraper availability, ordinary dead-letter messages, and bounded maintenance lag do not by themselves make hookrelay unready.
+The canonical readiness rules are defined under [health endpoints](#health-endpoints) and are not repeated with a second independent list here. Startup reconciliation checks compatibility of known `hr1:` structures by inspecting expected key types, required fields, value encodings, and script contracts; a separate `hr1:schema` record is not required. An incompatible known structure or an unisolatable ambiguity prevents readiness, while an ambiguity safely isolated to one Recipient follows the accepted block-marker policy. Grafana or Prometheus scraper availability, ordinary dead-letter messages, and bounded maintenance lag do not by themselves make hookrelay unready.
 
 ## Process lifecycle and shutdown
 
