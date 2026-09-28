@@ -113,19 +113,17 @@ func Serve(args []string) int {
 		"valkey_url", cfg.RedactedValkeyURL(),
 	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-	go func() {
-		<-ctx.Done()
-		// A second signal forces termination.
-		stop()
-		select {
-		case <-time.After(shutdownGraceForSecondSignal()):
-			fmt.Fprintln(os.Stderr, "hookrelay: forced termination on second signal")
-			os.Exit(ExitError)
-		case <-time.After(time.Second):
-		}
-	}()
+	serveCtx, stopNotify := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopNotify()
+
+	// The force channel stays registered while the graceful path drains: a
+	// second signal forces termination instead of the default disposition.
+	forceCh := make(chan os.Signal, 4)
+	signal.Notify(forceCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(forceCh)
+	appDone := make(chan struct{})
+	secondSignal := make(chan bool, 1)
+	go func() { secondSignal <- watchSecondSignal(serveCtx, forceCh, appDone) }()
 
 	adminLn, err := net.Listen("tcp", cfg.AdminAddress)
 	if err != nil {
@@ -139,14 +137,38 @@ func Serve(args []string) int {
 		return ExitError
 	}
 
-	if err := application.Run(ctx, adminLn, publicLn); err != nil {
+	runErr := application.Run(serveCtx, adminLn, publicLn)
+	close(appDone)
+	forced := <-secondSignal
+	if forced {
+		fmt.Fprintln(os.Stderr, "hookrelay: forced termination on second signal")
+		return ExitError
+	}
+	if runErr != nil {
 		log.Error("server failure", "event", "server_failed", "error_code", "internal_error")
 		return ExitError
 	}
 	return ExitOK
 }
 
-func shutdownGraceForSecondSignal() time.Duration { return time.Second }
+// watchSecondSignal reports whether a second signal arrives while the
+// controlled shutdown drains. The first signal also lands in forceCh, so its
+// duplicate is drained first; a genuinely second signal then fires the force
+// path. Without a second signal the watchdog completes through appDone.
+func watchSecondSignal(serveCtx context.Context, forceCh <-chan os.Signal, appDone <-chan struct{}) bool {
+	<-serveCtx.Done()
+	select {
+	case <-forceCh:
+	default:
+	}
+	select {
+	case <-forceCh:
+		fmt.Fprintln(os.Stderr, "hookrelay: forced termination on second signal")
+		return true
+	case <-appDone:
+		return false
+	}
+}
 
 // Version prints build information in human-readable or JSON form.
 func Version(args []string, stdout io.Writer) int {

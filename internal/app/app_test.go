@@ -138,7 +138,7 @@ func TestRunShutsDownCleanly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run returned error on clean shutdown: %v", err)
 		}
-	case <-timeAfter(5 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancellation")
 	}
 

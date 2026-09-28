@@ -60,8 +60,6 @@ services:
       retries: 12
       start_period: 5s
     read_only: true
-    tmpfs:
-      - /tmp
     cap_drop:
       - ALL
     security_opt:

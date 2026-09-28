@@ -175,6 +175,17 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 		}
 		return f, nil
 	}
+	getInt64 := func(env string, def int64) (int64, error) {
+		raw := get(env)
+		if raw == "" {
+			return def, nil
+		}
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", env, err)
+		}
+		return n, nil
+	}
 	getDuration := func(env string, def time.Duration) (time.Duration, error) {
 		raw := get(env)
 		if raw == "" {
@@ -304,7 +315,7 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	if c.DedupMinRetention, err = getDuration("HOOKRELAY_DEDUP_MIN_RETENTION", 24*time.Hour); err != nil {
 		return nil, err
 	}
-	if c.MaxDedupRecords, err = getInt64(getenv, "HOOKRELAY_MAX_DEDUP_RECORDS", 1000000); err != nil {
+	if c.MaxDedupRecords, err = getInt64("HOOKRELAY_MAX_DEDUP_RECORDS", 1000000); err != nil {
 		return nil, err
 	}
 	if c.ExpectedPeakRate, err = getFloat("HOOKRELAY_EXPECTED_PEAK_RATE", 0); err != nil {
@@ -357,18 +368,6 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
-}
-
-func getInt64(getenv func(string) string, env string, def int64) (int64, error) {
-	raw := getenv(env)
-	if raw == "" {
-		return def, nil
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", env, err)
-	}
-	return n, nil
 }
 
 func getRetryDelays(raw string, def []time.Duration) ([]time.Duration, error) {

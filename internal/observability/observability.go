@@ -5,6 +5,7 @@ package observability
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -32,27 +33,7 @@ func SetBuildVersion(version string) {
 // message rather than the default time and msg keys. The level is selected
 // at startup; there is no runtime level API.
 func NewLogger(level string) *slog.Logger {
-	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: parseLevel(level),
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			switch a.Key {
-			case slog.TimeKey:
-				if t, ok := a.Value.Any().(time.Time); ok {
-					return slog.Int64("timestamp_ms", t.UnixMilli())
-				}
-				return slog.Attr{}
-			case slog.LevelKey:
-				if l, ok := a.Value.Any().(slog.Level); ok {
-					return slog.String("level", levelName(l))
-				}
-				return a
-			case slog.MessageKey:
-				return slog.String("message", a.Value.String())
-			}
-			return a
-		},
-	})
-	return slog.New(&envelopeHandler{inner: h})
+	return slog.New(newJSONHandler(os.Stdout, level))
 }
 
 // LogEvent records a feature event with the required bounded event name and
@@ -119,7 +100,16 @@ func (h *envelopeHandler) WithGroup(name string) slog.Handler {
 
 // NewTestLogger writes envelope-compliant JSON into the provided buffer —
 // used by tests to assert the log contract.
-func NewTestLogger(level string, w writer) *slog.Logger {
+// NewTestLogger writes envelope-compliant JSON into the provided buffer —
+// used by tests to assert the log contract.
+func NewTestLogger(level string, w io.Writer) *slog.Logger {
+	return slog.New(newJSONHandler(w, level))
+}
+
+// newJSONHandler builds the single envelope handler: bounded level names,
+// integer timestamp_ms, and message instead of the default msg key, wrapped
+// with the required service and version stamping.
+func newJSONHandler(w io.Writer, level string) *envelopeHandler {
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: parseLevel(level),
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
@@ -140,11 +130,7 @@ func NewTestLogger(level string, w writer) *slog.Logger {
 			return a
 		},
 	})
-	return slog.New(&envelopeHandler{inner: h})
-}
-
-type writer interface {
-	Write(p []byte) (int, error)
+	return &envelopeHandler{inner: h}
 }
 
 // NewMetricsRegistry returns a private Prometheus registry. hookrelay never

@@ -88,4 +88,5 @@ jobs:
             --build-arg VERSION="${GITHUB_SHA::7}" \
             --build-arg COMMIT="${GITHUB_SHA::7}" \
             --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg DIRTY="$( [ -n "$(git status --porcelain)" ] && echo true || echo false )" \
             -t hookrelay:ci .
