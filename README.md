@@ -4,7 +4,7 @@ Webhook relay that distributes incoming events to recipients through ordered del
 
 ## Status
 
-The project is at the design stage. The runtime, ingestion contract, deduplication model, storage shape, ordered Consumer API, Admin API, Telegram adapter, deployment policy, and first implementation milestone have been selected; implementation has not started.
+Milestone 1 (the tracer-bullet vertical slice) is in progress. Done so far: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey. The ingestion, delivery, and Consumer API slices are pending. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/).
 
 ## Goals
 
@@ -65,10 +65,14 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 ## Repository layout
 
 - `cmd/hookrelay` — the single executable entry point;
-- `internal/app` — composition root, listeners, readiness, graceful shutdown;
+- `internal/app` — composition root, listeners, readiness gate, graceful shutdown;
 - `internal/config` — flags, environment, defaults, and startup validation;
 - `internal/observability` — structured logging and the private metrics registry;
 - `internal/cli` — serve, version, generate, and healthcheck commands;
+- `internal/administration` — Admin API service and HTTP transport;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts, readiness gate, endpoint store;
+- `internal/ingestion` — Webhook Type registry (verification and conversion seams);
+- `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
 
@@ -79,6 +83,15 @@ Build and test with the pinned Go toolchain (see `go.mod`):
 ```sh
 go build ./...
 go test ./...
+```
+
+Storage tests run against a real pinned Valkey (a fake cannot prove script
+semantics). Point `HOOKRELAY_TEST_VALKEY_URL` at an instance; without it the
+integration tests skip locally. CI runs them against `valkey/valkey:9.1.2`:
+
+```sh
+docker run --rm -p 6379:6379 valkey/valkey:9.1.2
+HOOKRELAY_TEST_VALKEY_URL=valkey://127.0.0.1:6379/0 go test ./...
 ```
 
 Generate local shared secrets and run the Compose stack (pinned Valkey with
@@ -93,6 +106,27 @@ docker compose up --build
 
 Health endpoints live on the administrative listener:
 `/health/live`, `/health/ready`, `/health/accepting-webhooks`, `/metrics`.
+The public listener opens only after the readiness gate (Valkey availability,
+script load, known-structure validation) has succeeded.
+
+## Admin API
+
+The administrative listener serves the authenticated Admin API. Requests
+authenticate with `Authorization: Bearer <admin secret>`
+(`HOOKRELAY_ADMIN_SECRET` or `HOOKRELAY_ADMIN_SECRET_FILE`); rejected attempts
+are audited best effort. Health and metrics endpoints stay unauthenticated.
+
+- `POST /admin/v1/webhooks` — create a Webhook Endpoint (`webhook_type`,
+  `bot_id`, `credential`; optional `webhook_identifier`, `enabled`). Returns
+  `201` with `Location`, an `ETag` of `"<generation_id>:<config_version>"`,
+  and a safe body that never contains the credential value. Duplicate
+  identifiers and the per-bot endpoint limit return `409`.
+- `GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` — read the
+  endpoint metadata with its `ETag`; a missing endpoint returns `404`.
+
+Every mutation commits the state change and the audit append as one atomic
+Lua operation. The full contract lives in
+[`docs/design/admin-api.md`](docs/design/admin-api.md).
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
 
