@@ -1,6 +1,3 @@
-// Package app is the composition root and lifecycle owner. It wires immutable
-// configuration, logging, metrics, feature modules, and the public and
-// administrative HTTP listeners, and owns readiness and graceful shutdown.
 package app
 
 import (
@@ -21,9 +18,13 @@ import (
 // shutdownDeadline is the controlled shutdown deadline.
 const shutdownDeadline = 30 * time.Second
 
+// readinessProbeInterval is the Valkey-loss monitor cadence. Loss flips
+// readiness false; recovery re-runs the full gate before readiness returns.
+const readinessProbeInterval = time.Second
+
 // Readiness is the shared readiness/acceptance state. The startup
-// reconciliation gate (storage slices) flips it to ready; it never reports
-// ready by default, so a partially built process is never falsely ready.
+// reconciliation gate flips it to ready; it never reports ready by default,
+// so a partially built process is never falsely ready.
 type Readiness struct {
 	ready     atomic.Bool
 	accepting atomic.Bool
@@ -45,13 +46,23 @@ func (r *Readiness) Ready() bool { return r.ready.Load() }
 func (r *Readiness) AcceptingWebhooks() bool { return r.accepting.Load() }
 
 // Deps carries the collaborators the application needs. Feature modules wire
-// into it as they arrive; the scaffold knows only logging, metrics, and
-// configuration.
+// into it as they arrive.
 type Deps struct {
 	Config    *config.Config
 	Logger    logger
 	Registry  *prometheus.Registry
 	Readiness *Readiness
+
+	// AdminAPI is mounted on the administrative listener (feature routes
+	// such as /admin/v1/...). Health and metrics stay unauthenticated:
+	// they are protected by the listener placement.
+	AdminAPI http.Handler
+
+	// Gate is the startup/recovery readiness gate: connectivity, production
+	// persistence checks, script loads, and structure validation. The
+	// administrative listener starts before the gate; the public listener
+	// opens only after the first successful gate.
+	Gate func(context.Context) error
 }
 
 type logger interface {
@@ -77,10 +88,13 @@ func New(deps Deps) *App {
 	adminMux.HandleFunc("GET /health/ready", a.handleReady)
 	adminMux.HandleFunc("GET /health/accepting-webhooks", a.handleAcceptingWebhooks)
 	adminMux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
+	if deps.AdminAPI != nil {
+		adminMux.Handle("/", deps.AdminAPI)
+	}
 
 	// The public listener carries webhook and Consumer API routes in later
-	// slices; it serves nothing yet and starts only after configuration
-	// validation (the reconciliation gate joins here with the storage work).
+	// slices; it serves nothing yet and starts only after the readiness gate
+	// succeeds.
 	publicMux := http.NewServeMux()
 
 	a.adminServer = &http.Server{
@@ -104,20 +118,68 @@ func (a *App) AdminHandler() http.Handler { return a.adminServer.Handler }
 // PublicHandler exposes the public HTTP handler for tests.
 func (a *App) PublicHandler() http.Handler { return a.publicServer.Handler }
 
-// Run starts both listeners and blocks until ctx is cancelled, then performs
-// the controlled shutdown: readiness false first, then connection draining.
-// The administrative listener starts before the public listener so that
-// liveness, readiness, and metrics expose startup progress.
-func (a *App) Run(ctx context.Context, lnAdmin, lnPublic net.Listener) error {
+// Run starts the administrative listener, runs the readiness gate, opens the
+// public listener only after the gate succeeds, monitors Valkey loss, and
+// blocks until ctx is cancelled, then performs the controlled shutdown.
+// openPublic must bind and return the public listener at call time.
+func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(context.Context) (net.Listener, error)) error {
 	log := a.deps.Logger
 	errAdmin := make(chan error, 1)
-	errPublic := make(chan error, 1)
 
 	log.Info("starting administrative listener", "event", "listener_started", "listener", "admin", "address", a.deps.Config.AdminAddress)
-	go func() { errAdmin <- a.adminServer.Serve(lnAdmin) }()
+	go func() { errAdmin <- a.adminServer.Serve(adminLn) }()
 
-	log.Info("starting public listener", "event", "listener_started", "listener", "public", "address", a.deps.Config.PublicAddress)
-	go func() { errPublic <- a.publicServer.Serve(lnPublic) }()
+	// Public listener lifecycle: opened after the first successful gate.
+	var publicLn atomic.Value // net.Listener
+	publicOpen := &atomic.Bool{}
+	openPublicListener := func() {
+		if publicOpen.Load() || openPublic == nil {
+			return
+		}
+		ln, err := openPublic(ctx)
+		if err != nil {
+			log.Error("public listener failed", "event", "listener_failed", "listener", "public", "error_code", "internal_error")
+			return
+		}
+		publicLn.Store(ln)
+		publicOpen.Store(true)
+		log.Info("starting public listener", "event", "listener_started", "listener", "public", "address", a.deps.Config.PublicAddress)
+		go func() { _ = a.publicServer.Serve(ln) }()
+	}
+
+	// Readiness gate + monitor: initial gate gates the public listener;
+	// subsequent ticks recover or withdraw readiness. Gate is cheap enough
+	// for a fixed one-second cadence in the first version.
+	runGate := func() {
+		if a.deps.Gate == nil {
+			return
+		}
+		if err := a.deps.Gate(ctx); err != nil {
+			if a.deps.Readiness.Ready() {
+				log.Warn("readiness withdrawn", "event", "readiness_withdrawn", "reason", "gate_failed")
+			}
+			a.deps.Readiness.MarkNotReady()
+			return
+		}
+		if !a.deps.Readiness.Ready() {
+			log.Info("readiness acquired", "event", "readiness_acquired")
+			a.deps.Readiness.MarkReady()
+			openPublicListener()
+		}
+	}
+	runGate()
+	monitor := time.NewTicker(readinessProbeInterval)
+	defer monitor.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-monitor.C:
+				runGate()
+			}
+		}
+	}()
 
 	<-ctx.Done()
 	log.Info("shutdown initiated", "event", "shutdown_initiated", "deadline_ms", shutdownDeadline.Milliseconds())
@@ -130,12 +192,15 @@ func (a *App) Run(ctx context.Context, lnAdmin, lnPublic net.Listener) error {
 	if err := a.adminServer.Shutdown(shutdownCtx); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := a.publicServer.Shutdown(shutdownCtx); err != nil && firstErr == nil {
-		firstErr = err
+	if publicOpen.Load() {
+		if err := a.publicServer.Shutdown(shutdownCtx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if ln, ok := publicLn.Load().(net.Listener); ok {
+			ln.Close()
+		}
 	}
-	// Serve on a closed listener returns http.ErrServerClosed; drain both.
 	<-errAdmin
-	<-errPublic
 	log.Info("shutdown complete", "event", "shutdown_complete")
 	return firstErr
 }

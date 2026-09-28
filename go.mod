@@ -2,7 +2,11 @@ module github.com/maxp/hookrelay
 
 go 1.27.1
 
-require github.com/prometheus/client_golang v1.24.1
+require (
+	github.com/google/uuid v1.6.0
+	github.com/prometheus/client_golang v1.24.1
+	github.com/valkey-io/valkey-go v1.0.78
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

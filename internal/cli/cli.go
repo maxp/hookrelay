@@ -17,10 +17,37 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/maxp/hookrelay/internal/administration"
 	"github.com/maxp/hookrelay/internal/app"
 	"github.com/maxp/hookrelay/internal/config"
+	"github.com/maxp/hookrelay/internal/gen"
+	"github.com/maxp/hookrelay/internal/ingestion"
 	"github.com/maxp/hookrelay/internal/observability"
+	"github.com/maxp/hookrelay/internal/valkey"
 )
+
+// types is the process-wide Webhook Type registry, wired into administration
+// through its narrow TypeCatalog view.
+var types *ingestion.Registry
+
+func init() {
+	r, err := ingestion.Builtin()
+	if err != nil {
+		panic(err)
+	}
+	types = r
+}
+
+// typeCatalog adapts the ingestion registry to the administration catalog.
+type typeCatalog struct{ registry *ingestion.Registry }
+
+func (c typeCatalog) Lookup(webhookType string) (string, []string, bool) {
+	d, ok := c.registry.Lookup(ingestion.WebhookType(webhookType))
+	if !ok {
+		return "", nil, false
+	}
+	return string(d.Platform), d.CredentialKinds, true
+}
 
 // Exit codes per the lifecycle contract: controlled clean shutdown 0,
 // runtime/internal failure 1, configuration or CLI usage failure 2.
@@ -98,11 +125,49 @@ func Serve(args []string) int {
 	observability.SetBuildVersion(version)
 	log := observability.NewLogger(cfg.LogLevel)
 	registry := observability.NewMetricsRegistry()
+
+	// Valkey adapter: eager dial is the first dependency check (ADR 0006).
+	// Connection bounds follow the verified client model: the pipeline ring
+	// is capped at 2^2 = 4 connections (well under MaxConnections), and the
+	// blocking pool is bounded by the waiting-claim limit with the configured
+	// idle floor. Exact long-poll sizing joins with the Consumer API slice.
+	opt, err := valkey.ParseURL(cfg.ValkeyURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
+		return ExitUsage
+	}
+	opt.PipelineMultiplex = 2
+	opt.BlockingPoolSize = cfg.MaxWaitingClaims
+	opt.BlockingPoolMinSize = cfg.ValkeyMinIdle
+	adapter, err := valkey.NewAdapter(opt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
+		return ExitError
+	}
+	defer adapter.Close()
+
+	catalog := typeCatalog{registry: types}
+	svc := administration.NewService(
+		valkey.NewEndpointStore(adapter),
+		catalog,
+		valkey.NewAuditSink(adapter),
+		adminSecret,
+		gen.Crypto{},
+	)
+
+	readiness := &app.Readiness{}
+	gate := func(ctx context.Context) error {
+		_, err := adapter.ValidateReadiness(ctx, cfg.Production())
+		return err
+	}
+
 	application := app.New(app.Deps{
 		Config:    cfg,
 		Logger:    log,
 		Registry:  registry,
-		Readiness: &app.Readiness{},
+		Readiness: readiness,
+		AdminAPI:  administration.Handler(svc, gen.Crypto{}),
+		Gate:      gate,
 	})
 
 	log.Info("hookrelay starting",
@@ -130,14 +195,13 @@ func Serve(args []string) int {
 		log.Error("admin listener failed", "event", "listener_failed", "error_code", "internal_error", "listener", "admin")
 		return ExitError
 	}
-	publicLn, err := net.Listen("tcp", cfg.PublicAddress)
-	if err != nil {
-		log.Error("public listener failed", "event", "listener_failed", "error_code", "internal_error", "listener", "public")
-		adminLn.Close()
-		return ExitError
-	}
+	defer adminLn.Close()
 
-	runErr := application.Run(serveCtx, adminLn, publicLn)
+	// The public listener opens only after the readiness gate succeeds; the
+	// app owns the deferred open so recovery re-gates before it returns.
+	runErr := application.Run(serveCtx, adminLn, func(ctx context.Context) (net.Listener, error) {
+		return net.Listen("tcp", cfg.PublicAddress)
+	})
 	close(appDone)
 	forced := <-secondSignal
 	if forced {

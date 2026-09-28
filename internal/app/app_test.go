@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -107,30 +108,65 @@ func TestPublicListenerServesNothingYet(t *testing.T) {
 	}
 }
 
-// TestRunShutsDownCleanly exercises the lifecycle: both listeners start, the
-// public one only after the administrative one, and context cancellation
-// drains without error within the deadline.
-func TestRunShutsDownCleanly(t *testing.T) {
-	app := New(testDeps(t))
+// TestRunGatesPublicListener exercises the lifecycle: the administrative
+// listener starts before the gate, the public listener opens only after the
+// gate succeeds, a failing gate holds readiness down, and context
+// cancellation drains without error within the deadline.
+func TestRunGatesPublicListener(t *testing.T) {
+	deps := testDeps(t)
+	gateOK := false
+	deps.Gate = func(context.Context) error {
+		if gateOK {
+			return nil
+		}
+		return errors.New("gate failed")
+	}
+	deps.Readiness = &Readiness{}
+	app := New(deps)
+
 	adminLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("admin listen: %v", err)
 	}
-	publicLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("public listen: %v", err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- app.Run(ctx, adminLn, publicLn) }()
+	opened := false
+	go func() {
+		errCh <- app.Run(ctx, adminLn, func(context.Context) (net.Listener, error) {
+			opened = true
+			return net.Listen("tcp", "127.0.0.1:0")
+		})
+	}()
 
-	// Both listeners answer while running.
-	resp, err := http.Get("http://" + adminLn.Addr().String() + "/health/live")
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("live probe: %v %v", resp, err)
+	// Admin answers while the gate fails; readiness stays down; the public
+	// listener is NOT opened.
+	time.Sleep(1500 * time.Millisecond) // let initial gate + one probe tick run
+	resp, err := http.Get("http://" + adminLn.Addr().String() + "/health/ready")
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("ready during failed gate: %v %v", resp, err)
 	}
 	resp.Body.Close()
+	if opened {
+		t.Fatal("public listener opened before the gate succeeded")
+	}
+
+	// The gate succeeds: readiness flips and the public listener opens.
+	gateOK = true
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + adminLn.Addr().String() + "/health/ready")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && opened {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !opened {
+		t.Fatal("public listener did not open after the gate succeeded")
+	}
 
 	cancel()
 	select {
@@ -142,7 +178,7 @@ func TestRunShutsDownCleanly(t *testing.T) {
 		t.Fatal("Run did not return after cancellation")
 	}
 
-	// After shutdown the listeners are closed.
+	// After shutdown the admin listener is closed.
 	if _, err := http.Get("http://" + adminLn.Addr().String() + "/health/live"); err == nil {
 		t.Error("admin listener still accepting after shutdown")
 	}

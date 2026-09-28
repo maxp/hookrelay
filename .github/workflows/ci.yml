@@ -47,6 +47,27 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - run: go test -race ./...
 
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:9.1.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      HOOKRELAY_TEST_VALKEY_URL: valkey://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test ./...
+
   vet:
     runs-on: ubuntu-latest
     steps:
