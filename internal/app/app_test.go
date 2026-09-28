@@ -184,3 +184,68 @@ func TestRunGatesPublicListener(t *testing.T) {
 		t.Error("admin listener still accepting after shutdown")
 	}
 }
+
+// TestRunHoldsReadinessUntilPublicListenerOpens pins that a successful gate
+// alone never reports ready: while the public bind fails, readiness stays
+// down and the bind is retried on the next gate run.
+func TestRunHoldsReadinessUntilPublicListenerOpens(t *testing.T) {
+	deps := testDeps(t)
+	deps.Gate = func(context.Context) error { return nil }
+	deps.Readiness = &Readiness{}
+	app := New(deps)
+
+	adminLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("admin listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	bindOK := &atomic.Bool{}
+	attempts := &atomic.Int32{}
+	go func() {
+		errCh <- app.Run(ctx, adminLn, func(context.Context) (net.Listener, error) {
+			attempts.Add(1)
+			if !bindOK.Load() {
+				return nil, errors.New("address already in use")
+			}
+			return net.Listen("tcp", "127.0.0.1:0")
+		})
+	}()
+
+	readyStatus := func() int {
+		resp, err := http.Get("http://" + adminLn.Addr().String() + "/health/ready")
+		if err != nil {
+			return 0
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	time.Sleep(1500 * time.Millisecond) // initial gate + at least one tick
+	if got := readyStatus(); got != http.StatusServiceUnavailable {
+		t.Fatalf("ready while the public bind fails = %d, want 503", got)
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("public bind attempts = %d, want a retry on the next gate run", attempts.Load())
+	}
+
+	bindOK.Store(true)
+	deadline := time.Now().Add(3 * time.Second)
+	for readyStatus() != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatal("readiness not acquired after the public bind succeeded")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error on clean shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+}

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -21,6 +22,10 @@ const shutdownDeadline = 30 * time.Second
 // readinessProbeInterval is the Valkey-loss monitor cadence. Loss flips
 // readiness false; recovery re-runs the full gate before readiness returns.
 const readinessProbeInterval = time.Second
+
+// gateTimeout bounds one gate run so a hung dependency cannot stall startup
+// or the loss monitor indefinitely.
+const gateTimeout = 5 * time.Second
 
 // Readiness is the shared readiness/acceptance state. The startup
 // reconciliation gate flips it to ready; it never reports ready by default,
@@ -129,48 +134,66 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 	log.Info("starting administrative listener", "event", "listener_started", "listener", "admin", "address", a.deps.Config.AdminAddress)
 	go func() { errAdmin <- a.adminServer.Serve(adminLn) }()
 
-	// Public listener lifecycle: opened after the first successful gate.
+	// Public listener lifecycle: opened after the first successful gate. A
+	// public server that stops unexpectedly clears publicOpen and withdraws
+	// readiness, so the next gate run reopens it.
 	var publicLn atomic.Value // net.Listener
 	publicOpen := &atomic.Bool{}
-	openPublicListener := func() {
+	openPublicListener := func() bool {
 		if publicOpen.Load() || openPublic == nil {
-			return
+			return true
 		}
 		ln, err := openPublic(ctx)
 		if err != nil {
 			log.Error("public listener failed", "event", "listener_failed", "listener", "public", "error_code", "internal_error")
-			return
+			return false
 		}
 		publicLn.Store(ln)
 		publicOpen.Store(true)
 		log.Info("starting public listener", "event", "listener_started", "listener", "public", "address", a.deps.Config.PublicAddress)
-		go func() { _ = a.publicServer.Serve(ln) }()
+		go func() {
+			if err := a.publicServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("public listener stopped", "event", "listener_failed", "listener", "public", "error_code", "internal_error")
+				a.deps.Readiness.MarkNotReady()
+				publicOpen.Store(false)
+			}
+		}()
+		return true
 	}
 
 	// Readiness gate + monitor: initial gate gates the public listener;
-	// subsequent ticks recover or withdraw readiness. Gate is cheap enough
+	// subsequent ticks recover or withdraw readiness. Readiness is reported
+	// only once the public listener is actually open. Gate is cheap enough
 	// for a fixed one-second cadence in the first version.
 	runGate := func() {
 		if a.deps.Gate == nil {
 			return
 		}
-		if err := a.deps.Gate(ctx); err != nil {
+		gateCtx, cancel := context.WithTimeout(ctx, gateTimeout)
+		err := a.deps.Gate(gateCtx)
+		cancel()
+		if err != nil {
 			if a.deps.Readiness.Ready() {
 				log.Warn("readiness withdrawn", "event", "readiness_withdrawn", "reason", "gate_failed")
 			}
 			a.deps.Readiness.MarkNotReady()
 			return
 		}
-		if !a.deps.Readiness.Ready() {
-			log.Info("readiness acquired", "event", "readiness_acquired")
-			a.deps.Readiness.MarkReady()
-			openPublicListener()
+		if a.deps.Readiness.Ready() || ctx.Err() != nil {
+			return
 		}
+		if !openPublicListener() {
+			return
+		}
+		log.Info("readiness acquired", "event", "readiness_acquired")
+		a.deps.Readiness.MarkReady()
 	}
 	runGate()
 	monitor := time.NewTicker(readinessProbeInterval)
 	defer monitor.Stop()
+	monitorDone := make(chan struct{})
 	go func() {
+		defer close(monitorDone)
 		for {
 			select {
 			case <-ctx.Done():
@@ -182,6 +205,8 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 	}()
 
 	<-ctx.Done()
+	// The monitor must not reopen the public listener during shutdown.
+	<-monitorDone
 	log.Info("shutdown initiated", "event", "shutdown_initiated", "deadline_ms", shutdownDeadline.Milliseconds())
 	a.deps.Readiness.MarkNotReady()
 	a.deps.Readiness.SetAcceptingWebhooks(false)
@@ -192,13 +217,11 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 	if err := a.adminServer.Shutdown(shutdownCtx); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if publicOpen.Load() {
-		if err := a.publicServer.Shutdown(shutdownCtx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if ln, ok := publicLn.Load().(net.Listener); ok {
-			ln.Close()
-		}
+	if err := a.publicServer.Shutdown(shutdownCtx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if ln, ok := publicLn.Load().(net.Listener); ok {
+		ln.Close()
 	}
 	<-errAdmin
 	log.Info("shutdown complete", "event", "shutdown_complete")
