@@ -107,7 +107,10 @@ docker compose up --build
 Health endpoints live on the administrative listener:
 `/health/live`, `/health/ready`, `/health/accepting-webhooks`, `/metrics`.
 The public listener opens only after the readiness gate (Valkey availability,
-script load, known-structure validation) has succeeded.
+script load with digest verification, known-structure validation) has
+succeeded, and `/health/ready` reports ready only once that listener is open.
+The gate re-runs every second; losing Valkey withdraws readiness until the
+full gate passes again.
 
 ## Admin API
 
@@ -117,15 +120,21 @@ authenticate with `Authorization: Bearer <admin secret>`
 are audited best effort. Health and metrics endpoints stay unauthenticated.
 
 - `POST /admin/v1/webhooks` — create a Webhook Endpoint (`webhook_type`,
-  `bot_id`, `credential`; optional `webhook_identifier`, `enabled`). Returns
-  `201` with `Location`, an `ETag` of `"<generation_id>:<config_version>"`,
-  and a safe body that never contains the credential value. Duplicate
-  identifiers and the per-bot endpoint limit return `409`.
+  `bot_id`, `credential`; optional `webhook_identifier`, `enabled`). The body
+  must be `application/json` (`415` otherwise) and at most 16 KiB (`413`).
+  Returns `201` with `Location`, an `ETag` of
+  `"<generation_id>:<config_version>"`, and a safe body that never contains
+  the credential value. Duplicate identifiers and the per-bot endpoint limit
+  return `409`. A `503` whose message says the outcome is uncertain means the
+  create may have been applied: read the endpoint and the audit before
+  retrying.
 - `GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` — read the
   endpoint metadata with its `ETag`; a missing endpoint returns `404`.
 
 Every mutation commits the state change and the audit append as one atomic
-Lua operation. The full contract lives in
+Lua operation, logs a feature event such as `webhook_endpoint_created`, and
+is counted in `hookrelay_audit_events_total`; failed best-effort audit
+appends are counted in `hookrelay_audit_write_failures_total`. The full contract lives in
 [`docs/design/admin-api.md`](docs/design/admin-api.md).
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
