@@ -21,8 +21,18 @@ const maintenanceOpTimeout = 5 * time.Second
 
 // Maintenance kinds (the bounded kind label).
 const (
-	kindLeaseExpiry     = "lease_expiry"
-	kindRetryActivation = "retry_activation"
+	kindLeaseExpiry           = "lease_expiry"
+	kindRetryActivation       = "retry_activation"
+	kindInlineLeaseExpiry     = "inline_lease_expiry"
+	kindInlineRetryActivation = "inline_retry_activation"
+)
+
+// inlinePassLimit bounds the due entries one claim processes before it
+// waits; inlinePassBudget bounds the time the pass may take, well inside
+// the claim's route deadline slack.
+const (
+	inlinePassLimit  = 10
+	inlinePassBudget = 2 * time.Second
 )
 
 // maintenanceResult is the bounded result label of one maintenance entry.
@@ -157,27 +167,77 @@ func (m *Maintenance) RunRound(ctx context.Context) {
 	m.runKind(ctx, kindRetryActivation, m.d.Retries.DueRetries, m.activateRetry)
 }
 
+// transition applies one maintenance transition and returns its bounded
+// result; kind is the label its failures are logged under.
+type transition func(ctx context.Context, kind string, e DueEntry) maintenanceResult
+
+// dueReader reads at most limit due entries of one kind.
+type dueReader func(ctx context.Context, limit int) (DueBatch, error)
+
+// InlinePass is the bounded self-healing path of a claim that found no
+// ready work before it waits: at most inlinePassLimit due entries in total,
+// due leases first, through the same transitions, events, and metrics as a
+// round, attributed to the inline kinds. The pass is detached from the
+// request (a started transition completes even if the client leaves) and
+// bounded by inlinePassBudget. Background maintenance remains the primary
+// path.
+func (m *Maintenance) InlinePass(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inlinePassBudget)
+	defer cancel()
+	remaining := inlinePassLimit
+	for _, k := range []struct {
+		kind    string
+		read    dueReader
+		process transition
+	}{{kindInlineLeaseExpiry, m.d.Leases.DueLeases, m.expireLease}, {kindInlineRetryActivation, m.d.Retries.DueRetries, m.activateRetry}} {
+		if remaining == 0 || ctx.Err() != nil {
+			return
+		}
+		batch, ok := m.read(ctx, k.kind, k.read, remaining)
+		if !ok {
+			continue // the other kind keeps its budget
+		}
+		for _, e := range batch.Entries {
+			m.processOne(ctx, k.kind, k.process, e)
+		}
+		remaining -= len(batch.Entries)
+	}
+}
+
 // ProcessDue expires the named due leases and activates the named due
 // retries through the same transitions, events, and metrics as a round.
 // Startup reconciliation reports these Recipients (without mutating them)
 // and hands them over before readiness. Each transition re-validates
 // state, so a Recipient that is no longer due is counted as stale.
 func (m *Maintenance) ProcessDue(ctx context.Context, leases, retries []string) {
-	for _, set := range []struct {
+	for _, k := range []struct {
 		kind    string
 		rids    []string
-		process func(context.Context, DueEntry) maintenanceResult
+		process transition
 	}{{kindLeaseExpiry, leases, m.expireLease}, {kindRetryActivation, retries, m.activateRetry}} {
-		for _, rid := range set.rids {
-			m.processOne(ctx, set.kind, set.process, DueEntry{RecipientIdentity: rid})
+		for _, rid := range k.rids {
+			m.processOne(ctx, k.kind, k.process, DueEntry{RecipientIdentity: rid})
 		}
 	}
 }
 
-// runKind runs the continuous batches of one maintenance kind. process
-// applies one transition and returns its bounded result label.
-func (m *Maintenance) runKind(ctx context.Context, kind string, read func(context.Context, int) (DueBatch, error),
-	process func(context.Context, DueEntry) maintenanceResult) {
+// read reads one batch of due entries with its own deadline; a failure is
+// logged and counted, and ok is false.
+func (m *Maintenance) read(ctx context.Context, kind string, read dueReader, limit int) (DueBatch, bool) {
+	readCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
+	defer cancel()
+	batch, err := read(readCtx, limit)
+	if err != nil {
+		observability.LogEvent(m.log, slog.LevelWarn, "maintenance_read_failed", "maintenance could not read due entries",
+			"kind", kind, "error_code", "dependency_unavailable")
+		m.processed.WithLabelValues(kind, string(resultFailed)).Inc()
+		return DueBatch{}, false
+	}
+	return batch, true
+}
+
+// runKind runs the continuous batches of one maintenance kind.
+func (m *Maintenance) runKind(ctx context.Context, kind string, read dueReader, process transition) {
 	for i := 0; i < m.d.Config.MaxContinuousBatches && ctx.Err() == nil; i++ {
 		n, ok := m.batch(context.WithoutCancel(ctx), kind, i == 0, read, process)
 		if !ok || n < m.d.Config.BatchSize {
@@ -188,16 +248,10 @@ func (m *Maintenance) runKind(ctx context.Context, kind string, read func(contex
 
 // batch processes one batch of due entries and reports how many were read;
 // ok is false when the read failed.
-func (m *Maintenance) batch(ctx context.Context, kind string, first bool, read func(context.Context, int) (DueBatch, error),
-	process func(context.Context, DueEntry) maintenanceResult) (int, bool) {
+func (m *Maintenance) batch(ctx context.Context, kind string, first bool, read dueReader, process transition) (int, bool) {
 	start := m.d.Clock.Now()
-	readCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
-	batch, err := read(readCtx, m.d.Config.BatchSize)
-	cancel()
-	if err != nil {
-		observability.LogEvent(m.log, slog.LevelWarn, "maintenance_read_failed", "maintenance could not read due entries",
-			"kind", kind, "error_code", "dependency_unavailable")
-		m.processed.WithLabelValues(kind, string(resultFailed)).Inc()
+	batch, ok := m.read(ctx, kind, read, m.d.Config.BatchSize)
+	if !ok {
 		return 0, false
 	}
 	if first {
@@ -217,14 +271,14 @@ func (m *Maintenance) batch(ctx context.Context, kind string, first bool, read f
 
 // processOne applies one transition with its own deadline and counts its
 // result.
-func (m *Maintenance) processOne(ctx context.Context, kind string, process func(context.Context, DueEntry) maintenanceResult, e DueEntry) {
+func (m *Maintenance) processOne(ctx context.Context, kind string, process transition, e DueEntry) {
 	opCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
 	defer cancel()
-	m.processed.WithLabelValues(kind, string(process(opCtx, e))).Inc()
+	m.processed.WithLabelValues(kind, string(process(opCtx, kind, e))).Inc()
 }
 
 // activateRetry applies one retry activation.
-func (m *Maintenance) activateRetry(ctx context.Context, e DueEntry) maintenanceResult {
+func (m *Maintenance) activateRetry(ctx context.Context, kind string, e DueEntry) maintenanceResult {
 	res := m.d.Retries.ActivateRetry(ctx, e.RecipientIdentity)
 	switch res.Outcome {
 	case ActivationActivated:
@@ -234,14 +288,14 @@ func (m *Maintenance) activateRetry(ctx context.Context, e DueEntry) maintenance
 	case ActivationRecipientBlocked:
 		return resultBlocked
 	default:
-		m.transitionFailed(kindRetryActivation, string(res.Outcome))
+		m.transitionFailed(kind, string(res.Outcome))
 		return resultFailed
 	}
 }
 
 // expireLease applies one lease expiry with freshly drawn retry delays and
 // records the expired attempt.
-func (m *Maintenance) expireLease(ctx context.Context, e DueEntry) maintenanceResult {
+func (m *Maintenance) expireLease(ctx context.Context, kind string, e DueEntry) maintenanceResult {
 	res := m.d.Leases.ExpireLease(ctx, e.RecipientIdentity, m.d.RetryPolicy.DrawDelaysMs(m.d.Uniform), m.d.RetryPolicy.MaxAttempts)
 	switch res.Outcome {
 	case ExpiryRetryScheduled:
@@ -271,7 +325,7 @@ func (m *Maintenance) expireLease(ctx context.Context, e DueEntry) maintenanceRe
 	case ExpiryRecipientBlocked:
 		return resultBlocked
 	default:
-		m.transitionFailed(kindLeaseExpiry, string(res.Outcome))
+		m.transitionFailed(kind, string(res.Outcome))
 		return resultFailed
 	}
 }

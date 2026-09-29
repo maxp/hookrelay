@@ -290,13 +290,19 @@ curl -X POST http://<public>/v1/deliveries/claim \
   `HOOKRELAY_MAX_WAITING_CLAIMS` (default 20) claims wait per process;
   more receive `429 consumer_limit_exceeded` with `Retry-After: 1`.
   Graceful shutdown ends waiting claims with `503` and `Retry-After: 1`.
+  Before a waiting claim waits on an empty ready index it runs one bounded
+  maintenance pass (at most 10 due lease expiries and retry activations,
+  counted as `kind=inline_lease_expiry`/`inline_retry_activation`) and
+  rechecks at once, so a retry that just became due is claimed without
+  waiting for background maintenance.
 - Metrics: `hookrelay_delivery_claims_total{outcome}`,
   `hookrelay_delivery_attempts_total{recipient_scope,outcome}`,
   `hookrelay_delivery_attempt_duration_seconds{recipient_scope,outcome}`,
   `hookrelay_retries_waiting`, `hookrelay_dead_letter_messages`,
   `hookrelay_dead_letters_total{recipient_scope,reason}`,
   `hookrelay_maintenance_processed_total{kind,result}` (`kind` =
-  `lease_expiry` | `retry_activation`; `result` = `applied` | `stale` |
+  `lease_expiry` | `retry_activation` | `inline_lease_expiry` |
+  `inline_retry_activation`; `result` = `applied` | `stale` |
   `blocked` | `failed`),
   `hookrelay_maintenance_due_lag_seconds{kind}`,
   `hookrelay_maintenance_batch_size{kind}`,

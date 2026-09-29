@@ -89,9 +89,16 @@ func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *de
 	if err != nil {
 		t.Fatal(err)
 	}
+	inline, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
+		Retries: store, Leases: store, RetryPolicy: testPolicy, Attempts: attempts, Registerer: reg,
+		Config: delivery.MaintenanceConfig{Interval: time.Second, BatchSize: 100, MaxContinuousBatches: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	consumer, err := delivery.NewHandler(delivery.HandlerDeps{
-		Attempts: attempts,
-		Claimer:  store, Acknowledger: store, NegativeAcknowledger: store, Extender: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
+		Attempts: attempts, InlineMaintenance: inline,
+		Claimer: store, Acknowledger: store, NegativeAcknowledger: store, Extender: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
 		RetryPolicy: testPolicy,
 	})
 	if err != nil {
@@ -576,5 +583,39 @@ func TestExtendOverRealValkey(t *testing.T) {
 	time.Sleep(time.Duration(c.Delivery.LeaseExpiresMs-c.Delivery.ClaimedMs)*time.Millisecond + 100*time.Millisecond) // past the original deadline
 	if w := send(public, "/v1/deliveries/ack", `{"delivery_token":"`+c.Delivery.DeliveryToken+`"}`, auth); w.Code != http.StatusOK {
 		t.Errorf("ack after the original deadline = %d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestInlinePassOverRealValkey pins the claim-path self-healing with no
+// background maintenance running: a waiting claim that finds the ready
+// index empty activates the due retry itself and returns attempt 2 at once.
+func TestInlinePassOverRealValkey(t *testing.T) {
+	public, _, _, _ := composeStack(t)
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	update := `{"update_id":13,"message":{"message_id":1,"date":1700000000,"chat":{"id":-82},"text":"inline"}}`
+	if w := send(public, "/webhook/telegram/wh_d", update, map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}); w.Code != http.StatusOK {
+		t.Fatalf("webhook = %d", w.Code)
+	}
+	w := send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-000000000051","wait_ms":0}`, auth)
+	var first claimBody
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &first) != nil {
+		t.Fatalf("claim = %d %s", w.Code, w.Body.String())
+	}
+	if w := send(public, "/v1/deliveries/nack", `{"delivery_token":"`+first.Delivery.DeliveryToken+`"}`, auth); w.Code != http.StatusOK {
+		t.Fatalf("nack = %d %s", w.Code, w.Body.String())
+	}
+	time.Sleep(50 * time.Millisecond) // the 10-20 ms retry delay is due
+
+	start := time.Now()
+	w = send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-000000000052","wait_ms":10000}`, auth)
+	var retried claimBody
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &retried) != nil {
+		t.Fatalf("waiting claim = %d %s", w.Code, w.Body.String())
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Errorf("waiting claim returned after %v; the inline pass should activate the retry before any recheck pause", elapsed)
+	}
+	if retried.Delivery.Attempt != 2 || retried.Delivery.DeliveryToken == first.Delivery.DeliveryToken {
+		t.Errorf("retried delivery = %+v", retried.Delivery)
 	}
 }

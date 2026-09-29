@@ -64,6 +64,9 @@ type HandlerDeps struct {
 	Stats                StatsReader
 	// Attempts counts completed attempts; maintenance shares the instance.
 	Attempts *AttemptMetrics
+	// InlineMaintenance, when set, runs once before a waiting claim waits
+	// on an empty ready index; the claim then rechecks at once.
+	InlineMaintenance InlineMaintainer
 	// RetryPolicy chooses the retry delay after a failed attempt.
 	RetryPolicy RetryPolicy
 	// Uniform draws the retry jitter in [0, 1) (rand.Float64 when nil).
@@ -245,6 +248,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	final := wait == 0
+	inlineDone := false
 	for {
 		// Only the final check at the deadline records an empty outcome, so
 		// rechecks under the same operation_id never replay an early empty.
@@ -260,6 +264,23 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 		if res.Outcome != ClaimEmpty || final {
 			h.respondClaim(w, c, req.OperationID, res)
 			return
+		}
+		if !inlineDone && h.d.InlineMaintenance != nil {
+			// Bounded self-healing before waiting: due expiries and retry
+			// activations may make work ready; recheck once at once.
+			inlineDone = true
+			h.d.InlineMaintenance.InlinePass(ctx)
+			if r.Context().Err() != nil {
+				h.metrics.claims.WithLabelValues("cancelled").Inc()
+				return
+			}
+			select {
+			case <-h.stopping:
+				h.respondShutdown(w, c)
+				return
+			default:
+			}
+			continue
 		}
 		pause := time.NewTimer(h.recheckDelay())
 		select {

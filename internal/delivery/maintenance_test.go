@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func (f *fakeActivator) ActivateRetry(_ context.Context, rid string) ActivationR
 // fakeExpirer serves due leases from a pending list, oldest first, and
 // removes each one it expires.
 type fakeExpirer struct {
+	readErr error
 	nowMs   int64
 	pending []DueEntry
 	reads   []int
@@ -65,6 +67,9 @@ type fakeExpirer struct {
 
 func (f *fakeExpirer) DueLeases(_ context.Context, limit int) (DueBatch, error) {
 	f.reads = append(f.reads, limit)
+	if f.readErr != nil {
+		return DueBatch{}, f.readErr
+	}
 	n := min(limit, len(f.pending))
 	return DueBatch{NowMs: f.nowMs, Entries: append([]DueEntry(nil), f.pending[:n]...)}, nil
 }
@@ -416,5 +421,61 @@ func TestMaintenanceProcessDue(t *testing.T) {
 	}
 	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"delivery_lease_expired"`)); n != 2 {
 		t.Errorf("delivery_lease_expired events = %d", n)
+	}
+}
+
+// TestMaintenanceInlinePassIsBounded pins the claim-path pass: at most 10
+// due entries in total, due leases first, attributed to the inline kinds.
+func TestMaintenanceInlinePassIsBounded(t *testing.T) {
+	expirer := &fakeExpirer{nowMs: 10_000, pending: dueEntries(7, 9_000)}
+	activator := &fakeActivator{nowMs: 10_000, pending: dueEntries(8, 9_500)}
+	mh := newExpiryHarness(t, activator, expirer, nil)
+	mh.m.InlinePass(context.Background())
+	if len(expirer.expired) != 7 || len(activator.activated) != 3 {
+		t.Fatalf("inline pass expired %d, activated %d; want 7 and 3", len(expirer.expired), len(activator.activated))
+	}
+	if len(expirer.reads) != 1 || expirer.reads[0] != 10 || len(activator.reads) != 1 || activator.reads[0] != 3 {
+		t.Errorf("reads: leases %v, retries %v; want [10] and [3]", expirer.reads, activator.reads)
+	}
+	for kind, want := range map[string]float64{"inline_lease_expiry": 7, "inline_retry_activation": 3} {
+		if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": kind, "result": "applied"}); got != want {
+			t.Errorf("processed{%s} = %v, want %v", kind, got, want)
+		}
+	}
+	if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": "lease_expiry"}); got != -1 {
+		t.Errorf("inline work attributed to the background kind: %v", got)
+	}
+	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"delivery_lease_expired"`)); n != 7 {
+		t.Errorf("delivery_lease_expired events = %d", n)
+	}
+
+	// Nothing due: one lease read, no retry read beyond the remaining bound.
+	idle := &fakeExpirer{nowMs: 10_000}
+	idleRetries := &fakeActivator{nowMs: 10_000}
+	mh = newExpiryHarness(t, idleRetries, idle, nil)
+	mh.m.InlinePass(context.Background())
+	if len(idle.reads) != 1 || len(idleRetries.reads) != 1 || idleRetries.reads[0] != 10 {
+		t.Errorf("idle reads: leases %v, retries %v", idle.reads, idleRetries.reads)
+	}
+}
+
+// TestMaintenanceInlinePassFailures pins the inline failure paths: a
+// failed lease read is logged and still leaves the retry read its budget,
+// and a failed transition is logged under its inline kind.
+func TestMaintenanceInlinePassFailures(t *testing.T) {
+	expirer := &fakeExpirer{readErr: errors.New("connection refused")}
+	activator := &fakeActivator{nowMs: 10_000, pending: dueEntries(2, 9_000), outcome: func(string) ActivationOutcome { return ActivationInternalFailure }}
+	mh := newExpiryHarness(t, activator, expirer, nil)
+	mh.m.InlinePass(context.Background())
+	if len(activator.reads) != 1 || activator.reads[0] != 10 || len(activator.activated) != 2 {
+		t.Errorf("retry reads %v, activated %d after a failed lease read", activator.reads, len(activator.activated))
+	}
+	logs := mh.logs.String()
+	if !strings.Contains(logs, `"event":"maintenance_read_failed"`) || !strings.Contains(logs, `"kind":"inline_lease_expiry"`) {
+		t.Errorf("read failure not logged under the inline kind:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"event":"maintenance_transition_failed"`) || !strings.Contains(logs, `"kind":"inline_retry_activation"`) ||
+		strings.Contains(logs, `"kind":"retry_activation"`) {
+		t.Errorf("transition failure not logged under the inline kind:\n%s", logs)
 	}
 }

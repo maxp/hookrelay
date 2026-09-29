@@ -221,6 +221,8 @@ hookrelay_maintenance_processed_total{kind,result}
 hookrelay_maintenance_due_lag_seconds{kind}
 hookrelay_maintenance_batch_size{kind}
 hookrelay_maintenance_duration_seconds{kind}
+# kind: lease_expiry, retry_activation, later dlq_retention; processed_total
+# also counts the claim-path inline_lease_expiry / inline_retry_activation
 hookrelay_blocked_recipients
 hookrelay_consistency_issues_total{kind,resolution}
 hookrelay_reconciliation_in_progress

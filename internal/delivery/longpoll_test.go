@@ -303,3 +303,106 @@ func TestClientCancelDuringCheck(t *testing.T) {
 		t.Errorf("claim outcomes = %v", counts)
 	}
 }
+
+// fakeInline records inline passes and the number of claim checks run
+// before each.
+type fakeInline struct {
+	mu      sync.Mutex
+	claimer *scriptedClaimer
+	passes  []int
+}
+
+func (f *fakeInline) InlinePass(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.passes = append(f.passes, len(f.claimer.snapshot()))
+}
+
+func (f *fakeInline) snapshot() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.passes...)
+}
+
+// TestLongPollInlinePassBeforeWaiting pins the bounded self-healing path:
+// a waiting claim whose first check is empty runs one inline maintenance
+// pass and rechecks at once (without recording empty), so a due retry is
+// claimed by the very claim that found the index empty.
+func TestLongPollInlinePassBeforeWaiting(t *testing.T) {
+	inline := &fakeInline{}
+	ph := newPollHarness(t, HandlerDeps{RecheckInterval: 500 * time.Millisecond, RecheckJitter: 1, InlineMaintenance: inline}, func(n int) ClaimResult {
+		if n == 1 {
+			return ClaimResult{Outcome: ClaimEmpty}
+		}
+		return claimedResult(ClaimClaimed)
+	})
+	inline.claimer = ph.claimer
+	start := time.Now()
+	w := ph.claim(context.Background(), "30000")
+	if w.Code != http.StatusOK {
+		t.Fatalf("claim = %d", w.Code)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("returned after %v; the recheck after the inline pass must not wait for the interval", elapsed)
+	}
+	if passes := inline.snapshot(); len(passes) != 1 || passes[0] != 1 {
+		t.Errorf("inline passes = %v, want one after the first check", passes)
+	}
+	calls := ph.claimer.snapshot()
+	if len(calls) != 2 || calls[1].RecordEmpty {
+		t.Errorf("checks = %+v, want an immediate non-recording recheck", calls)
+	}
+}
+
+// TestLongPollInlinePassOnlyOnce pins that the pass runs once per claim and
+// the claim then waits normally; a wait_ms=0 claim never runs it.
+func TestLongPollInlinePassOnlyOnce(t *testing.T) {
+	inline := &fakeInline{}
+	ph := newPollHarness(t, HandlerDeps{RecheckInterval: 20 * time.Millisecond, RecheckJitter: 1, InlineMaintenance: inline}, alwaysEmpty)
+	inline.claimer = ph.claimer
+	if w := ph.claim(context.Background(), "150"); w.Code != http.StatusNoContent {
+		t.Fatalf("claim = %d", w.Code)
+	}
+	if passes := inline.snapshot(); len(passes) != 1 {
+		t.Errorf("inline passes = %v, want exactly one", passes)
+	}
+	if calls := ph.claimer.snapshot(); len(calls) < 4 || !calls[len(calls)-1].RecordEmpty {
+		t.Errorf("checks = %d, want the normal waiting loop ending in a recorded empty", len(calls))
+	}
+
+	inline = &fakeInline{}
+	ph = newPollHarness(t, HandlerDeps{InlineMaintenance: inline}, alwaysEmpty)
+	inline.claimer = ph.claimer
+	if w := ph.claim(context.Background(), "0"); w.Code != http.StatusNoContent {
+		t.Fatalf("claim = %d", w.Code)
+	}
+	if passes := inline.snapshot(); len(passes) != 0 {
+		t.Errorf("wait_ms=0 ran inline passes: %v", passes)
+	}
+}
+
+// blockingInline runs its hook inside the pass.
+type blockingInline struct{ during func() }
+
+func (b blockingInline) InlinePass(context.Context) { b.during() }
+
+// TestLongPollInlinePassThenStopOrLeave pins that a claim does not recheck
+// after the pass when shutdown began (503) or the client left (no
+// response, cancelled) meanwhile.
+func TestLongPollInlinePassThenStopOrLeave(t *testing.T) {
+	var ph *pollHarness
+	ph = newPollHarness(t, HandlerDeps{InlineMaintenance: blockingInline{during: func() { ph.h.Shutdown() }}}, alwaysEmpty)
+	if w := ph.claim(context.Background(), "30000"); w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" {
+		t.Errorf("claim during shutdown = %d", w.Code)
+	}
+	if n := len(ph.claimer.snapshot()); n != 1 {
+		t.Errorf("checks = %d, want no recheck after shutdown began", n)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ph = newPollHarness(t, HandlerDeps{InlineMaintenance: blockingInline{during: cancel}}, alwaysEmpty)
+	w := ph.claim(ctx, "30000")
+	if n := len(ph.claimer.snapshot()); n != 1 || w.Body.Len() != 0 {
+		t.Errorf("checks = %d, body %q; want no recheck and no response after the client left", n, w.Body.String())
+	}
+}

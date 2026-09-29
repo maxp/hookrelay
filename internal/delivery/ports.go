@@ -286,3 +286,9 @@ type ExtendResult struct {
 type Extender interface {
 	Extend(ctx context.Context, req ExtendRequest) ExtendResult
 }
+
+// InlineMaintainer runs the bounded maintenance pass a waiting claim makes
+// before it waits on an empty ready index.
+type InlineMaintainer interface {
+	InlinePass(ctx context.Context)
+}

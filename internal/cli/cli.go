@@ -214,26 +214,6 @@ func Serve(args []string) int {
 		JitterMin:   cfg.RetryJitterMin,
 		JitterMax:   cfg.RetryJitterMax,
 	}
-	consumerAPI, err := delivery.NewHandler(delivery.HandlerDeps{
-		Claimer:              deliveryStore,
-		Acknowledger:         deliveryStore,
-		NegativeAcknowledger: deliveryStore,
-		Extender:             deliveryStore,
-		Stats:                deliveryStore,
-		RetryPolicy:          retryPolicy,
-		Attempts:             attempts,
-		ConsumerSecret:       consumerSecret,
-		MaxWaitingClaims:     cfg.MaxWaitingClaims,
-		Gen:                  gen.Crypto{},
-		Clock:                gen.SystemClock{},
-		Logger:               log,
-		Registerer:           registry,
-	})
-	if err != nil {
-		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
-		return ExitError
-	}
-
 	maintenance, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
 		Retries:     deliveryStore,
 		Leases:      deliveryStore,
@@ -251,6 +231,27 @@ func Serve(args []string) int {
 	})
 	if err != nil {
 		log.Error("maintenance wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
+
+	consumerAPI, err := delivery.NewHandler(delivery.HandlerDeps{
+		Claimer:              deliveryStore,
+		Acknowledger:         deliveryStore,
+		NegativeAcknowledger: deliveryStore,
+		Extender:             deliveryStore,
+		InlineMaintenance:    maintenance,
+		Stats:                deliveryStore,
+		RetryPolicy:          retryPolicy,
+		Attempts:             attempts,
+		ConsumerSecret:       consumerSecret,
+		MaxWaitingClaims:     cfg.MaxWaitingClaims,
+		Gen:                  gen.Crypto{},
+		Clock:                gen.SystemClock{},
+		Logger:               log,
+		Registerer:           registry,
+	})
+	if err != nil {
+		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
 		return ExitError
 	}
 
