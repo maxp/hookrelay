@@ -60,7 +60,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - [`docs/design/telegram-adapter.md`](docs/design/telegram-adapter.md) defines Telegram verification, update identity, and recipient extraction policy.
 - [`docs/design/storage.md`](docs/design/storage.md) defines the accepted internal Valkey data structures and key namespace.
 - [`docs/design/open-questions.md`](docs/design/open-questions.md) lists decisions that remain open.
-- [`docs/runbooks/recipient-block-recovery.md`](docs/runbooks/recipient-block-recovery.md) defines safe diagnosis and clearing of an ambiguous Recipient block.
+- [`docs/runbooks/recipient-block-recovery.md`](docs/runbooks/recipient-block-recovery.md) defines safe diagnosis and clearing of an ambiguous Recipient block (its `inspect-block`/`clear-block` operations arrive after Milestone 1).
 
 ## Repository layout
 
@@ -135,11 +135,24 @@ counter, and isolates any Recipient whose queue or head state is ambiguous
 behind a persistent block marker (`hr1:q:<recipient>`) while every other
 Recipient serves normally. Authoritative state is never rewritten. A lease
 already past its deadline, or state that cannot be isolated, holds readiness
-false (`"startup_reconciliation":"held"` in `/health/ready`) until an
-operator intervenes; see the
-[Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md).
-Progress is exported as `hookrelay_reconciliation_in_progress` and
-`hookrelay_consistency_issues_total{kind,resolution}`.
+false (`"startup_reconciliation":"held"` in `/health/ready`). Progress is
+exported as `hookrelay_reconciliation_in_progress` and
+`hookrelay_consistency_issues_total{kind,resolution}`; each block, hold, and
+repair is logged, and repairs and blocks are audited best effort.
+
+Milestone 1 has no clear or repair operation yet. Diagnosis is read-only:
+
+- **Blocked Recipient:** find it with `ZRANGE hr1:blocked 0 -1 WITHSCORES`
+  and read `HGETALL hr1:q:<recipient>` (`detected_ms`, `reason_code`). Other
+  Recipients keep serving; the blocked one stays blocked until the audited
+  clear operation of the
+  [Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md)
+  ships with the Admin block routes. Do not delete the marker by hand.
+- **Readiness held by a due lease** (`reconciliation_hold` log,
+  `reason_code=due_lease`): Milestone 1 deliberately invents no expiry. The
+  hold ends when the Milestone 2 lease-expiry transition processes the
+  lease; until then recovery requires a reviewed incident procedure, not ad
+  hoc Valkey edits.
 
 ## Webhook ingestion
 

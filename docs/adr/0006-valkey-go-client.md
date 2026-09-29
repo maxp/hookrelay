@@ -32,3 +32,7 @@ The spike tests run against a real pinned Valkey. Local containers provide three
 - `CLIENT LIST` (and similar) replies are RESP3 verbatim strings: `ToString()` returns a `txt:`-prefixed payload that callers must strip before line parsing.
 - `NewClient` dials eagerly; construction failure is the first dependency check, not the first command.
 - The library uses SHA-1 for its internal script identity; hookrelay's registry keeps its own body SHA-256 digest for contract identity checks, which is compatible.
+
+## Update (2026-09-29, Milestone 1 complete)
+
+The long-poll ticket implemented the waiting contract as periodic atomic `claim_v1` rechecks (250 ms + 0–50 ms jitter) on the pipelined connection ring, as the delivery design specifies; hookrelay issues no blocking commands, so the blocking-pool retention question above did not arise. `HOOKRELAY_VALKEY_MAX_CONNECTIONS` (minimum 2) now bounds the pipelined ring plus the blocking pool: the ring uses 2^N connections with N ≤ 2 and 2^N ≤ max − 1, and the (unused) blocking pool receives the remainder with `HOOKRELAY_VALKEY_MIN_IDLE` as its idle floor (`valkey.ApplyConnectionLimits`). A later notification-based wake-up that uses blocking commands must revisit this split.

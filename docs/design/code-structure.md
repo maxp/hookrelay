@@ -21,6 +21,7 @@ cmd/hookrelay/
 
 internal/
   app/
+  cli/
   config/
   model/
   ingestion/
@@ -28,13 +29,19 @@ internal/
   administration/
   valkey/
   observability/
+  gen/
+  jsonbody/
 ```
 
 Packages are created only when implementation requires them; empty package scaffolding is avoided.
 
 ### `internal/app`
 
-The composition root and lifecycle owner. It wires immutable configuration, logging, metrics, Valkey adapters, feature modules, public and administrative HTTP servers, maintenance loops, readiness, and graceful shutdown. It is the only module expected to know all concrete implementations.
+The lifecycle owner. It receives the composed dependencies (configuration, logging, metrics, feature handlers, readiness gate, reconciliation, probes) and runs the public and administrative HTTP servers, the readiness gate and reconciliation, maintenance loops, and graceful shutdown. The construction of concrete implementations happens in `cli serve` (below); together they form the composition root, and no other module knows all concrete implementations.
+
+### `internal/cli`
+
+Implements the command families (`serve`, `admin`, `generate`, `version`, `healthcheck`). `serve` is where the concrete implementations are constructed and wired: it resolves configuration and secrets, builds the Valkey adapter and the feature modules, and hands them to `app` as interface-typed dependencies (`app.Deps`). `app` itself stays free of concrete storage and feature imports and owns only lifecycle, listeners, readiness, reconciliation gating, and shutdown. The `admin` command family is an HTTP client of the Admin API and never touches Valkey.
 
 ### `internal/config`
 
@@ -59,6 +66,14 @@ Owns Admin Secret and browser-session authentication, CSRF, Webhook Endpoint man
 ### `internal/valkey`
 
 The concrete Valkey adapter and the only module that knows `hr1:` keys, Valkey commands, client behavior, and embedded Lua scripts. Scripts live as `.lua` files under this module and are embedded into the executable. It satisfies small interfaces declared by the feature modules that consume storage behavior; it does not export generic `Get` and `Set` repositories.
+
+### `internal/gen`
+
+Injectable generation of UUIDv7 identifiers and cryptographically random tokens, and the small `Clock` interface for process timestamps. Tests use deterministic implementations.
+
+### `internal/jsonbody`
+
+The strict JSON request-body discipline shared by the Admin and Consumer APIs: media type, 16 KiB limit, nesting depth 40, one top-level object, unknown fields and trailing data rejected, and bounded failure classes each API maps to its own error codes.
 
 ### `internal/observability`
 

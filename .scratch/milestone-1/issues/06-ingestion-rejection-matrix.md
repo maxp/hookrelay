@@ -12,7 +12,7 @@
 - [x] Process protections: in-flight webhook semaphore (default 100) acquired after route resolution and rate limiting but before body read, excess → `503` + `Retry-After: 1`; 10-second request-context deadline covering body reading
 - [x] Error discipline: empty success bodies; error bodies empty or platform-minimal; no internal error envelopes, message ids, or Valkey details on webhook routes
 - [x] `hookrelay_webhook_requests_total{webhook_type,outcome}` bounded outcomes asserted for every rejection class; `hookrelay_webhook_inflight` reflects the semaphore
-- [x] `/health/accepting-webhooks` returns 200 while acceptance is enabled and 503 under global/per-recipient queue, dedup capacity, or Valkey unavailability; `hookrelay_accepting_webhooks` gauge matches; `/health/ready` unaffected by capacity pressure (draining stays safe)
+- [x] `/health/accepting-webhooks` returns 200 while acceptance is enabled and 503 under global/per-recipient queue, dedup capacity, or Valkey unavailability *(implemented without the per-recipient stop, per platform.md: a full Recipient rejects only its own messages — see the comments)*; `hookrelay_accepting_webhooks` gauge matches; `/health/ready` unaffected by capacity pressure (draining stays safe)
 
 ## Comments
 

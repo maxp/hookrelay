@@ -1,5 +1,7 @@
 # Recipient block recovery
 
+> **Availability:** the `hookrelay admin recipients inspect-block`/`clear-block` commands and their `POST /admin/v1/recipient-blocks/…` routes are not part of Milestone 1. Until they ship, blocked Recipients stay blocked and diagnosis is read-only (see the README's reconciliation section); the safety rules below already apply.
+
 Use this runbook when hookrelay creates `hr1:q:<recipient_identity>` after detecting ambiguous authoritative Recipient state. The marker already prevents new ingestion, claims, token operations, and maintenance transitions for that Recipient; other Recipients continue normally.
 
 This procedure clears a protective block only after the authoritative queue, head state, Canonical Message, and attempt state are known to be consistent. It is not a generic repair mechanism and does not authorize guessing or deleting ambiguous data.

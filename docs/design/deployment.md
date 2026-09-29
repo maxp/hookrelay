@@ -45,7 +45,7 @@ hookrelay
 valkey
 ```
 
-An `observability` profile adds Prometheus and Grafana. Hookrelay publishes its public port, while the admin port is bound only to loopback or kept inside the Compose network. Secret files are mounted read-only. Hookrelay waits for a healthy Valkey.
+An `observability` profile adds Prometheus and Grafana. The local Compose stack publishes both hookrelay ports on loopback only (`127.0.0.1:8080` public, `127.0.0.1:8081` administrative); a deployment exposes the public port through its reverse proxy, while the admin port stays bound to loopback or inside the private network. Secret files are mounted read-only. Hookrelay waits for a healthy Valkey.
 
 Local Valkey uses the same core persistence policy as production: a pinned exact version, AOF with `appendfsync everysec`, `noeviction`, a persistent named volume, and a healthcheck. Developers explicitly remove the volume with `docker compose down -v` when they want a clean state.
 

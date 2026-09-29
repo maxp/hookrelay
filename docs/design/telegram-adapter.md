@@ -91,7 +91,7 @@ The adapter does not substitute the original message creation time for an edit e
 
 Telegram accepts `application/json` with an optional UTF-8 charset parameter, parsed as a media type rather than compared as a raw header string. Other media types receive `415`.
 
-Accepted, duplicate, and relay-scoped accepted updates receive an empty `200`. Unknown endpoint is `404`, verification failure is `403`, invalid JSON is `400`, oversized body is `413`, temporary rate/capacity/Valkey failure is `503`, and an internal error is `500`.
+Accepted, duplicate, and relay-scoped accepted updates receive an empty `200`. Unknown endpoint is `404`, verification failure is `403`, invalid JSON is `400`, oversized body is `413`, temporary rate/capacity/Valkey failure, a blocked Recipient, or the in-flight limit is `503` with `Retry-After: 1`, and an internal error is `500`. The adapter uses the common transport results for a non-`POST` method (`405`), an unsupported media type or encoding (`415`), a body not received within the request deadline (`408`), and another body read failure (`400`); see the [message contract](message-contract.md#webhook-route-and-request-acceptance).
 
 Hookrelay does not call Telegram `setWebhook` in the first version and does not store or use the Telegram Bot API token. Operators configure the webhook URL, `secret_token`, and `allowed_updates` directly at Telegram. Unknown new update types are preserved through relay scope.
 

@@ -136,13 +136,16 @@ hr1:op:<operation_id>
 
 Claim and extension operation records share this namespace, include an operation kind and request-argument digest, and have a 10-minute TTL. An extension record stores its bounded completed deadline result for idempotent replay. For an empty completed claim poll, the record stores the empty outcome until expiry. For a successful claim, it temporarily stores the completed response, including the plaintext token and payload reference needed to replay a lost HTTP response while the Delivery Attempt remains active. After acknowledgement, negative acknowledgement, or expiry of that attempt, the plaintext token and replayable payload response are removed from the claim-operation record, leaving only a marker that causes repeat claim requests to return `409 claim_no_longer_active` until the original 10-minute TTL expires. The token itself is never written to logs, metrics, URLs, attempt history, audit records, or compact success metadata.
 
-After acknowledgement, negative acknowledgement, or expiry, plaintext copies of the token are deleted from active state and operation caches. A one-hour terminal tombstone is keyed by SHA-256 digest:
+The token record is keyed by the token's SHA-256 digest and has two phases:
 
 ```text
 hr1:t:<delivery_token_digest>
 ```
 
-It records the terminal outcome and enough safe metadata to make repeated `ack` or `nack` idempotent. Token encryption and a separate encryption key are deliberately not introduced in the first version. Valkey, its backups, and diagnostics are treated as secret-bearing infrastructure, and the Consumer API additionally requires the shared Consumer Secret.
+- **Active phase** (written by claim; TTL 10 minutes plus the lease): `state=active`, `recipient_identity`, `message_id`, `operation_id`, `claimed_ms`, `lease_expires_ms`. It is the token→attempt index that lets a token-keyed `ack` locate the Recipient, message, and claim operation without scanning.
+- **Terminal phase** (written by `ack`; one-hour TTL): `state=acknowledged`, `message_id`, `acknowledged_ms`, the recorded result that makes a repeated `ack` idempotent. Negative-acknowledgement and expiry phases arrive with Milestone 2.
+
+After acknowledgement, negative acknowledgement, or expiry, plaintext copies of the token are deleted from active state and operation caches; neither phase stores the token itself. Token encryption and a separate encryption key are deliberately not introduced in the first version. Valkey, its backups, and diagnostics are treated as secret-bearing infrastructure, and the Consumer API additionally requires the shared Consumer Secret.
 
 ## Administrative sessions
 
@@ -251,7 +254,7 @@ hr1:dedup_age
   member = dedup_identity_digest
 ```
 
-An index member whose record expired is stale and is removed by maintenance. A record missing from the index is restored during startup reconciliation. Whether periodic consistency checking repeats this repair after startup remains open.
+The deduplication capacity counts only live index members (score within the retention window), so members of records already expired by TTL never block acceptance. Each successful acceptance removes at most 100 such stale members in the same atomic operation, keeping the index bounded between reconciliations; reconciliation (at startup and after Valkey recovery) also deletes records past `expires_ms` with their members, restores live records missing from the index from `accepted_ms`, and removes members without a record. Whether periodic consistency checking repeats this repair while serving remains open.
 
 ## Global dead-letter queue
 
@@ -401,7 +404,7 @@ hr1:leases                                 lease deadlines ZSET
 hr1:retries                                retry deadlines ZSET
 hr1:a:<message_id>                         attempt history
 hr1:op:<operation_id>                      idempotent operation result
-hr1:t:<delivery_token_digest>              terminal token result
+hr1:t:<delivery_token_digest>              token record (active attempt, then terminal result)
 hr1:d:<dedup_identity_digest>              dedup record
 hr1:dedup_age                              dedup age ZSET
 hr1:dlq                                    global DLQ ZSET
