@@ -31,8 +31,11 @@ const (
 	MaxWaitMs     = 30000
 )
 
-// AckTimeout is the acknowledgement request deadline.
-const AckTimeout = 5 * time.Second
+// AckTimeout and NackTimeout are the acknowledgement request deadlines.
+const (
+	AckTimeout  = 5 * time.Second
+	NackTimeout = 5 * time.Second
+)
 
 // Long-poll defaults from the delivery design.
 const (
@@ -47,13 +50,19 @@ var (
 	tokenPattern      = regexp.MustCompile(`^dlv_[A-Za-z0-9_-]{22}$`)
 	uuidV7Pattern     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 	instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+	reasonCodePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
 )
 
 // HandlerDeps carries the Consumer API collaborators.
 type HandlerDeps struct {
-	Claimer      Claimer
-	Acknowledger Acknowledger
-	Stats        StatsReader
+	Claimer              Claimer
+	Acknowledger         Acknowledger
+	NegativeAcknowledger NegativeAcknowledger
+	Stats                StatsReader
+	// RetryPolicy chooses the retry delay after a failed attempt.
+	RetryPolicy RetryPolicy
+	// Uniform draws the retry jitter in [0, 1) (rand.Float64 when nil).
+	Uniform func() float64
 	// ConsumerSecret must already be resolved and validated.
 	ConsumerSecret string
 	// MaxWaitingClaims bounds concurrent waiting claims in this process
@@ -88,8 +97,14 @@ type Handler struct {
 
 // NewHandler composes the Consumer API.
 func NewHandler(d HandlerDeps) (*Handler, error) {
-	if d.Clock == nil || d.Gen == nil || d.Claimer == nil || d.Acknowledger == nil {
-		return nil, errors.New("delivery: Claimer, Acknowledger, Gen, and Clock are required")
+	if d.Clock == nil || d.Gen == nil || d.Claimer == nil || d.Acknowledger == nil || d.NegativeAcknowledger == nil {
+		return nil, errors.New("delivery: Claimer, Acknowledger, NegativeAcknowledger, Gen, and Clock are required")
+	}
+	if err := d.RetryPolicy.Validate(); err != nil {
+		return nil, err
+	}
+	if d.Uniform == nil {
+		d.Uniform = rand.Float64
 	}
 	reg := d.Registerer
 	if reg == nil {
@@ -121,6 +136,7 @@ func NewHandler(d HandlerDeps) (*Handler, error) {
 	}
 	h.mux.Handle("POST /v1/deliveries/claim", h.auth(h.handleClaim))
 	h.mux.Handle("POST /v1/deliveries/ack", h.auth(h.handleAck))
+	h.mux.Handle("POST /v1/deliveries/nack", h.auth(h.handleNack))
 	return h, nil
 }
 
@@ -410,6 +426,7 @@ func (h *Handler) RefreshGauges(ctx context.Context) {
 	h.metrics.readyRecipients.Set(float64(s.ReadyRecipients))
 	h.metrics.blockedRecipients.Set(float64(s.BlockedRecipients))
 	h.metrics.queueMessages.Set(float64(s.QueuedMessages))
+	h.metrics.retriesWaiting.Set(float64(s.RetriesWaiting))
 }
 
 type ackRequest struct {
@@ -447,6 +464,8 @@ func (h *Handler) handleAck(w http.ResponseWriter, r *http.Request, c call) {
 		writeError(w, http.StatusNotFound, "delivery_token_not_found", "unknown or expired delivery token", c.requestID)
 	case AckStale:
 		writeError(w, http.StatusConflict, "stale_delivery_token", "the delivery attempt is no longer active", c.requestID)
+	case AckAlreadyNacked:
+		writeError(w, http.StatusConflict, "delivery_already_nacked", "the delivery attempt was negatively acknowledged", c.requestID)
 	case AckRecipientBlocked:
 		writeError(w, http.StatusConflict, "recipient_blocked", "the recipient is blocked pending operator recovery", c.requestID)
 	case AckInternalFailure:
@@ -468,8 +487,16 @@ func (h *Handler) logAcknowledged(c call, res AckResult) {
 		"delivery_cycle", res.DeliveryCycle, "attempt", res.Attempt,
 		"duration_ms", h.d.Clock.Now().Sub(c.start).Milliseconds(),
 	}
+	fields, scope := h.recipientFields(c, res.RecipientIdentity, fields)
+	h.observeAttempt(scope, "acknowledged", res.ClaimedMs, res.AcknowledgedMs)
+	observability.LogEvent(h.log, slog.LevelInfo, "delivery_acknowledged", "delivery acknowledged", fields...)
+}
+
+// recipientFields appends the Recipient and consumer diagnostics to event
+// fields and returns the bounded recipient_scope label.
+func (h *Handler) recipientFields(c call, recipientIdentity string, fields []any) ([]any, string) {
 	scope := "unknown"
-	if rcpt, err := model.ParseIdentity(res.RecipientIdentity); err == nil {
+	if rcpt, err := model.ParseIdentity(recipientIdentity); err == nil {
 		scope = string(rcpt.Scope)
 		fields = append(fields, "recipient_scope", scope, "bot_platform", rcpt.BotPlatform, "bot_id", rcpt.BotID)
 		if rcpt.ChatID != "" {
@@ -482,6 +509,93 @@ func (h *Handler) logAcknowledged(c call, res AckResult) {
 	if c.instanceID != "" {
 		fields = append(fields, "consumer_instance_id", c.instanceID)
 	}
-	h.metrics.attempts.WithLabelValues(scope, "acknowledged").Inc()
-	observability.LogEvent(h.log, slog.LevelInfo, "delivery_acknowledged", "delivery acknowledged", fields...)
+	return fields, scope
+}
+
+// observeAttempt counts one completed attempt and its Valkey-time duration
+// from claim to completion.
+func (h *Handler) observeAttempt(scope, outcome string, claimedMs, completedMs int64) {
+	h.metrics.attempts.WithLabelValues(scope, outcome).Inc()
+	if claimedMs > 0 && completedMs >= claimedMs {
+		h.metrics.attemptDuration.WithLabelValues(scope, outcome).Observe(float64(completedMs-claimedMs) / 1000)
+	}
+}
+
+type nackRequest struct {
+	DeliveryToken string  `json:"delivery_token"`
+	ReasonCode    *string `json:"reason_code"`
+}
+
+type nackResponse struct {
+	Status    string `json:"status"`
+	MessageID string `json:"message_id"`
+	Attempt   int64  `json:"attempt"`
+	RetryAtMs int64  `json:"retry_at_ms"`
+}
+
+func (h *Handler) handleNack(w http.ResponseWriter, r *http.Request, c call) {
+	var req nackRequest
+	if status, code, msg, ok := decode(r, &req); !ok {
+		writeError(w, status, code, msg, c.requestID)
+		return
+	}
+	if !tokenPattern.MatchString(req.DeliveryToken) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "delivery_token is malformed", c.requestID)
+		return
+	}
+	reason := ""
+	if req.ReasonCode != nil {
+		if !reasonCodePattern.MatchString(*req.ReasonCode) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "reason_code must be 1-64 characters of [A-Za-z0-9_.:-]", c.requestID)
+			return
+		}
+		reason = *req.ReasonCode
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), NackTimeout)
+	defer cancel()
+	digest := sha256.Sum256([]byte(req.DeliveryToken))
+	res := h.d.NegativeAcknowledger.Nack(ctx, NackRequest{
+		Token: req.DeliveryToken, TokenDigest: hex.EncodeToString(digest[:]), ReasonCode: reason,
+		RetryDelaysMs: h.d.RetryPolicy.DrawDelaysMs(h.d.Uniform), MaxAttempts: h.d.RetryPolicy.MaxAttempts,
+	})
+
+	switch res.Outcome {
+	case NackRetryScheduled, NackAlreadyNacked:
+		if res.Outcome == NackRetryScheduled {
+			h.logNacked(c, res, reason)
+		}
+		writeJSON(w, http.StatusOK, nackResponse{Status: res.Result, MessageID: res.MessageID, Attempt: res.Attempt, RetryAtMs: res.RetryAtMs})
+	case NackAlreadyAcknowledged:
+		writeError(w, http.StatusConflict, "delivery_already_acknowledged", "the delivery attempt was acknowledged", c.requestID)
+	case NackNotFound:
+		writeError(w, http.StatusNotFound, "delivery_token_not_found", "unknown or expired delivery token", c.requestID)
+	case NackStale:
+		writeError(w, http.StatusConflict, "stale_delivery_token", "the delivery attempt is no longer active", c.requestID)
+	case NackRecipientBlocked:
+		writeError(w, http.StatusConflict, "recipient_blocked", "the recipient is blocked pending operator recovery", c.requestID)
+	case NackAttemptsExhausted, NackInternalFailure:
+		observability.LogEvent(h.log, slog.LevelError, "delivery_nack_failed", "negative acknowledgement hit unexpected stored state",
+			"request_id", c.requestID, "error_code", "internal_error", "outcome", string(res.Outcome))
+		writeError(w, http.StatusInternalServerError, "internal_error", "unexpected internal error", c.requestID)
+	default:
+		observability.LogEvent(h.log, slog.LevelError, "delivery_nack_failed", "negative acknowledgement could not reach Valkey",
+			"request_id", c.requestID, "error_code", "dependency_unavailable")
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "dependency unavailable; repeat the negative acknowledgement", c.requestID)
+	}
+}
+
+// logNacked records the feature event and the failed attempt.
+func (h *Handler) logNacked(c call, res NackResult, reason string) {
+	fields := []any{
+		"request_id", c.requestID, "message_id", res.MessageID,
+		"delivery_cycle", res.DeliveryCycle, "attempt", res.Attempt, "retry_at_ms", res.RetryAtMs,
+		"duration_ms", h.d.Clock.Now().Sub(c.start).Milliseconds(),
+	}
+	if reason != "" {
+		fields = append(fields, "reason_code", reason)
+	}
+	fields, scope := h.recipientFields(c, res.RecipientIdentity, fields)
+	h.observeAttempt(scope, "nack", res.ClaimedMs, res.CompletedMs)
+	observability.LogEvent(h.log, slog.LevelInfo, "delivery_nacked", "delivery negatively acknowledged; retry scheduled", fields...)
 }

@@ -70,7 +70,8 @@ func composeApp(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Regi
 	}
 	store := valkey.NewDeliveryStore(a, valkey.ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: time.Minute})
 	consumer, err := delivery.NewHandler(delivery.HandlerDeps{
-		Claimer: store, Acknowledger: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
+		Claimer: store, Acknowledger: store, NegativeAcknowledger: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
+		RetryPolicy: delivery.RetryPolicy{MaxAttempts: 4, Delays: []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}, JitterMin: 0.5, JitterMax: 1},
 	})
 	if err != nil {
 		t.Fatal(err)

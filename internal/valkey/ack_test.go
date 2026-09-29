@@ -47,7 +47,8 @@ func TestAckWithNextHead(t *testing.T) {
 	claimed := s.Claim(ctx, req)
 
 	res := s.Ack(ctx, ackReq("dlv_token1"))
-	if res.Outcome != delivery.AckAcknowledged || res.MessageID != "m1" || res.RecipientIdentity != ridA || res.DeliveryCycle != 1 || res.Attempt != 1 || res.AcknowledgedMs < claimed.Delivery.ClaimedMs {
+	if res.Outcome != delivery.AckAcknowledged || res.MessageID != "m1" || res.RecipientIdentity != ridA || res.DeliveryCycle != 1 || res.Attempt != 1 ||
+		res.ClaimedMs != claimed.Delivery.ClaimedMs || res.AcknowledgedMs < claimed.Delivery.ClaimedMs {
 		t.Fatalf("ack = %+v", res)
 	}
 
@@ -166,6 +167,23 @@ func TestAckMessageWithoutMetadata(t *testing.T) {
 	}
 }
 
+// TestAckAfterNack pins the ack/nack cross-conflict: acknowledging a
+// negatively acknowledged token is refused without mutation.
+func TestAckAfterNack(t *testing.T) {
+	a, s := claimSetup(t)
+	ctx := context.Background()
+	enqueueJSON(t, a, "m1", ridA)
+	s.Claim(ctx, claimReq("op-1", "args", "dlv_token1"))
+	if r := s.Nack(ctx, nackReq("dlv_token1", "")); r.Outcome != delivery.NackRetryScheduled {
+		t.Fatalf("nack = %+v", r)
+	}
+	before := snapshot(t, a)
+	if r := s.Ack(ctx, ackReq("dlv_token1")); r.Outcome != delivery.AckAlreadyNacked {
+		t.Errorf("ack after nack = %+v, want already_nacked", r)
+	}
+	assertUnchanged(t, a, before, "ack after nack")
+}
+
 // TestAckRefusals pins not_found, stale, recipient_blocked, and wrong_type
 // with no mutation.
 func TestAckRefusals(t *testing.T) {
@@ -255,7 +273,7 @@ func TestAckArguments(t *testing.T) {
 		"zero ttl":        with(3, "0"),
 		"digest mismatch": with(1, "other"),
 	} {
-		if _, err := a.RunScript(ctx, "ack_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "ack_v3", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

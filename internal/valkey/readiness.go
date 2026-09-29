@@ -93,6 +93,7 @@ func (a *Adapter) checkStructures(ctx context.Context) error {
 		"hr1:ready":                 {"none", "zset"},
 		"hr1:leases":                {"none", "zset"},
 		"hr1:blocked":               {"none", "zset"},
+		"hr1:retries":               {"none", "zset"},
 		"hr1:dedup_age":             {"none", "zset"},
 		"hr1:ready_seq":             {"none", "string"},
 		"hr1:stats:queued_messages": {"none", "string"},

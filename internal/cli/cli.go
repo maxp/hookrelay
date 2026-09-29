@@ -202,9 +202,16 @@ func Serve(args []string) int {
 		InitialLeaseDuration: cfg.InitialLeaseDuration,
 	})
 	consumerAPI, err := delivery.NewHandler(delivery.HandlerDeps{
-		Claimer:          deliveryStore,
-		Acknowledger:     deliveryStore,
-		Stats:            deliveryStore,
+		Claimer:              deliveryStore,
+		Acknowledger:         deliveryStore,
+		NegativeAcknowledger: deliveryStore,
+		Stats:                deliveryStore,
+		RetryPolicy: delivery.RetryPolicy{
+			MaxAttempts: cfg.MaxDeliveryAttempts,
+			Delays:      cfg.RetryDelays,
+			JitterMin:   cfg.RetryJitterMin,
+			JitterMax:   cfg.RetryJitterMax,
+		},
 		ConsumerSecret:   consumerSecret,
 		MaxWaitingClaims: cfg.MaxWaitingClaims,
 		Gen:              gen.Crypto{},

@@ -9,6 +9,8 @@ import (
 type metrics struct {
 	claims            *prometheus.CounterVec
 	attempts          *prometheus.CounterVec
+	attemptDuration   *prometheus.HistogramVec
+	retriesWaiting    prometheus.Gauge
 	activeLeases      prometheus.Gauge
 	readyRecipients   prometheus.Gauge
 	blockedRecipients prometheus.Gauge
@@ -25,6 +27,15 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 			Name: "hookrelay_delivery_attempts_total",
 			Help: "Completed Delivery Attempts by Recipient scope and outcome.",
 		}, []string{"recipient_scope", "outcome"}),
+		attemptDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "hookrelay_delivery_attempt_duration_seconds",
+			Help:    "Completed Delivery Attempt duration from claim to completion (Valkey time), by Recipient scope and outcome.",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+		}, []string{"recipient_scope", "outcome"}),
+		retriesWaiting: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hookrelay_retries_waiting",
+			Help: "Recipients whose head message waits for a retry.",
+		}),
 		activeLeases: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "hookrelay_active_leases",
 			Help: "Unexpired Message Leases, work-pool-wide.",
@@ -42,7 +53,7 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 			Help: "Messages queued across all Recipients.",
 		}),
 	}
-	collectors := []prometheus.Collector{m.claims, m.attempts, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
+	collectors := []prometheus.Collector{m.claims, m.attempts, m.attemptDuration, m.retriesWaiting, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "hookrelay_waiting_claims",
 			Help: "Claim requests waiting for work in this process.",

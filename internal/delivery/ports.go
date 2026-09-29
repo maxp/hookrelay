@@ -67,6 +67,7 @@ type Stats struct {
 	ReadyRecipients   int64
 	BlockedRecipients int64
 	QueuedMessages    int64
+	RetriesWaiting    int64
 }
 
 // StatsReader reads the delivery gauges' sources.
@@ -86,6 +87,7 @@ type AckOutcome string
 const (
 	AckAcknowledged          AckOutcome = "acknowledged"
 	AckAlreadyAcknowledged   AckOutcome = "already_acknowledged"
+	AckAlreadyNacked         AckOutcome = "already_nacked"
 	AckNotFound              AckOutcome = "not_found"
 	AckStale                 AckOutcome = "stale"
 	AckRecipientBlocked      AckOutcome = "recipient_blocked"
@@ -94,7 +96,8 @@ const (
 )
 
 // AckResult carries the recorded acknowledgement; RecipientIdentity,
-// DeliveryCycle, and Attempt are set only for a first acknowledgement.
+// DeliveryCycle, Attempt, and ClaimedMs are set only for a first
+// acknowledgement.
 type AckResult struct {
 	Outcome           AckOutcome
 	MessageID         string
@@ -102,9 +105,59 @@ type AckResult struct {
 	RecipientIdentity string
 	DeliveryCycle     int64
 	Attempt           int64
+	ClaimedMs         int64
 }
 
 // Acknowledger runs the atomic acknowledgement transition.
 type Acknowledger interface {
 	Ack(ctx context.Context, req AckRequest) AckResult
+}
+
+// NackRequest negatively acknowledges one Delivery Attempt by its token.
+type NackRequest struct {
+	Token       string
+	TokenDigest string
+	// ReasonCode is empty or a bounded consumer-supplied code.
+	ReasonCode string
+	// RetryDelaysMs[n-1] is the drawn effective delay after failed attempt
+	// n; the transition picks the entry of the attempt it fails.
+	RetryDelaysMs []int64
+	MaxAttempts   int
+}
+
+// NackOutcome is the bounded result of a negative acknowledgement.
+type NackOutcome string
+
+const (
+	NackRetryScheduled      NackOutcome = "retry_scheduled"
+	NackAlreadyNacked       NackOutcome = "already_nacked"
+	NackAlreadyAcknowledged NackOutcome = "already_acknowledged"
+	NackNotFound            NackOutcome = "not_found"
+	NackStale               NackOutcome = "stale"
+	NackRecipientBlocked    NackOutcome = "recipient_blocked"
+	// NackAttemptsExhausted refuses the last attempt without mutation until
+	// the dead-letter transition exists (Milestone 2 ticket 05).
+	NackAttemptsExhausted     NackOutcome = "attempts_exhausted"
+	NackDependencyUnavailable NackOutcome = "dependency_unavailable"
+	NackInternalFailure       NackOutcome = "internal_failure"
+)
+
+// NackResult carries the scheduled retry or the recorded result of an
+// earlier nack (Result names the recorded result kind). RecipientIdentity,
+// DeliveryCycle, ClaimedMs, and CompletedMs are set only for a first nack.
+type NackResult struct {
+	Outcome           NackOutcome
+	Result            string
+	MessageID         string
+	Attempt           int64
+	RetryAtMs         int64
+	RecipientIdentity string
+	DeliveryCycle     int64
+	ClaimedMs         int64
+	CompletedMs       int64
+}
+
+// NegativeAcknowledger runs the atomic negative-acknowledgement transition.
+type NegativeAcknowledger interface {
+	Nack(ctx context.Context, req NackRequest) NackResult
 }

@@ -3,6 +3,7 @@ package valkey
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -113,8 +114,9 @@ func (s *DeliveryStore) Stats(ctx context.Context) (delivery.Stats, error) {
 		c.B().Zcard().Key("hr1:ready").Build(),
 		c.B().Zcard().Key("hr1:blocked").Build(),
 		c.B().Get().Key("hr1:stats:queued_messages").Build(),
+		c.B().Zcard().Key("hr1:retries").Build(),
 	)
-	targets := []*int64{&st.ActiveLeases, &st.ReadyRecipients, &st.BlockedRecipients, &st.QueuedMessages}
+	targets := []*int64{&st.ActiveLeases, &st.ReadyRecipients, &st.BlockedRecipients, &st.QueuedMessages, &st.RetriesWaiting}
 	for i, r := range cmds {
 		v, err := r.AsInt64()
 		if err != nil && !isNil(err) {
@@ -135,9 +137,9 @@ const (
 	TombstoneTTL = time.Hour
 )
 
-// Ack runs ack_v2.
+// Ack runs ack_v3.
 func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delivery.AckResult {
-	res, err := s.a.RunScript(ctx, "ack_v2",
+	res, err := s.a.RunScript(ctx, "ack_v3",
 		[]string{"hr1:t:" + req.TokenDigest, "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages"},
 		[]string{req.Token, req.TokenDigest, itoa64(SuccessTTL.Milliseconds()), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {
@@ -153,7 +155,9 @@ func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delive
 			if out.AcknowledgedMs, perr = res.Fields[1].AsInt64(); perr == nil {
 				if out.RecipientIdentity, perr = res.Fields[2].ToString(); perr == nil {
 					if out.DeliveryCycle, perr = res.Fields[3].AsInt64(); perr == nil {
-						out.Attempt, perr = res.Fields[4].AsInt64()
+						if out.Attempt, perr = res.Fields[4].AsInt64(); perr == nil {
+							out.ClaimedMs, perr = res.Fields[5].AsInt64()
+						}
 					}
 				}
 			}
@@ -167,4 +171,54 @@ func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delive
 	default:
 		return delivery.AckResult{Outcome: delivery.AckOutcome(res.Status)}
 	}
+}
+
+// Nack runs nack_v1.
+func (s *DeliveryStore) Nack(ctx context.Context, req delivery.NackRequest) delivery.NackResult {
+	delays := make([]string, len(req.RetryDelaysMs))
+	for i, d := range req.RetryDelaysMs {
+		delays[i] = itoa64(d)
+	}
+	res, err := s.a.RunScript(ctx, "nack_v1",
+		[]string{"hr1:t:" + req.TokenDigest, "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"},
+		[]string{req.Token, req.TokenDigest, req.ReasonCode, strings.Join(delays, ","), itoa64(int64(req.MaxAttempts)), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
+	if err != nil {
+		// Whether or not the script ran, repeating the negative
+		// acknowledgement returns the recorded result or the current outcome.
+		return delivery.NackResult{Outcome: delivery.NackDependencyUnavailable}
+	}
+	var perr error
+	str := func(i int) string {
+		v, err := res.Fields[i].ToString()
+		if err != nil {
+			perr = err
+		}
+		return v
+	}
+	num := func(i int) int64 {
+		v, err := res.Fields[i].AsInt64()
+		if err != nil {
+			perr = err
+		}
+		return v
+	}
+	var out delivery.NackResult
+	switch res.Status {
+	case "retry_scheduled":
+		out = delivery.NackResult{
+			Outcome: delivery.NackRetryScheduled, Result: "retry_scheduled",
+			MessageID: str(0), Attempt: num(1), RetryAtMs: num(2), RecipientIdentity: str(3),
+			DeliveryCycle: num(4), ClaimedMs: num(5), CompletedMs: num(6),
+		}
+	case "already_nacked":
+		out = delivery.NackResult{Outcome: delivery.NackAlreadyNacked, Result: str(0), MessageID: str(1), Attempt: num(2), RetryAtMs: num(3)}
+	case "wrong_type":
+		return delivery.NackResult{Outcome: delivery.NackInternalFailure}
+	default:
+		return delivery.NackResult{Outcome: delivery.NackOutcome(res.Status)}
+	}
+	if perr != nil {
+		return delivery.NackResult{Outcome: delivery.NackInternalFailure}
+	}
+	return out
 }

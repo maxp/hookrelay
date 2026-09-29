@@ -440,6 +440,17 @@ func TestStructureValidationRejectsWrongTypes(t *testing.T) {
 	}
 }
 
+// TestStructureValidationCoversTheRetryIndex pins the retry index as a
+// validated global structure.
+func TestStructureValidationCoversTheRetryIndex(t *testing.T) {
+	a := testAdapter(t, false)
+	flushAll(t, a)
+	a.testDo(t, "SET", "hr1:retries", "poison")
+	if _, err := a.ValidateReadiness(context.Background(), false); err == nil || !strings.Contains(err.Error(), "hr1:retries") {
+		t.Fatalf("poisoned retry index passed the gate: %v", err)
+	}
+}
+
 // streamEntryFields flattens one XRANGE entry ([id, [k, v, ...]]) into a map.
 func streamEntryFields(entry valkey.ValkeyMessage) (map[string]string, error) {
 	parts, err := entry.ToArray()

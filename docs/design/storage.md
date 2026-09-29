@@ -365,6 +365,8 @@ first_archived_ms
 last_archived_ms
 ```
 
+`first_archived_ms` is the earliest archived `claimed_ms` and `last_archived_ms` the latest archived `completed_ms`; a later fold merges into the existing summary.
+
 ## Dead-letter retention
 
 Dead-letter retention is configurable and defaults to 30 days. `hr1:dlq` already orders entries by `dead_lettered_ms`, so it also serves as the retention index; no separate expiry index is created.

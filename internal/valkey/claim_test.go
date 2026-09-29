@@ -322,11 +322,12 @@ func TestDeliveryStats(t *testing.T) {
 	enqueue(t, a, "m2", ridB)
 	s.Claim(ctx, claimReq("op", "a", "dlv_t"))
 	a.testDo(t, "ZADD", "hr1:blocked", "1", "telegram:42:chat:-9")
+	a.testDo(t, "ZADD", "hr1:retries", "1", "telegram:42:chat:-8")
 	st, err := s.Stats(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st != (delivery.Stats{ActiveLeases: 1, ReadyRecipients: 1, BlockedRecipients: 1, QueuedMessages: 2}) {
+	if st != (delivery.Stats{ActiveLeases: 1, ReadyRecipients: 1, BlockedRecipients: 1, QueuedMessages: 2, RetriesWaiting: 1}) {
 		t.Errorf("stats = %+v", st)
 	}
 }
