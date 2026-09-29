@@ -74,7 +74,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/ingestion` — webhook pipeline and the Telegram adapter;
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v3`, `ack_v3`, `nack_v2`, `expire_lease_v2`, `activate_retry_v1`, `reconcile_recipient_v2`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`), readiness gate, endpoint store, message acceptance;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v3`, `ack_v3`, `nack_v2`, `expire_lease_v2`, `activate_retry_v1`, `extend_v1`, `reconcile_recipient_v2`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`), readiness gate, endpoint store, message acceptance;
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -260,6 +260,16 @@ curl -X POST http://<public>/v1/deliveries/claim \
   "dead_lettered_ms"}` (repeatable): the message moves to the global DLQ
   (blob and attempt history retained) and the Recipient's next message
   becomes claimable. A fourth expired lease dead-letters the same way.
+- `POST /v1/deliveries/extend` with `{"delivery_token": "dlv_...",
+  "operation_id": "<uuidv7>"}` pushes the lease deadline by the
+  server-chosen `HOOKRELAY_LEASE_EXTENSION_DURATION` (60 s), never beyond
+  `HOOKRELAY_MAX_LEASE_LIFETIME` (5 min) from the attempt start:
+  `200 {"status":"extended","message_id","lease_expires_ms",
+  "max_lease_expires_ms"}`. Repeating the same `operation_id` returns the
+  recorded deadline for 10 minutes without extending again;
+  `409 operation_conflict` for another token or a claim's operation id,
+  `409 maximum_lease_lifetime_reached` at the cap, `409 stale_delivery_token`
+  after the deadline, otherwise the same `404`/`409`/`503` outcomes as `ack`.
 - Background maintenance starts once the process is ready and runs every
   `HOOKRELAY_MAINTENANCE_INTERVAL` (1 s) plus up to
   `HOOKRELAY_MAINTENANCE_INTERVAL_JITTER` (250 ms), in batches of
@@ -294,7 +304,7 @@ curl -X POST http://<public>/v1/deliveries/claim \
   `hookrelay_queue_messages`, `hookrelay_ready_recipients`,
   `hookrelay_blocked_recipients`; feature event `delivery_claimed` (tokens
   are never logged), `delivery_acknowledged`, `delivery_nacked`,
-  `delivery_lease_expired`, `delivery_dead_lettered`.
+  `delivery_lease_expired`, `delivery_dead_lettered`, `delivery_lease_extended`.
 
 ## Admin API
 

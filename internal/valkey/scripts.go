@@ -70,6 +70,19 @@ func init() {
 		"recipient_blocked":    0,
 		"wrong_type":           0,
 	})
+	register("extend_v1", 1, map[string]int{
+		// message_id, lease_expires_ms, max_lease_expires_ms,
+		// recipient_identity, delivery_cycle, attempt
+		"extended": 6,
+		// message_id, lease_expires_ms, max_lease_expires_ms (recorded)
+		"replay":                         3,
+		"operation_conflict":             0,
+		"not_found":                      0,
+		"stale":                          0,
+		"recipient_blocked":              0,
+		"maximum_lease_lifetime_reached": 0,
+		"wrong_type":                     0,
+	})
 	register("activate_retry_v1", 1, map[string]int{
 		"activated":         2, // message_id, attempt
 		"not_due":           0,

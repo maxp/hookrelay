@@ -66,6 +66,7 @@ func newPollHarness(t *testing.T, deps HandlerDeps, next func(int) ClaimResult) 
 	t.Helper()
 	ph := &pollHarness{claimer: &scriptedClaimer{next: next}, logs: &syncBuffer{}, reg: prometheus.NewRegistry()}
 	deps.Claimer, deps.Acknowledger, deps.NegativeAcknowledger, deps.RetryPolicy = ph.claimer, &fakeAcker{}, &fakeNacker{}, defaultPolicy()
+	deps.Extender = &fakeExtender{}
 	deps.ConsumerSecret, deps.Gen, deps.Clock = secret, fixedGen{}, fixedClock{}
 	deps.Logger, deps.Registerer = observability.NewTestLogger("debug", ph.logs), ph.reg
 	var err error

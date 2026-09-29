@@ -84,14 +84,14 @@ func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *de
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := valkey.NewDeliveryStore(a, valkey.ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: lease})
+	store := valkey.NewDeliveryStore(a, valkey.ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: lease, LeaseExtension: time.Minute, MaxLeaseLifetime: 5 * time.Minute})
 	attempts, err := delivery.NewAttemptMetrics(reg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	consumer, err := delivery.NewHandler(delivery.HandlerDeps{
 		Attempts: attempts,
-		Claimer:  store, Acknowledger: store, NegativeAcknowledger: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
+		Claimer:  store, Acknowledger: store, NegativeAcknowledger: store, Extender: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
 		RetryPolicy: testPolicy,
 	})
 	if err != nil {
@@ -540,5 +540,41 @@ func TestDeadLetterOverRealValkey(t *testing.T) {
 	}
 	if msg.MessageID == first || msg.SourceEventID != "11" || next.Delivery.Attempt != 1 || next.Delivery.DeliveryCycle != 1 {
 		t.Errorf("next claim = %+v %s, want update 11 attempt 1", next.Delivery, msg.SourceEventID)
+	}
+}
+
+// TestExtendOverRealValkey drives webhook → claim with a short lease →
+// extend → ack after the original deadline through the composed public
+// listener: the extension keeps the attempt alive, and repeating the same
+// operation replays the recorded deadline.
+func TestExtendOverRealValkey(t *testing.T) {
+	public, _, _, _ := composeStackWithLease(t, 300*time.Millisecond)
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	update := `{"update_id":12,"message":{"message_id":1,"date":1700000000,"chat":{"id":-81},"text":"slow"}}`
+	if w := send(public, "/webhook/telegram/wh_d", update, map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}); w.Code != http.StatusOK {
+		t.Fatalf("webhook = %d", w.Code)
+	}
+	w := send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-000000000041","wait_ms":0}`, auth)
+	var c claimBody
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &c) != nil {
+		t.Fatalf("claim = %d %s", w.Code, w.Body.String())
+	}
+	extend := `{"delivery_token":"` + c.Delivery.DeliveryToken + `","operation_id":"0195c4d8-0000-7000-8000-000000000042"}`
+	first := send(public, "/v1/deliveries/extend", extend, auth)
+	var ext struct {
+		Status            string `json:"status"`
+		LeaseExpiresMs    int64  `json:"lease_expires_ms"`
+		MaxLeaseExpiresMs int64  `json:"max_lease_expires_ms"`
+	}
+	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &ext) != nil || ext.Status != "extended" ||
+		ext.LeaseExpiresMs <= c.Delivery.LeaseExpiresMs || ext.MaxLeaseExpiresMs != c.Delivery.ClaimedMs+5*60*1000 {
+		t.Fatalf("extend = %d %s", first.Code, first.Body.String())
+	}
+	if again := send(public, "/v1/deliveries/extend", extend, auth); again.Code != http.StatusOK || again.Body.String() != first.Body.String() {
+		t.Errorf("replay = %d %s", again.Code, again.Body.String())
+	}
+	time.Sleep(time.Duration(c.Delivery.LeaseExpiresMs-c.Delivery.ClaimedMs)*time.Millisecond + 100*time.Millisecond) // past the original deadline
+	if w := send(public, "/v1/deliveries/ack", `{"delivery_token":"`+c.Delivery.DeliveryToken+`"}`, auth); w.Code != http.StatusOK {
+		t.Errorf("ack after the original deadline = %d %s", w.Code, w.Body.String())
 	}
 }

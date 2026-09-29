@@ -200,6 +200,8 @@ func Serve(args []string) int {
 	deliveryStore := valkey.NewDeliveryStore(adapter, valkey.ClaimLimits{
 		MaxActiveLeases:      cfg.MaxActiveLeases,
 		InitialLeaseDuration: cfg.InitialLeaseDuration,
+		LeaseExtension:       cfg.LeaseExtensionDuration,
+		MaxLeaseLifetime:     cfg.MaxLeaseLifetime,
 	})
 	attempts, err := delivery.NewAttemptMetrics(registry)
 	if err != nil {
@@ -216,6 +218,7 @@ func Serve(args []string) int {
 		Claimer:              deliveryStore,
 		Acknowledger:         deliveryStore,
 		NegativeAcknowledger: deliveryStore,
+		Extender:             deliveryStore,
 		Stats:                deliveryStore,
 		RetryPolicy:          retryPolicy,
 		Attempts:             attempts,

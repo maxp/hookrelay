@@ -13,7 +13,10 @@ import (
 func expirySetup(t *testing.T) (*Adapter, *DeliveryStore) {
 	t.Helper()
 	a, _ := claimSetup(t)
-	return a, NewDeliveryStore(a, ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: 20 * time.Millisecond})
+	return a, NewDeliveryStore(a, ClaimLimits{
+		MaxActiveLeases: 10, InitialLeaseDuration: 20 * time.Millisecond,
+		LeaseExtension: time.Minute, MaxLeaseLifetime: 5 * time.Minute,
+	})
 }
 
 // claimAndLapse claims the next head and waits until its lease is due.

@@ -243,3 +243,46 @@ type LeaseExpirer interface {
 	DueLeases(ctx context.Context, limit int) (DueBatch, error)
 	ExpireLease(ctx context.Context, recipientIdentity string, retryDelaysMs []int64, maxAttempts int) ExpiryResult
 }
+
+// ExtendRequest extends one lease by its token, idempotent by OperationID.
+type ExtendRequest struct {
+	Token       string
+	TokenDigest string
+	OperationID string
+	// ArgsDigest binds the operation to its arguments (operation_id and the
+	// token digest); a replay with another token is an operation conflict.
+	ArgsDigest string
+}
+
+// ExtendOutcome is the bounded result of a lease extension.
+type ExtendOutcome string
+
+const (
+	ExtendExtended               ExtendOutcome = "extended"
+	ExtendReplay                 ExtendOutcome = "replay"
+	ExtendOperationConflict      ExtendOutcome = "operation_conflict"
+	ExtendNotFound               ExtendOutcome = "not_found"
+	ExtendStale                  ExtendOutcome = "stale"
+	ExtendRecipientBlocked       ExtendOutcome = "recipient_blocked"
+	ExtendMaximumLifetimeReached ExtendOutcome = "maximum_lease_lifetime_reached"
+	ExtendDependencyUnavailable  ExtendOutcome = "dependency_unavailable"
+	ExtendInternalFailure        ExtendOutcome = "internal_failure"
+)
+
+// ExtendResult carries the (recorded) new deadline and the lifetime cap;
+// RecipientIdentity, DeliveryCycle, and Attempt are set only for a first
+// extension.
+type ExtendResult struct {
+	Outcome           ExtendOutcome
+	MessageID         string
+	LeaseExpiresMs    int64
+	MaxLeaseExpiresMs int64
+	RecipientIdentity string
+	DeliveryCycle     int64
+	Attempt           int64
+}
+
+// Extender runs the atomic lease-extension transition.
+type Extender interface {
+	Extend(ctx context.Context, req ExtendRequest) ExtendResult
+}

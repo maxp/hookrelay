@@ -52,24 +52,25 @@ func (f *fakeAcker) Ack(_ context.Context, req AckRequest) AckResult {
 }
 
 type harness struct {
-	h       *Handler
-	acker   *fakeAcker
-	nacker  *fakeNacker
-	claimer *fakeClaimer
-	logs    *bytes.Buffer
-	reg     *prometheus.Registry
+	h        *Handler
+	acker    *fakeAcker
+	nacker   *fakeNacker
+	extender *fakeExtender
+	claimer  *fakeClaimer
+	logs     *bytes.Buffer
+	reg      *prometheus.Registry
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	hs := &harness{claimer: &fakeClaimer{}, acker: &fakeAcker{}, nacker: &fakeNacker{}, logs: &bytes.Buffer{}, reg: prometheus.NewRegistry()}
+	hs := &harness{claimer: &fakeClaimer{}, acker: &fakeAcker{}, nacker: &fakeNacker{}, extender: &fakeExtender{}, logs: &bytes.Buffer{}, reg: prometheus.NewRegistry()}
 	attempts, err := NewAttemptMetrics(hs.reg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hs.h, err = NewHandler(HandlerDeps{
 		Attempts: attempts,
-		Claimer:  hs.claimer, Acknowledger: hs.acker, NegativeAcknowledger: hs.nacker, RetryPolicy: defaultPolicy(),
+		Claimer:  hs.claimer, Acknowledger: hs.acker, NegativeAcknowledger: hs.nacker, Extender: hs.extender, RetryPolicy: defaultPolicy(),
 		Uniform: func() float64 { return 0 }, ConsumerSecret: secret, Gen: fixedGen{}, Clock: fixedClock{},
 		Logger: observability.NewTestLogger("debug", hs.logs), Registerer: hs.reg,
 	})

@@ -31,10 +31,12 @@ const (
 	MaxWaitMs     = 30000
 )
 
-// AckTimeout and NackTimeout are the acknowledgement request deadlines.
+// AckTimeout, NackTimeout, and ExtendTimeout are the request deadlines of
+// the token-keyed operations.
 const (
-	AckTimeout  = 5 * time.Second
-	NackTimeout = 5 * time.Second
+	AckTimeout    = 5 * time.Second
+	NackTimeout   = 5 * time.Second
+	ExtendTimeout = 5 * time.Second
 )
 
 // Long-poll defaults from the delivery design.
@@ -58,6 +60,7 @@ type HandlerDeps struct {
 	Claimer              Claimer
 	Acknowledger         Acknowledger
 	NegativeAcknowledger NegativeAcknowledger
+	Extender             Extender
 	Stats                StatsReader
 	// Attempts counts completed attempts; maintenance shares the instance.
 	Attempts *AttemptMetrics
@@ -99,8 +102,8 @@ type Handler struct {
 
 // NewHandler composes the Consumer API.
 func NewHandler(d HandlerDeps) (*Handler, error) {
-	if d.Clock == nil || d.Gen == nil || d.Claimer == nil || d.Acknowledger == nil || d.NegativeAcknowledger == nil || d.Attempts == nil {
-		return nil, errors.New("delivery: Claimer, Acknowledger, NegativeAcknowledger, Attempts, Gen, and Clock are required")
+	if d.Clock == nil || d.Gen == nil || d.Claimer == nil || d.Acknowledger == nil || d.NegativeAcknowledger == nil || d.Extender == nil || d.Attempts == nil {
+		return nil, errors.New("delivery: Claimer, Acknowledger, NegativeAcknowledger, Extender, Attempts, Gen, and Clock are required")
 	}
 	if err := d.RetryPolicy.Validate(); err != nil {
 		return nil, err
@@ -139,6 +142,7 @@ func NewHandler(d HandlerDeps) (*Handler, error) {
 	h.mux.Handle("POST /v1/deliveries/claim", h.auth(h.handleClaim))
 	h.mux.Handle("POST /v1/deliveries/ack", h.auth(h.handleAck))
 	h.mux.Handle("POST /v1/deliveries/nack", h.auth(h.handleNack))
+	h.mux.Handle("POST /v1/deliveries/extend", h.auth(h.handleExtend))
 	return h, nil
 }
 
@@ -628,4 +632,79 @@ func (h *Handler) logNacked(c call, res NackResult, reason string) {
 	fields, scope := h.recipientFields(c, res.RecipientIdentity, fields)
 	h.d.Attempts.Observe(scope, "nack", res.ClaimedMs, res.CompletedMs)
 	observability.LogEvent(h.log, slog.LevelInfo, "delivery_nacked", "delivery negatively acknowledged; retry scheduled", fields...)
+}
+
+type extendRequest struct {
+	DeliveryToken string `json:"delivery_token"`
+	OperationID   string `json:"operation_id"`
+}
+
+type extendResponse struct {
+	Status            string `json:"status"`
+	MessageID         string `json:"message_id"`
+	LeaseExpiresMs    int64  `json:"lease_expires_ms"`
+	MaxLeaseExpiresMs int64  `json:"max_lease_expires_ms"`
+}
+
+func (h *Handler) handleExtend(w http.ResponseWriter, r *http.Request, c call) {
+	var req extendRequest
+	if status, code, msg, ok := decode(r, &req); !ok {
+		writeError(w, status, code, msg, c.requestID)
+		return
+	}
+	switch {
+	case !tokenPattern.MatchString(req.DeliveryToken):
+		writeError(w, http.StatusBadRequest, "invalid_request", "delivery_token is malformed", c.requestID)
+		return
+	case !uuidV7Pattern.MatchString(req.OperationID):
+		writeError(w, http.StatusBadRequest, "invalid_request", "operation_id must be a UUIDv7", c.requestID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), ExtendTimeout)
+	defer cancel()
+	tokenDigest := sha256.Sum256([]byte(req.DeliveryToken))
+	tokenHex := hex.EncodeToString(tokenDigest[:])
+	argsDigest := sha256.Sum256([]byte(req.OperationID + "\n" + tokenHex))
+	res := h.d.Extender.Extend(ctx, ExtendRequest{
+		Token: req.DeliveryToken, TokenDigest: tokenHex, OperationID: req.OperationID, ArgsDigest: hex.EncodeToString(argsDigest[:]),
+	})
+
+	switch res.Outcome {
+	case ExtendExtended:
+		h.logExtended(c, req.OperationID, res)
+		writeJSON(w, http.StatusOK, extendResponse{Status: "extended", MessageID: res.MessageID, LeaseExpiresMs: res.LeaseExpiresMs, MaxLeaseExpiresMs: res.MaxLeaseExpiresMs})
+	case ExtendReplay:
+		writeJSON(w, http.StatusOK, extendResponse{Status: "extended", MessageID: res.MessageID, LeaseExpiresMs: res.LeaseExpiresMs, MaxLeaseExpiresMs: res.MaxLeaseExpiresMs})
+	case ExtendOperationConflict:
+		writeError(w, http.StatusConflict, "operation_conflict", "operation_id was used with other arguments", c.requestID)
+	case ExtendNotFound:
+		writeError(w, http.StatusNotFound, "delivery_token_not_found", "unknown or expired delivery token", c.requestID)
+	case ExtendStale:
+		writeError(w, http.StatusConflict, "stale_delivery_token", "the delivery attempt is no longer active", c.requestID)
+	case ExtendRecipientBlocked:
+		writeError(w, http.StatusConflict, "recipient_blocked", "the recipient is blocked pending operator recovery", c.requestID)
+	case ExtendMaximumLifetimeReached:
+		writeError(w, http.StatusConflict, "maximum_lease_lifetime_reached", "the lease reached its maximum lifetime", c.requestID)
+	case ExtendInternalFailure:
+		observability.LogEvent(h.log, slog.LevelError, "delivery_extend_failed", "lease extension hit unexpected stored state",
+			"request_id", c.requestID, "error_code", "internal_error", "outcome", string(res.Outcome))
+		writeError(w, http.StatusInternalServerError, "internal_error", "unexpected internal error", c.requestID)
+	default:
+		observability.LogEvent(h.log, slog.LevelError, "delivery_extend_failed", "lease extension could not reach Valkey",
+			"request_id", c.requestID, "error_code", "dependency_unavailable")
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "dependency unavailable; repeat the same operation_id", c.requestID)
+	}
+}
+
+// logExtended records the delivery_lease_extended feature event.
+func (h *Handler) logExtended(c call, operationID string, res ExtendResult) {
+	fields := []any{
+		"request_id", c.requestID, "operation_id", operationID, "message_id", res.MessageID,
+		"delivery_cycle", res.DeliveryCycle, "attempt", res.Attempt,
+		"lease_expires_ms", res.LeaseExpiresMs, "max_lease_expires_ms", res.MaxLeaseExpiresMs,
+		"duration_ms", h.d.Clock.Now().Sub(c.start).Milliseconds(),
+	}
+	fields, _ = h.recipientFields(c, res.RecipientIdentity, fields)
+	observability.LogEvent(h.log, slog.LevelInfo, "delivery_lease_extended", "delivery lease extended", fields...)
 }

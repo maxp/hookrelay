@@ -2,6 +2,7 @@ package valkey
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -14,10 +15,13 @@ import (
 // ClaimOpTTL is the fixed claim operation record retention.
 const ClaimOpTTL = 10 * time.Minute
 
-// ClaimLimits are the lease bounds passed to claim_v3.
+// ClaimLimits are the lease bounds passed to claim_v3 and extend_v1.
 type ClaimLimits struct {
 	MaxActiveLeases      int
 	InitialLeaseDuration time.Duration
+	// LeaseExtension and MaxLeaseLifetime come from validated configuration.
+	LeaseExtension   time.Duration
+	MaxLeaseLifetime time.Duration
 }
 
 // DeliveryStore implements delivery.Claimer with claim_v3 and
@@ -234,4 +238,39 @@ func (s *DeliveryStore) Nack(ctx context.Context, req delivery.NackRequest) deli
 		return delivery.NackResult{Outcome: delivery.NackInternalFailure}
 	}
 	return out
+}
+
+// Extend runs extend_v1.
+func (s *DeliveryStore) Extend(ctx context.Context, req delivery.ExtendRequest) delivery.ExtendResult {
+	res, err := s.a.RunScript(ctx, "extend_v1",
+		[]string{"hr1:t:" + req.TokenDigest, "hr1:op:" + req.OperationID, "hr1:leases"},
+		[]string{req.Token, req.TokenDigest, req.OperationID, req.ArgsDigest,
+			itoa64(s.limits.LeaseExtension.Milliseconds()), itoa64(s.limits.MaxLeaseLifetime.Milliseconds()),
+			itoa64(ClaimOpTTL.Milliseconds()), "hr1"})
+	if err != nil {
+		// Whether or not the script ran, repeating the same operation_id
+		// returns the recorded deadline.
+		return delivery.ExtendResult{Outcome: delivery.ExtendDependencyUnavailable}
+	}
+	switch res.Status {
+	case "extended", "replay":
+		id, err1 := res.Fields[0].ToString()
+		lease, err2 := res.Fields[1].AsInt64()
+		maxLease, err3 := res.Fields[2].AsInt64()
+		out := delivery.ExtendResult{Outcome: delivery.ExtendOutcome(res.Status), MessageID: id, LeaseExpiresMs: lease, MaxLeaseExpiresMs: maxLease}
+		var err4, err5, err6 error
+		if res.Status == "extended" {
+			out.RecipientIdentity, err4 = res.Fields[3].ToString()
+			out.DeliveryCycle, err5 = res.Fields[4].AsInt64()
+			out.Attempt, err6 = res.Fields[5].AsInt64()
+		}
+		if errors.Join(err1, err2, err3, err4, err5, err6) != nil {
+			return delivery.ExtendResult{Outcome: delivery.ExtendInternalFailure}
+		}
+		return out
+	case "wrong_type":
+		return delivery.ExtendResult{Outcome: delivery.ExtendInternalFailure}
+	default:
+		return delivery.ExtendResult{Outcome: delivery.ExtendOutcome(res.Status)}
+	}
 }
