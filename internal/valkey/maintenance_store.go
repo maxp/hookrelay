@@ -2,6 +2,7 @@ package valkey
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/maxp/hookrelay/internal/delivery"
@@ -60,13 +61,13 @@ func (s *DeliveryStore) DueLeases(ctx context.Context, limit int) (delivery.DueB
 	return s.dueEntries(ctx, "hr1:leases", limit)
 }
 
-// ExpireLease runs expire_lease_v1 for one Recipient.
+// ExpireLease runs expire_lease_v2 for one Recipient.
 func (s *DeliveryStore) ExpireLease(ctx context.Context, recipientIdentity string, retryDelaysMs []int64, maxAttempts int) delivery.ExpiryResult {
 	delays := make([]string, len(retryDelaysMs))
 	for i, d := range retryDelaysMs {
 		delays[i] = itoa64(d)
 	}
-	res, err := s.a.RunScript(ctx, "expire_lease_v1",
+	res, err := s.a.RunScript(ctx, "expire_lease_v2",
 		[]string{"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"},
 		[]string{recipientIdentity, strings.Join(delays, ","), itoa64(int64(maxAttempts)), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {
@@ -93,6 +94,21 @@ func (s *DeliveryStore) ExpireLease(ctx context.Context, recipientIdentity strin
 			return delivery.ExpiryResult{Outcome: delivery.ExpiryInternalFailure}
 		}
 		return out
+	case "dead_lettered":
+		id, err1 := res.Fields[0].ToString()
+		instance, err2 := res.Fields[5].ToString()
+		cycle, err3 := res.Fields[1].AsInt64()
+		at, err4 := res.Fields[2].AsInt64()
+		attempt, err5 := res.Fields[3].AsInt64()
+		claimed, err6 := res.Fields[4].AsInt64()
+		if err := errors.Join(err1, err2, err3, err4, err5, err6); err != nil {
+			return delivery.ExpiryResult{Outcome: delivery.ExpiryInternalFailure}
+		}
+		// The dead-letter time is also when the lease expired.
+		return delivery.ExpiryResult{
+			Outcome: delivery.ExpiryDeadLettered, MessageID: id, DeliveryCycle: cycle, DeadLetteredMs: at,
+			ExpiredMs: at, Attempt: attempt, ClaimedMs: claimed, ConsumerInstanceID: instance,
+		}
 	case "wrong_type":
 		return delivery.ExpiryResult{Outcome: delivery.ExpiryInternalFailure}
 	default:

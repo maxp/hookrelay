@@ -54,17 +54,20 @@ func init() {
 		"recipient_blocked":    0,
 		"wrong_type":           0,
 	})
-	register("nack_v1", 1, map[string]int{
+	register("nack_v2", 2, map[string]int{
 		// message_id, attempt, retry_at_ms, recipient_identity,
 		// delivery_cycle, claimed_ms, completed_ms
 		"retry_scheduled": 7,
-		// result, message_id, attempt, retry_at_ms (recorded result)
+		// message_id, delivery_cycle, dead_lettered_ms, recipient_identity,
+		// attempt, claimed_ms
+		"dead_lettered": 6,
+		// result, message_id, then attempt, retry_at_ms (retry_scheduled)
+		// or delivery_cycle, dead_lettered_ms (dead_lettered)
 		"already_nacked":       4,
 		"already_acknowledged": 0,
 		"not_found":            0,
 		"stale":                0,
 		"recipient_blocked":    0,
-		"attempts_exhausted":   0,
 		"wrong_type":           0,
 	})
 	register("activate_retry_v1", 1, map[string]int{
@@ -73,14 +76,16 @@ func init() {
 		"recipient_blocked": 0,
 		"wrong_type":        0,
 	})
-	register("expire_lease_v1", 1, map[string]int{
+	register("expire_lease_v2", 2, map[string]int{
 		// message_id, attempt, retry_at_ms, delivery_cycle, claimed_ms,
 		// expired_ms, consumer_instance_id (empty when absent)
-		"retry_scheduled":    7,
-		"not_due":            0,
-		"recipient_blocked":  0,
-		"attempts_exhausted": 0,
-		"wrong_type":         0,
+		"retry_scheduled": 7,
+		// message_id, delivery_cycle, dead_lettered_ms, attempt, claimed_ms,
+		// consumer_instance_id
+		"dead_lettered":     6,
+		"not_due":           0,
+		"recipient_blocked": 0,
+		"wrong_type":        0,
 	})
 	register("reconcile_recipient_v1", 1, map[string]int{
 		// repairs, queue_length, reason

@@ -440,14 +440,16 @@ func TestStructureValidationRejectsWrongTypes(t *testing.T) {
 	}
 }
 
-// TestStructureValidationCoversTheRetryIndex pins the retry index as a
-// validated global structure.
-func TestStructureValidationCoversTheRetryIndex(t *testing.T) {
-	a := testAdapter(t, false)
-	flushAll(t, a)
-	a.testDo(t, "SET", "hr1:retries", "poison")
-	if _, err := a.ValidateReadiness(context.Background(), false); err == nil || !strings.Contains(err.Error(), "hr1:retries") {
-		t.Fatalf("poisoned retry index passed the gate: %v", err)
+// TestStructureValidationCoversFailurePathIndexes pins the retry and DLQ
+// indexes as validated global structures.
+func TestStructureValidationCoversFailurePathIndexes(t *testing.T) {
+	for _, key := range []string{"hr1:retries", "hr1:dlq"} {
+		a := testAdapter(t, false)
+		flushAll(t, a)
+		a.testDo(t, "SET", key, "poison")
+		if _, err := a.ValidateReadiness(context.Background(), false); err == nil || !strings.Contains(err.Error(), key) {
+			t.Fatalf("poisoned %s passed the gate: %v", key, err)
+		}
 	}
 }
 

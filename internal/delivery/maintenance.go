@@ -29,11 +29,10 @@ const (
 type maintenanceResult string
 
 const (
-	resultApplied  maintenanceResult = "applied"
-	resultStale    maintenanceResult = "stale"
-	resultBlocked  maintenanceResult = "blocked"
-	resultDeferred maintenanceResult = "deferred"
-	resultFailed   maintenanceResult = "failed"
+	resultApplied maintenanceResult = "applied"
+	resultStale   maintenanceResult = "stale"
+	resultBlocked maintenanceResult = "blocked"
+	resultFailed  maintenanceResult = "failed"
 )
 
 // MaintenanceConfig paces cooperative background maintenance.
@@ -109,7 +108,7 @@ func NewMaintenance(d MaintenanceDeps) (*Maintenance, error) {
 		log: d.Logger,
 		processed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hookrelay_maintenance_processed_total",
-			Help: "Maintenance transitions by kind and bounded result (applied, stale, blocked, deferred, failed).",
+			Help: "Maintenance transitions by kind and bounded result (applied, stale, blocked, failed).",
 		}, []string{"kind", "result"}),
 		dueLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "hookrelay_maintenance_due_lag_seconds",
@@ -191,19 +190,11 @@ func (m *Maintenance) batch(ctx context.Context, kind string, first bool, read f
 		}
 		m.dueLag.WithLabelValues(kind).Set(lag)
 	}
-	deferred := 0
 	for _, e := range batch.Entries {
 		opCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
 		result := process(opCtx, e)
 		cancel()
-		if result == resultDeferred {
-			deferred++
-		}
 		m.processed.WithLabelValues(kind, string(result)).Inc()
-	}
-	if deferred > 0 {
-		observability.LogEvent(m.log, slog.LevelWarn, "maintenance_transition_deferred",
-			"due entries on their last attempt wait for the dead-letter transition", "kind", kind, "count", deferred)
 	}
 	m.batchSize.WithLabelValues(kind).Observe(float64(len(batch.Entries)))
 	m.duration.WithLabelValues(kind).Observe(m.d.Clock.Now().Sub(start).Seconds())
@@ -243,12 +234,20 @@ func (m *Maintenance) expireLease(ctx context.Context, e DueEntry) maintenanceRe
 		m.d.Attempts.Observe(scope, "expired", res.ClaimedMs, res.ExpiredMs)
 		observability.LogEvent(m.log, slog.LevelInfo, "delivery_lease_expired", "lease expired; retry scheduled", fields...)
 		return resultApplied
+	case ExpiryDeadLettered:
+		var extra []any
+		if res.ConsumerInstanceID != "" {
+			extra = append(extra, "consumer_instance_id", res.ConsumerInstanceID)
+		}
+		recordDeadLetter(m.log, m.d.Attempts, deadLetter{
+			RecipientIdentity: e.RecipientIdentity, MessageID: res.MessageID, Reason: reasonExpiryExhausted,
+			DeliveryCycle: res.DeliveryCycle, Attempt: res.Attempt, ClaimedMs: res.ClaimedMs, DeadLetteredMs: res.DeadLetteredMs,
+		}, extra...)
+		return resultApplied
 	case ExpiryNotDue:
 		return resultStale
 	case ExpiryRecipientBlocked:
 		return resultBlocked
-	case ExpiryAttemptsExhausted:
-		return resultDeferred
 	default:
 		m.transitionFailed(kindLeaseExpiry, string(res.Outcome))
 		return resultFailed

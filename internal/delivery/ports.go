@@ -63,11 +63,12 @@ type Claimer interface {
 
 // Stats is the delivery state snapshot behind the delivery gauges.
 type Stats struct {
-	ActiveLeases      int64
-	ReadyRecipients   int64
-	BlockedRecipients int64
-	QueuedMessages    int64
-	RetriesWaiting    int64
+	ActiveLeases       int64
+	ReadyRecipients    int64
+	BlockedRecipients  int64
+	QueuedMessages     int64
+	RetriesWaiting     int64
+	DeadLetterMessages int64
 }
 
 // StatsReader reads the delivery gauges' sources.
@@ -129,22 +130,22 @@ type NackRequest struct {
 type NackOutcome string
 
 const (
-	NackRetryScheduled      NackOutcome = "retry_scheduled"
-	NackAlreadyNacked       NackOutcome = "already_nacked"
-	NackAlreadyAcknowledged NackOutcome = "already_acknowledged"
-	NackNotFound            NackOutcome = "not_found"
-	NackStale               NackOutcome = "stale"
-	NackRecipientBlocked    NackOutcome = "recipient_blocked"
-	// NackAttemptsExhausted refuses the last attempt without mutation until
-	// the dead-letter transition exists (Milestone 2 ticket 05).
-	NackAttemptsExhausted     NackOutcome = "attempts_exhausted"
+	NackRetryScheduled        NackOutcome = "retry_scheduled"
+	NackAlreadyNacked         NackOutcome = "already_nacked"
+	NackAlreadyAcknowledged   NackOutcome = "already_acknowledged"
+	NackNotFound              NackOutcome = "not_found"
+	NackStale                 NackOutcome = "stale"
+	NackRecipientBlocked      NackOutcome = "recipient_blocked"
+	NackDeadLettered          NackOutcome = "dead_lettered"
 	NackDependencyUnavailable NackOutcome = "dependency_unavailable"
 	NackInternalFailure       NackOutcome = "internal_failure"
 )
 
-// NackResult carries the scheduled retry or the recorded result of an
-// earlier nack (Result names the recorded result kind). RecipientIdentity,
-// DeliveryCycle, ClaimedMs, and CompletedMs are set only for a first nack.
+// NackResult carries the scheduled retry, the dead-letter, or the recorded
+// result of an earlier nack (Result names the result kind: retry_scheduled
+// with Attempt and RetryAtMs, or dead_lettered with DeliveryCycle and
+// DeadLetteredMs). RecipientIdentity, ClaimedMs, and CompletedMs are set
+// only for a first nack.
 type NackResult struct {
 	Outcome           NackOutcome
 	Result            string
@@ -155,7 +156,14 @@ type NackResult struct {
 	DeliveryCycle     int64
 	ClaimedMs         int64
 	CompletedMs       int64
+	DeadLetteredMs    int64
 }
+
+// Recorded nack result kinds (NackResult.Result).
+const (
+	NackResultRetryScheduled = "retry_scheduled"
+	NackResultDeadLettered   = "dead_lettered"
+)
 
 // NegativeAcknowledger runs the atomic negative-acknowledgement transition.
 type NegativeAcknowledger interface {
@@ -205,25 +213,25 @@ type RetryActivator interface {
 type ExpiryOutcome string
 
 const (
-	ExpiryRetryScheduled   ExpiryOutcome = "retry_scheduled"
-	ExpiryNotDue           ExpiryOutcome = "not_due"
-	ExpiryRecipientBlocked ExpiryOutcome = "recipient_blocked"
-	// ExpiryAttemptsExhausted leaves the last attempt's lease in place
-	// until the dead-letter transition exists (Milestone 2 ticket 05).
-	ExpiryAttemptsExhausted     ExpiryOutcome = "attempts_exhausted"
+	ExpiryRetryScheduled        ExpiryOutcome = "retry_scheduled"
+	ExpiryNotDue                ExpiryOutcome = "not_due"
+	ExpiryRecipientBlocked      ExpiryOutcome = "recipient_blocked"
+	ExpiryDeadLettered          ExpiryOutcome = "dead_lettered"
 	ExpiryDependencyUnavailable ExpiryOutcome = "dependency_unavailable"
 	ExpiryInternalFailure       ExpiryOutcome = "internal_failure"
 )
 
-// ExpiryResult carries the expired attempt and its scheduled retry.
+// ExpiryResult carries the expired attempt and its scheduled retry, or its
+// dead-letter (DeadLetteredMs; no retry).
 type ExpiryResult struct {
-	Outcome       ExpiryOutcome
-	MessageID     string
-	Attempt       int64
-	RetryAtMs     int64
-	DeliveryCycle int64
-	ClaimedMs     int64
-	ExpiredMs     int64
+	Outcome        ExpiryOutcome
+	MessageID      string
+	Attempt        int64
+	RetryAtMs      int64
+	DeliveryCycle  int64
+	ClaimedMs      int64
+	ExpiredMs      int64
+	DeadLetteredMs int64
 	// ConsumerInstanceID is the diagnostics identifier recorded at claim
 	// (empty when absent).
 	ConsumerInstanceID string

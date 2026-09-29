@@ -182,17 +182,31 @@ func TestExpireLeaseRefusals(t *testing.T) {
 		}
 		assertUnchanged(t, a, before, "blocked expiry")
 	})
-	t.Run("last attempt", func(t *testing.T) {
-		a, s := expirySetup(t)
-		enqueueJSON(t, a, "m1", ridA)
-		a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "attempt", "4")
-		claimAndLapse(t, s, "op-1", "dlv_token1", "")
-		before := snapshot(t, a)
-		if r := expire(s, ridA); r.Outcome != delivery.ExpiryAttemptsExhausted {
-			t.Errorf("expire = %+v, want attempts_exhausted until dead-letter exists", r)
-		}
-		assertUnchanged(t, a, before, "last attempt expiry")
-	})
+	for name, poison := range map[string]func(t *testing.T, a *Adapter){
+		"last attempt with zero counter":               func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:stats:queued_messages", "0") },
+		"last attempt with dead-letter hash":           func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", "hr1:dl:m1", "x", "y") },
+		"last attempt with sequence overflow":          func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:ready_seq", "9223372036854775807") },
+		"last attempt with malformed counter":          func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:stats:queued_messages", "x") },
+		"last attempt with dead-letter key wrong type": func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:dl:m1", "x") },
+		"last attempt with metadata wrong type": func(t *testing.T, a *Adapter) {
+			a.testDo(t, "DEL", "hr1:mi:m1")
+			a.testDo(t, "SET", "hr1:mi:m1", "x")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, s := expirySetup(t)
+			enqueueJSON(t, a, "m1", ridA)
+			enqueueJSON(t, a, "m2", ridA)
+			a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "attempt", "4")
+			claimAndLapse(t, s, "op-1", "dlv_token1", "")
+			poison(t, a)
+			before := snapshot(t, a)
+			if r := expire(s, ridA); r.Outcome != delivery.ExpiryInternalFailure {
+				t.Errorf("expire = %+v, want internal failure", r)
+			}
+			assertUnchanged(t, a, before, name)
+		})
+	}
 	state := "hr1:r:" + ridA + ":s"
 	for name, poison := range map[string]func(t *testing.T, a *Adapter){
 		"leases wrong type": func(t *testing.T, a *Adapter) {
@@ -293,11 +307,11 @@ func TestExpireLeaseArgumentsAndReload(t *testing.T) {
 		"zero tombstone ttl": with(3, "0"),
 		"prefix mismatch":    with(4, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "expire_lease_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "expire_lease_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}
-	if _, err := a.RunScript(ctx, "expire_lease_v1", keys[:6], valid); err == nil || errors.Is(err, ErrNotDispatched) {
+	if _, err := a.RunScript(ctx, "expire_lease_v2", keys[:6], valid); err == nil || errors.Is(err, ErrNotDispatched) {
 		t.Errorf("too few keys: err = %v", err)
 	}
 
@@ -348,4 +362,85 @@ func TestExpireLeaseStaleMemberBesideCorruptIndex(t *testing.T) {
 		t.Errorf("expire = %+v, want not_due", r)
 	}
 	assertUnchanged(t, a, before, "stale member beside a corrupt index")
+}
+
+// TestExpireLeaseDeadLettersTheLastAttempt pins the dead_lettered tuple of
+// expiry: reason expiry_exhausted, the queue advanced, the expired token
+// phase, the claim operation marker, and the retained history.
+func TestExpireLeaseDeadLettersTheLastAttempt(t *testing.T) {
+	a, s := expirySetup(t)
+	ctx := context.Background()
+	enqueueJSON(t, a, "m1", ridA)
+	enqueueJSON(t, a, "m2", ridA)
+	a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "attempt", "4")
+	claimed := claimAndLapse(t, s, "op-1", "dlv_token1", "worker-4")
+
+	res := expire(s, ridA)
+	if res.Outcome != delivery.ExpiryDeadLettered || res.MessageID != "m1" || res.DeliveryCycle != 1 || res.Attempt != 4 ||
+		res.ClaimedMs != claimed.Delivery.ClaimedMs || res.DeadLetteredMs < claimed.Delivery.LeaseExpiresMs || res.ConsumerInstanceID != "worker-4" {
+		t.Fatalf("expire = %+v", res)
+	}
+	assertHash(t, a, "hr1:dl:m1", map[string]string{
+		"bot_platform": "telegram", "bot_id": "42", "recipient_scope": "chat", "chat_id": "-1", "recipient_identity": ridA,
+		"dead_lettered_ms": itoa64(res.DeadLetteredMs), "dead_letter_reason": "expiry_exhausted", "delivery_cycle": "1",
+		"dedup_identity_digest": "d-m1",
+	})
+	if sc, ok := score(t, a, "hr1:dlq", "m1"); !ok || sc != res.DeadLetteredMs {
+		t.Errorf("dlq score = %d %v", sc, ok)
+	}
+	if q := lrange(t, a, "hr1:r:"+ridA+":q"); len(q) != 1 || q[0] != "m2" {
+		t.Errorf("queue = %v", q)
+	}
+	assertHash(t, a, "hr1:r:"+ridA+":s", map[string]string{"status": "ready", "head_message_id": "m2", "delivery_cycle": "1", "attempt": "1"})
+	for _, idx := range []string{"hr1:leases", "hr1:retries"} {
+		if _, ok := score(t, a, idx, ridA); ok {
+			t.Errorf("%s member kept", idx)
+		}
+	}
+	if n, _ := a.client.Do(ctx, a.client.B().Get().Key("hr1:stats:queued_messages").Build()).AsInt64(); n != 1 {
+		t.Errorf("counter = %d", n)
+	}
+	assertHash(t, a, "hr1:t:"+ackReq("dlv_token1").TokenDigest, map[string]string{"state": "expired", "message_id": "m1", "expired_ms": itoa64(res.DeadLetteredMs)})
+	if got := hget(t, a, "hr1:op:op-1", "state"); got != "no_longer_active" {
+		t.Errorf("op state = %q", got)
+	}
+	history := lrange(t, a, "hr1:a:m1")
+	if e := decodeEntry(t, history[len(history)-1]); e["outcome"] != "expired" || e["attempt"] != 4.0 {
+		t.Errorf("history = %v", history)
+	}
+	if !exists(t, a, "hr1:m:m1") || !exists(t, a, "hr1:mi:m1") {
+		t.Error("dead-lettered blob or metadata deleted")
+	}
+	if c := s.Claim(ctx, claimReq("op-next", "args", "dlv_next")); c.Outcome != delivery.ClaimClaimed || c.Delivery.MessageID != "m2" {
+		t.Errorf("next claim = %+v", c)
+	}
+}
+
+// TestExpireLeaseDeadLetterDrainsQueue pins a dead-lettering expiry of the
+// only message of a user-scope Recipient: user_id in the dead-letter Hash,
+// queue and state deleted, no index membership left.
+func TestExpireLeaseDeadLetterDrainsQueue(t *testing.T) {
+	a, s := expirySetup(t)
+	ctx := context.Background()
+	rid := "telegram:42:user:7"
+	enqueueJSON(t, a, "m1", rid)
+	a.testDo(t, "HSET", "hr1:r:"+rid+":s", "attempt", "4")
+	claimAndLapse(t, s, "op-1", "dlv_token1", "")
+	res := expire(s, rid)
+	if res.Outcome != delivery.ExpiryDeadLettered {
+		t.Fatalf("expire = %+v", res)
+	}
+	assertHash(t, a, "hr1:dl:m1", map[string]string{
+		"bot_platform": "telegram", "bot_id": "42", "recipient_scope": "user", "user_id": "7", "recipient_identity": rid,
+		"dead_lettered_ms": itoa64(res.DeadLetteredMs), "dead_letter_reason": "expiry_exhausted", "delivery_cycle": "1",
+		"dedup_identity_digest": "d-m1",
+	})
+	for _, k := range []string{"hr1:r:" + rid + ":q", "hr1:r:" + rid + ":s", "hr1:ready", "hr1:leases", "hr1:retries"} {
+		if exists(t, a, k) {
+			t.Errorf("%s kept after draining", k)
+		}
+	}
+	if n, _ := a.client.Do(ctx, a.client.B().Get().Key("hr1:stats:queued_messages").Build()).AsInt64(); n != 0 {
+		t.Errorf("counter = %d", n)
+	}
 }

@@ -6,11 +6,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// AttemptMetrics counts completed Delivery Attempts. The Consumer API
-// (acknowledged, nack) and maintenance (expired) share one instance.
+// AttemptMetrics counts completed Delivery Attempts and dead-letters. The
+// Consumer API (acknowledged, nack) and maintenance (expired) share one
+// instance; both paths can dead-letter.
 type AttemptMetrics struct {
-	attempts *prometheus.CounterVec
-	duration *prometheus.HistogramVec
+	attempts    *prometheus.CounterVec
+	duration    *prometheus.HistogramVec
+	deadLetters *prometheus.CounterVec
 }
 
 // NewAttemptMetrics registers the attempt counter and duration histogram.
@@ -25,8 +27,12 @@ func NewAttemptMetrics(reg prometheus.Registerer) (*AttemptMetrics, error) {
 			Help:    "Completed Delivery Attempt duration from claim to completion (Valkey time), by Recipient scope and outcome.",
 			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
 		}, []string{"recipient_scope", "outcome"}),
+		deadLetters: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hookrelay_dead_letters_total",
+			Help: "Messages moved to the global DLQ by Recipient scope and reason (nack_exhausted, expiry_exhausted).",
+		}, []string{"recipient_scope", "reason"}),
 	}
-	for _, c := range []prometheus.Collector{m.attempts, m.duration} {
+	for _, c := range []prometheus.Collector{m.attempts, m.duration, m.deadLetters} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("delivery: register attempt metrics: %w", err)
 		}
@@ -44,12 +50,13 @@ func (m *AttemptMetrics) Observe(scope, outcome string, claimedMs, completedMs i
 }
 
 type metrics struct {
-	claims            *prometheus.CounterVec
-	retriesWaiting    prometheus.Gauge
-	activeLeases      prometheus.Gauge
-	readyRecipients   prometheus.Gauge
-	blockedRecipients prometheus.Gauge
-	queueMessages     prometheus.Gauge
+	claims             *prometheus.CounterVec
+	retriesWaiting     prometheus.Gauge
+	deadLetterMessages prometheus.Gauge
+	activeLeases       prometheus.Gauge
+	readyRecipients    prometheus.Gauge
+	blockedRecipients  prometheus.Gauge
+	queueMessages      prometheus.Gauge
 }
 
 func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, error) {
@@ -61,6 +68,10 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 		retriesWaiting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "hookrelay_retries_waiting",
 			Help: "Recipients whose head message waits for a retry.",
+		}),
+		deadLetterMessages: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hookrelay_dead_letter_messages",
+			Help: "Messages in the global DLQ.",
 		}),
 		activeLeases: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "hookrelay_active_leases",
@@ -79,7 +90,7 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 			Help: "Messages queued across all Recipients.",
 		}),
 	}
-	collectors := []prometheus.Collector{m.claims, m.retriesWaiting, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
+	collectors := []prometheus.Collector{m.claims, m.retriesWaiting, m.deadLetterMessages, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "hookrelay_waiting_claims",
 			Help: "Claim requests waiting for work in this process.",
@@ -91,4 +102,9 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 		}
 	}
 	return m, nil
+}
+
+// countDeadLetter counts one message moved to the DLQ.
+func (m *AttemptMetrics) countDeadLetter(scope, reason string) {
+	m.deadLetters.WithLabelValues(scope, reason).Inc()
 }

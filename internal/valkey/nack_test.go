@@ -174,9 +174,8 @@ func TestNackSchedulesRetry(t *testing.T) {
 	}
 }
 
-// TestNackPicksTheDelayOfTheFailedAttempt pins delay selection by attempt,
-// omission of absent optional history fields, and the temporary refusal
-// of the last attempt until the dead-letter transition exists.
+// TestNackPicksTheDelayOfTheFailedAttempt pins delay selection by attempt
+// and omission of absent optional history fields.
 func TestNackPicksTheDelayOfTheFailedAttempt(t *testing.T) {
 	a, s := claimSetup(t)
 	ctx := context.Background()
@@ -202,15 +201,6 @@ func TestNackPicksTheDelayOfTheFailedAttempt(t *testing.T) {
 			t.Errorf("entry %d = %s", i, raw)
 		}
 	}
-
-	if c := s.Claim(ctx, claimReq("op-4", "args", "dlv_token4")); c.Delivery.Attempt != 4 {
-		t.Fatalf("fourth claim = %+v", c)
-	}
-	before := snapshot(t, a)
-	if r := s.Nack(ctx, nackReq("dlv_token4", "")); r.Outcome != delivery.NackAttemptsExhausted {
-		t.Errorf("last attempt nack = %+v, want attempts_exhausted until dead-letter exists", r)
-	}
-	assertUnchanged(t, a, before, "last attempt nack")
 }
 
 // TestNackRefusals pins every refusal status and the absence of mutation.
@@ -270,20 +260,189 @@ func TestNackRefusals(t *testing.T) {
 	}
 }
 
-// TestNackSingleAttemptPolicy pins a one-attempt policy: the delay list is
-// empty and the only attempt is the last one.
-func TestNackSingleAttemptPolicy(t *testing.T) {
+// failToLastAttempt nacks and activates attempts 1-3 of the head of rid,
+// then claims attempt 4 with token dlv_last.
+func failToLastAttempt(t *testing.T, a *Adapter, s *DeliveryStore, rid string) delivery.ClaimResult {
+	t.Helper()
+	ctx := context.Background()
+	for _, token := range []string{"dlv_token1", "dlv_token2", "dlv_token3"} {
+		s.Claim(ctx, claimReq("op-"+token, "args", token))
+		if r := s.Nack(ctx, nackReq(token, "")); r.Outcome != delivery.NackRetryScheduled {
+			t.Fatalf("nack = %+v", r)
+		}
+		activateRetry(t, a, rid)
+	}
+	req := claimReq("op-last", "args", "dlv_last")
+	req.ConsumerInstanceID = "worker-4"
+	c := s.Claim(ctx, req)
+	if c.Outcome != delivery.ClaimClaimed || c.Delivery.Attempt != 4 {
+		t.Fatalf("fourth claim = %+v", c)
+	}
+	return c
+}
+
+// assertHash checks that key holds exactly the wanted fields.
+func assertHash(t *testing.T, a *Adapter, key string, want map[string]string) {
+	t.Helper()
+	got := hgetall(t, a, key)
+	if len(got) != len(want) {
+		t.Errorf("%s = %v, want exactly %v", key, got, want)
+		return
+	}
+	for f, v := range want {
+		if got[f] != v {
+			t.Errorf("%s %s = %q, want %q", key, f, got[f], v)
+		}
+	}
+}
+
+// TestNackDeadLettersTheLastAttempt pins the dead_lettered tuple and every
+// affected key: the dead-letter Hash and DLQ member, the queue advanced to
+// a fresh ready head, the counter, retained blob/history/metadata, the
+// token's recorded dead_lettered result, and the claim operation marker.
+func TestNackDeadLettersTheLastAttempt(t *testing.T) {
 	a, s := claimSetup(t)
 	ctx := context.Background()
 	enqueueJSON(t, a, "m1", ridA)
-	s.Claim(ctx, claimReq("op-1", "args", "dlv_token1"))
-	req := nackReq("dlv_token1", "")
-	req.RetryDelaysMs, req.MaxAttempts = nil, 1
-	before := snapshot(t, a)
-	if r := s.Nack(ctx, req); r.Outcome != delivery.NackAttemptsExhausted {
-		t.Errorf("nack = %+v, want attempts_exhausted", r)
+	enqueueJSON(t, a, "m2", ridA)
+	claimed := failToLastAttempt(t, a, s, ridA)
+	seqBefore, _ := a.client.Do(ctx, a.client.B().Get().Key("hr1:ready_seq").Build()).AsInt64()
+
+	res := s.Nack(ctx, nackReq("dlv_last", "final_failure"))
+	if res.Outcome != delivery.NackDeadLettered || res.Result != "dead_lettered" || res.MessageID != "m1" || res.DeliveryCycle != 1 ||
+		res.Attempt != 4 || res.RecipientIdentity != ridA || res.ClaimedMs != claimed.Delivery.ClaimedMs || res.DeadLetteredMs < res.ClaimedMs {
+		t.Fatalf("nack = %+v", res)
 	}
-	assertUnchanged(t, a, before, "single-attempt nack")
+	assertHash(t, a, "hr1:dl:m1", map[string]string{
+		"bot_platform": "telegram", "bot_id": "42", "recipient_scope": "chat", "chat_id": "-1", "recipient_identity": ridA,
+		"dead_lettered_ms": itoa64(res.DeadLetteredMs), "dead_letter_reason": "nack_exhausted", "delivery_cycle": "1",
+		"dedup_identity_digest": "d-m1",
+	})
+	if sc, ok := score(t, a, "hr1:dlq", "m1"); !ok || sc != res.DeadLetteredMs {
+		t.Errorf("dlq score = %d %v", sc, ok)
+	}
+	if q := lrange(t, a, "hr1:r:"+ridA+":q"); len(q) != 1 || q[0] != "m2" {
+		t.Errorf("queue = %v, want [m2]", q)
+	}
+	assertHash(t, a, "hr1:r:"+ridA+":s", map[string]string{"status": "ready", "head_message_id": "m2", "delivery_cycle": "1", "attempt": "1"})
+	if sc, ok := score(t, a, "hr1:ready", ridA); !ok || sc != seqBefore+1 {
+		t.Errorf("ready score = %d %v, want the fresh sequence %d", sc, ok, seqBefore+1)
+	}
+	for _, idx := range []string{"hr1:leases", "hr1:retries"} {
+		if _, ok := score(t, a, idx, ridA); ok {
+			t.Errorf("%s member kept", idx)
+		}
+	}
+	if n, _ := a.client.Do(ctx, a.client.B().Get().Key("hr1:stats:queued_messages").Build()).AsInt64(); n != 1 {
+		t.Errorf("counter = %d, want 1", n)
+	}
+	if !exists(t, a, "hr1:m:m1") || !exists(t, a, "hr1:mi:m1") {
+		t.Error("dead-lettered blob or metadata deleted")
+	}
+	history := lrange(t, a, "hr1:a:m1")
+	if last := decodeEntry(t, history[len(history)-1]); len(history) != 4 || last["outcome"] != "nack" || last["attempt"] != 4.0 || last["reason_code"] != "final_failure" {
+		t.Errorf("history = %v", history)
+	}
+	assertHash(t, a, "hr1:t:"+ackReq("dlv_last").TokenDigest, map[string]string{
+		"state": "nacked", "result": "dead_lettered", "message_id": "m1", "delivery_cycle": "1", "dead_lettered_ms": itoa64(res.DeadLetteredMs),
+	})
+	if got := hget(t, a, "hr1:op:op-last", "state"); got != "no_longer_active" {
+		t.Errorf("op state = %q", got)
+	}
+
+	before := snapshot(t, a)
+	repeat := s.Nack(ctx, nackReq("dlv_last", ""))
+	if repeat.Outcome != delivery.NackAlreadyNacked || repeat.Result != "dead_lettered" || repeat.MessageID != "m1" ||
+		repeat.DeliveryCycle != 1 || repeat.DeadLetteredMs != res.DeadLetteredMs {
+		t.Errorf("repeat = %+v, want the recorded dead_lettered result", repeat)
+	}
+	if r := s.Ack(ctx, ackReq("dlv_last")); r.Outcome != delivery.AckAlreadyNacked {
+		t.Errorf("ack after dead-letter = %+v", r)
+	}
+	assertUnchanged(t, a, before, "repeat after dead-letter")
+	if c := s.Claim(ctx, claimReq("op-next", "args", "dlv_next")); c.Outcome != delivery.ClaimClaimed || c.Delivery.MessageID != "m2" || c.Delivery.Attempt != 1 {
+		t.Errorf("next claim = %+v, want m2 attempt 1", c)
+	}
+}
+
+// TestNackDeadLetterRecipientScopesAndDrainedQueue pins the structured
+// Recipient fields for each scope, the drained queue (queue and state
+// deleted), and an M1-era message without metadata (empty digest).
+func TestNackDeadLetterRecipientScopesAndDrainedQueue(t *testing.T) {
+	for _, tc := range []struct {
+		rid      string
+		fields   map[string]string
+		metadata bool
+	}{
+		{"telegram:42:chat:-5", map[string]string{"recipient_scope": "chat", "chat_id": "-5"}, true},
+		{"telegram:42:user:7", map[string]string{"recipient_scope": "user", "user_id": "7"}, true},
+		{"telegram:42:bot", map[string]string{"recipient_scope": "bot"}, false},
+		{"telegram:42:relay", map[string]string{"recipient_scope": "relay"}, true},
+	} {
+		t.Run(tc.rid, func(t *testing.T) {
+			a, s := claimSetup(t)
+			ctx := context.Background()
+			enqueueJSON(t, a, "m1", tc.rid)
+			if !tc.metadata {
+				a.testDo(t, "DEL", "hr1:mi:m1")
+			}
+			s.Claim(ctx, claimReq("op-1", "args", "dlv_token1"))
+			req := nackReq("dlv_token1", "")
+			req.RetryDelaysMs, req.MaxAttempts = nil, 1
+			res := s.Nack(ctx, req)
+			if res.Outcome != delivery.NackDeadLettered || res.Attempt != 1 {
+				t.Fatalf("nack = %+v", res)
+			}
+			want := map[string]string{
+				"bot_platform": "telegram", "bot_id": "42", "recipient_identity": tc.rid, "dead_lettered_ms": itoa64(res.DeadLetteredMs),
+				"dead_letter_reason": "nack_exhausted", "delivery_cycle": "1", "dedup_identity_digest": "",
+			}
+			if tc.metadata {
+				want["dedup_identity_digest"] = "d-m1"
+			}
+			for k, v := range tc.fields {
+				want[k] = v
+			}
+			assertHash(t, a, "hr1:dl:m1", want)
+			for _, k := range []string{"hr1:r:" + tc.rid + ":q", "hr1:r:" + tc.rid + ":s", "hr1:ready", "hr1:leases", "hr1:retries"} {
+				if exists(t, a, k) {
+					t.Errorf("%s kept after draining", k)
+				}
+			}
+			if n, _ := a.client.Do(ctx, a.client.B().Get().Key("hr1:stats:queued_messages").Build()).AsInt64(); n != 0 {
+				t.Errorf("counter = %d", n)
+			}
+		})
+	}
+}
+
+// TestNackDeadLetterRefusals pins the dead-letter preconditions: corrupt
+// counter, sequence, or dead-letter/metadata keys refuse without mutation.
+func TestNackDeadLetterRefusals(t *testing.T) {
+	for name, poison := range map[string]func(t *testing.T, a *Adapter){
+		"zero counter":               func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:stats:queued_messages", "0") },
+		"malformed counter":          func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:stats:queued_messages", "x") },
+		"ready sequence overflow":    func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:ready_seq", "9223372036854775807") },
+		"dead-letter hash present":   func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", "hr1:dl:m1", "x", "y") },
+		"dead-letter key wrong type": func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:dl:m1", "x") },
+		"metadata wrong type": func(t *testing.T, a *Adapter) {
+			a.testDo(t, "DEL", "hr1:mi:m1")
+			a.testDo(t, "SET", "hr1:mi:m1", "x")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, s := claimSetup(t)
+			enqueueJSON(t, a, "m1", ridA)
+			enqueueJSON(t, a, "m2", ridA)
+			failToLastAttempt(t, a, s, ridA)
+			poison(t, a)
+			before := snapshot(t, a)
+			if r := s.Nack(context.Background(), nackReq("dlv_last", "")); r.Outcome != delivery.NackInternalFailure {
+				t.Errorf("nack = %+v, want internal failure", r)
+			}
+			assertUnchanged(t, a, before, name)
+		})
+	}
 }
 
 // TestNackArguments pins argument and key validation.
@@ -292,7 +451,7 @@ func TestNackArguments(t *testing.T) {
 	ctx := context.Background()
 	keys := []string{"hr1:t:d", "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"}
 	valid := []string{"dlv_t", "d", "", "1000,5000,30000", "4", "3600000", "hr1"}
-	if _, err := a.RunScript(ctx, "nack_v1", keys, valid); err != nil {
+	if _, err := a.RunScript(ctx, "nack_v2", keys, valid); err != nil {
 		t.Fatalf("valid call failed: %v", err)
 	}
 	with := func(i int, v string) []string {
@@ -313,16 +472,16 @@ func TestNackArguments(t *testing.T) {
 		"zero tombstone ttl": with(5, "0"),
 		"prefix mismatch":    with(6, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "nack_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "nack_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}
-	if _, err := a.RunScript(ctx, "nack_v1", keys[:7], valid); err == nil || errors.Is(err, ErrNotDispatched) {
+	if _, err := a.RunScript(ctx, "nack_v2", keys[:7], valid); err == nil || errors.Is(err, ErrNotDispatched) {
 		t.Errorf("too few keys: err = %v", err)
 	}
 }
 
-// TestNackAfterScriptFlush pins the EVAL reload path for nack_v1.
+// TestNackAfterScriptFlush pins the EVAL reload path for nack_v2.
 func TestNackAfterScriptFlush(t *testing.T) {
 	a, s := claimSetup(t)
 	ctx := context.Background()

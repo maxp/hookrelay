@@ -462,3 +462,83 @@ func TestLeaseExpiryOverRealValkey(t *testing.T) {
 		t.Errorf("claim replay after expiry = %d %s", w.Code, w.Body.String())
 	}
 }
+
+// TestDeadLetterOverRealValkey drives four nacks of one message through
+// the composed public listener and background maintenance: the fourth
+// dead-letters it (repeatable result) and the Recipient's next message is
+// claimed as attempt 1.
+func TestDeadLetterOverRealValkey(t *testing.T) {
+	public, _, _, store := composeStack(t)
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	for _, id := range []string{"10", "11"} {
+		update := `{"update_id":` + id + `,"message":{"message_id":` + id + `,"date":1700000000,"chat":{"id":-80},"text":"poison"}}`
+		if w := send(public, "/webhook/telegram/wh_d", update, map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}); w.Code != http.StatusOK {
+			t.Fatalf("webhook %s = %d", id, w.Code)
+		}
+	}
+	defer runMaintenance(t, store)()
+
+	op := 0
+	claimNext := func() claimBody {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			op++
+			w := send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-0000000003`+fmt.Sprintf("%02d", op)+`","wait_ms":0}`, auth)
+			if w.Code == http.StatusOK {
+				var b claimBody
+				if err := json.Unmarshal(w.Body.Bytes(), &b); err != nil {
+					t.Fatal(err)
+				}
+				return b
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("nothing claimable; last claim = %d", w.Code)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	var first string
+	var final *httptest.ResponseRecorder
+	var token string
+	for attempt := int64(1); attempt <= 4; attempt++ {
+		c := claimNext()
+		var msg model.CanonicalMessage
+		if err := json.Unmarshal(c.Message, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if first == "" {
+			first = msg.MessageID
+		}
+		if msg.MessageID != first || c.Delivery.Attempt != attempt {
+			t.Fatalf("claim %d = message %s attempt %d, want %s attempt %d", attempt, msg.MessageID, c.Delivery.Attempt, first, attempt)
+		}
+		token = `{"delivery_token":"` + c.Delivery.DeliveryToken + `"}`
+		final = send(public, "/v1/deliveries/nack", token, auth)
+		if final.Code != http.StatusOK {
+			t.Fatalf("nack %d = %d %s", attempt, final.Code, final.Body.String())
+		}
+	}
+	var dead struct {
+		Status         string `json:"status"`
+		MessageID      string `json:"message_id"`
+		DeliveryCycle  int64  `json:"delivery_cycle"`
+		DeadLetteredMs int64  `json:"dead_lettered_ms"`
+	}
+	if err := json.Unmarshal(final.Body.Bytes(), &dead); err != nil || dead.Status != "dead_lettered" || dead.MessageID != first ||
+		dead.DeliveryCycle != 1 || dead.DeadLetteredMs <= 0 {
+		t.Fatalf("fourth nack = %s", final.Body.String())
+	}
+	if w := send(public, "/v1/deliveries/nack", token, auth); w.Code != http.StatusOK || w.Body.String() != final.Body.String() {
+		t.Errorf("repeat = %d %s, want the recorded dead_lettered result", w.Code, w.Body.String())
+	}
+
+	next := claimNext()
+	var msg model.CanonicalMessage
+	if err := json.Unmarshal(next.Message, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.MessageID == first || msg.SourceEventID != "11" || next.Delivery.Attempt != 1 || next.Delivery.DeliveryCycle != 1 {
+		t.Errorf("next claim = %+v %s, want update 11 attempt 1", next.Delivery, msg.SourceEventID)
+	}
+}

@@ -115,8 +115,9 @@ func (s *DeliveryStore) Stats(ctx context.Context) (delivery.Stats, error) {
 		c.B().Zcard().Key("hr1:blocked").Build(),
 		c.B().Get().Key("hr1:stats:queued_messages").Build(),
 		c.B().Zcard().Key("hr1:retries").Build(),
+		c.B().Zcard().Key("hr1:dlq").Build(),
 	)
-	targets := []*int64{&st.ActiveLeases, &st.ReadyRecipients, &st.BlockedRecipients, &st.QueuedMessages, &st.RetriesWaiting}
+	targets := []*int64{&st.ActiveLeases, &st.ReadyRecipients, &st.BlockedRecipients, &st.QueuedMessages, &st.RetriesWaiting, &st.DeadLetterMessages}
 	for i, r := range cmds {
 		v, err := r.AsInt64()
 		if err != nil && !isNil(err) {
@@ -173,13 +174,13 @@ func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delive
 	}
 }
 
-// Nack runs nack_v1.
+// Nack runs nack_v2.
 func (s *DeliveryStore) Nack(ctx context.Context, req delivery.NackRequest) delivery.NackResult {
 	delays := make([]string, len(req.RetryDelaysMs))
 	for i, d := range req.RetryDelaysMs {
 		delays[i] = itoa64(d)
 	}
-	res, err := s.a.RunScript(ctx, "nack_v1",
+	res, err := s.a.RunScript(ctx, "nack_v2",
 		[]string{"hr1:t:" + req.TokenDigest, "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"},
 		[]string{req.Token, req.TokenDigest, req.ReasonCode, strings.Join(delays, ","), itoa64(int64(req.MaxAttempts)), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {
@@ -206,12 +207,24 @@ func (s *DeliveryStore) Nack(ctx context.Context, req delivery.NackRequest) deli
 	switch res.Status {
 	case "retry_scheduled":
 		out = delivery.NackResult{
-			Outcome: delivery.NackRetryScheduled, Result: "retry_scheduled",
+			Outcome: delivery.NackRetryScheduled, Result: delivery.NackResultRetryScheduled,
 			MessageID: str(0), Attempt: num(1), RetryAtMs: num(2), RecipientIdentity: str(3),
 			DeliveryCycle: num(4), ClaimedMs: num(5), CompletedMs: num(6),
 		}
+	case "dead_lettered":
+		out = delivery.NackResult{
+			Outcome: delivery.NackDeadLettered, Result: delivery.NackResultDeadLettered,
+			// The dead-letter time is also when the attempt completed.
+			MessageID: str(0), DeliveryCycle: num(1), DeadLetteredMs: num(2), RecipientIdentity: str(3),
+			Attempt: num(4), ClaimedMs: num(5), CompletedMs: num(2),
+		}
 	case "already_nacked":
-		out = delivery.NackResult{Outcome: delivery.NackAlreadyNacked, Result: str(0), MessageID: str(1), Attempt: num(2), RetryAtMs: num(3)}
+		out = delivery.NackResult{Outcome: delivery.NackAlreadyNacked, Result: str(0), MessageID: str(1)}
+		if out.Result == delivery.NackResultDeadLettered {
+			out.DeliveryCycle, out.DeadLetteredMs = num(2), num(3)
+		} else {
+			out.Attempt, out.RetryAtMs = num(2), num(3)
+		}
 	case "wrong_type":
 		return delivery.NackResult{Outcome: delivery.NackInternalFailure}
 	default:

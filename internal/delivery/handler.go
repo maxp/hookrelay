@@ -429,6 +429,7 @@ func (h *Handler) RefreshGauges(ctx context.Context) {
 	h.metrics.blockedRecipients.Set(float64(s.BlockedRecipients))
 	h.metrics.queueMessages.Set(float64(s.QueuedMessages))
 	h.metrics.retriesWaiting.Set(float64(s.RetriesWaiting))
+	h.metrics.deadLetterMessages.Set(float64(s.DeadLetterMessages))
 }
 
 type ackRequest struct {
@@ -526,6 +527,13 @@ type nackRequest struct {
 	ReasonCode    *string `json:"reason_code"`
 }
 
+type deadLetteredResponse struct {
+	Status         string `json:"status"`
+	MessageID      string `json:"message_id"`
+	DeliveryCycle  int64  `json:"delivery_cycle"`
+	DeadLetteredMs int64  `json:"dead_lettered_ms"`
+}
+
 type nackResponse struct {
 	Status    string `json:"status"`
 	MessageID string `json:"message_id"`
@@ -560,11 +568,24 @@ func (h *Handler) handleNack(w http.ResponseWriter, r *http.Request, c call) {
 	})
 
 	switch res.Outcome {
-	case NackRetryScheduled, NackAlreadyNacked:
-		if res.Outcome == NackRetryScheduled {
-			h.logNacked(c, res, reason)
+	case NackRetryScheduled:
+		h.logNacked(c, res, reason)
+		writeNackResult(w, res)
+	case NackDeadLettered:
+		extra := []any{"request_id", c.requestID}
+		if reason != "" {
+			extra = append(extra, "reason_code", reason)
 		}
-		writeJSON(w, http.StatusOK, nackResponse{Status: res.Result, MessageID: res.MessageID, Attempt: res.Attempt, RetryAtMs: res.RetryAtMs})
+		if c.instanceID != "" {
+			extra = append(extra, "consumer_instance_id", c.instanceID)
+		}
+		recordDeadLetter(h.log, h.d.Attempts, deadLetter{
+			RecipientIdentity: res.RecipientIdentity, MessageID: res.MessageID, Reason: reasonNackExhausted,
+			DeliveryCycle: res.DeliveryCycle, Attempt: res.Attempt, ClaimedMs: res.ClaimedMs, DeadLetteredMs: res.DeadLetteredMs,
+		}, extra...)
+		writeNackResult(w, res)
+	case NackAlreadyNacked:
+		writeNackResult(w, res)
 	case NackAlreadyAcknowledged:
 		writeError(w, http.StatusConflict, "delivery_already_acknowledged", "the delivery attempt was acknowledged", c.requestID)
 	case NackNotFound:
@@ -573,7 +594,7 @@ func (h *Handler) handleNack(w http.ResponseWriter, r *http.Request, c call) {
 		writeError(w, http.StatusConflict, "stale_delivery_token", "the delivery attempt is no longer active", c.requestID)
 	case NackRecipientBlocked:
 		writeError(w, http.StatusConflict, "recipient_blocked", "the recipient is blocked pending operator recovery", c.requestID)
-	case NackAttemptsExhausted, NackInternalFailure:
+	case NackInternalFailure:
 		observability.LogEvent(h.log, slog.LevelError, "delivery_nack_failed", "negative acknowledgement hit unexpected stored state",
 			"request_id", c.requestID, "error_code", "internal_error", "outcome", string(res.Outcome))
 		writeError(w, http.StatusInternalServerError, "internal_error", "unexpected internal error", c.requestID)
@@ -583,6 +604,15 @@ func (h *Handler) handleNack(w http.ResponseWriter, r *http.Request, c call) {
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "dependency unavailable; repeat the negative acknowledgement", c.requestID)
 	}
+}
+
+// writeNackResult writes the (recorded) nack result body of its kind.
+func writeNackResult(w http.ResponseWriter, res NackResult) {
+	if res.Result == NackResultDeadLettered {
+		writeJSON(w, http.StatusOK, deadLetteredResponse{Status: res.Result, MessageID: res.MessageID, DeliveryCycle: res.DeliveryCycle, DeadLetteredMs: res.DeadLetteredMs})
+		return
+	}
+	writeJSON(w, http.StatusOK, nackResponse{Status: res.Result, MessageID: res.MessageID, Attempt: res.Attempt, RetryAtMs: res.RetryAtMs})
 }
 
 // logNacked records the feature event and the failed attempt.

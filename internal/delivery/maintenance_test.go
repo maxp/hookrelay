@@ -80,7 +80,11 @@ func (f *fakeExpirer) ExpireLease(_ context.Context, rid string, delaysMs []int6
 		}
 	}
 	if f.outcome != nil {
-		return ExpiryResult{Outcome: f.outcome(rid)}
+		o := f.outcome(rid)
+		if o == ExpiryDeadLettered {
+			return ExpiryResult{Outcome: o, MessageID: "m-" + rid, DeliveryCycle: 1, DeadLetteredMs: 3_000, ExpiredMs: 3_000, Attempt: 4, ClaimedMs: 1_000}
+		}
+		return ExpiryResult{Outcome: o}
 	}
 	return ExpiryResult{Outcome: ExpiryRetryScheduled, MessageID: "m-" + rid, Attempt: 1, RetryAtMs: 20_000, DeliveryCycle: 1, ClaimedMs: 1_000, ExpiredMs: 3_000, ConsumerInstanceID: "worker-3"}
 }
@@ -352,29 +356,40 @@ func TestMaintenanceExpiresDueLeasesInTheirOwnBatches(t *testing.T) {
 	}
 }
 
-// TestMaintenanceExpiryOutcomes pins the lease result labels: a lease on
-// the last attempt is deferred (one warning per batch) until the
-// dead-letter transition exists.
+// TestMaintenanceExpiryOutcomes pins the lease result labels and the
+// dead-lettering expiry: it counts as applied, emits
+// delivery_dead_lettered (reason expiry_exhausted), and counts the final
+// attempt as outcome=dead_lettered.
 func TestMaintenanceExpiryOutcomes(t *testing.T) {
 	outcomes := map[string]ExpiryOutcome{
 		"telegram:42:chat:0": ExpiryNotDue,
 		"telegram:42:chat:1": ExpiryRecipientBlocked,
-		"telegram:42:chat:2": ExpiryAttemptsExhausted,
-		"telegram:42:chat:3": ExpiryAttemptsExhausted,
+		"telegram:42:chat:2": ExpiryDeadLettered,
+		"telegram:42:chat:3": ExpiryDeadLettered,
 		"telegram:42:chat:4": ExpiryInternalFailure,
 	}
 	expirer := &fakeExpirer{nowMs: 10_000, pending: dueEntries(5, 9_000), outcome: func(rid string) ExpiryOutcome { return outcomes[rid] }}
 	mh := newExpiryHarness(t, &fakeActivator{}, expirer, nil)
 	mh.m.RunRound(context.Background())
-	for result, want := range map[string]float64{"stale": 1, "blocked": 1, "deferred": 2, "failed": 1} {
+	for result, want := range map[string]float64{"applied": 2, "stale": 1, "blocked": 1, "failed": 1} {
 		if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": "lease_expiry", "result": result}); got != want {
 			t.Errorf("processed{%s} = %v, want %v", result, got, want)
 		}
 	}
-	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"maintenance_transition_deferred"`)); n != 1 {
-		t.Errorf("deferred warnings = %d, want one per batch:\n%s", n, mh.logs.String())
+	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"delivery_dead_lettered"`)); n != 2 {
+		t.Errorf("delivery_dead_lettered events = %d:\n%s", n, mh.logs.String())
+	}
+	if !bytes.Contains(mh.logs.Bytes(), []byte(`"dead_letter_reason":"expiry_exhausted"`)) || !bytes.Contains(mh.logs.Bytes(), []byte(`"dead_lettered_ms":3000`)) ||
+		!bytes.Contains(mh.logs.Bytes(), []byte(`"duration_ms":2000`)) {
+		t.Errorf("dead-letter event fields:\n%s", mh.logs.String())
 	}
 	if bytes.Contains(mh.logs.Bytes(), []byte(`"event":"delivery_lease_expired"`)) {
-		t.Error("lease_expired event for a lease that did not expire")
+		t.Error("lease_expired event for a dead-lettered lease")
+	}
+	if got := mh.value(t, "hookrelay_delivery_attempts_total", map[string]string{"recipient_scope": "chat", "outcome": "dead_lettered"}); got != 2 {
+		t.Errorf("attempts{dead_lettered} = %v", got)
+	}
+	if got := mh.value(t, "hookrelay_dead_letters_total", map[string]string{"recipient_scope": "chat", "reason": "expiry_exhausted"}); got != 2 {
+		t.Errorf("dead_letters_total{expiry_exhausted} = %v", got)
 	}
 }

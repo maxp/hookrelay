@@ -141,7 +141,6 @@ func TestNackOutcomesAndValidation(t *testing.T) {
 		NackNotFound:              {404, "delivery_token_not_found"},
 		NackStale:                 {409, "stale_delivery_token"},
 		NackRecipientBlocked:      {409, "recipient_blocked"},
-		NackAttemptsExhausted:     {500, "internal_error"},
 		NackInternalFailure:       {500, "internal_error"},
 		NackDependencyUnavailable: {503, "dependency_unavailable"},
 	} {
@@ -206,9 +205,59 @@ func TestAckAfterNackAndAttemptDuration(t *testing.T) {
 // TestRetriesWaitingGauge pins the retries_waiting gauge refresh.
 func TestRetriesWaitingGauge(t *testing.T) {
 	hs := newHarness(t)
-	hs.h.d.Stats = fakeStats{Stats{RetriesWaiting: 3}}
+	hs.h.d.Stats = fakeStats{Stats{RetriesWaiting: 3, DeadLetterMessages: 5}}
 	hs.h.RefreshGauges(context.Background())
 	if m := metric(t, hs, "hookrelay_retries_waiting", nil); m == nil || m.GetGauge().GetValue() != 3 {
 		t.Errorf("retries_waiting = %v", m)
+	}
+	if m := metric(t, hs, "hookrelay_dead_letter_messages", nil); m == nil || m.GetGauge().GetValue() != 5 {
+		t.Errorf("dead_letter_messages = %v", m)
+	}
+}
+
+// TestNackDeadLetteredContract pins the dead_lettered body (identical for a
+// repeat), the delivery_dead_lettered event, and the dead-letter metrics:
+// the final attempt counts as outcome=dead_lettered, not nack.
+func TestNackDeadLetteredContract(t *testing.T) {
+	hs := newHarness(t)
+	hs.nacker.result = NackResult{
+		Outcome: NackDeadLettered, Result: "dead_lettered", MessageID: "m1", DeliveryCycle: 1, DeadLetteredMs: 9000,
+		RecipientIdentity: "telegram:42:chat:-1", Attempt: 4, ClaimedMs: 1000, CompletedMs: 9000,
+	}
+	w := hs.nack(`{"delivery_token":"` + validToken + `","reason_code":"final"}`)
+	want := `{"status":"dead_lettered","message_id":"m1","delivery_cycle":1,"dead_lettered_ms":9000}` + "\n"
+	if w.Code != 200 || w.Body.String() != want {
+		t.Fatalf("nack = %d %s", w.Code, w.Body.String())
+	}
+	hs.nacker.result = NackResult{Outcome: NackAlreadyNacked, Result: "dead_lettered", MessageID: "m1", DeliveryCycle: 1, DeadLetteredMs: 9000}
+	if w := hs.nack(`{"delivery_token":"` + validToken + `"}`); w.Code != 200 || w.Body.String() != want {
+		t.Errorf("repeat = %d %s", w.Code, w.Body.String())
+	}
+
+	var event map[string]any
+	if err := json.Unmarshal(hs.logs.Bytes(), &event); err != nil {
+		t.Fatalf("expected exactly one event: %v\n%s", err, hs.logs.String())
+	}
+	for k, v := range map[string]any{
+		"event": "delivery_dead_lettered", "message_id": "m1", "recipient_scope": "chat", "chat_id": "-1", "delivery_cycle": 1.0,
+		"attempt": 4.0, "dead_lettered_ms": 9000.0, "dead_letter_reason": "nack_exhausted", "reason_code": "final", "consumer_instance_id": "worker-7",
+		"duration_ms": 8000.0,
+	} {
+		if event[k] != v {
+			t.Errorf("event %s = %v, want %v", k, event[k], v)
+		}
+	}
+	labels := map[string]string{"recipient_scope": "chat", "outcome": "dead_lettered"}
+	if m := metric(t, hs, "hookrelay_delivery_attempts_total", labels); m == nil || m.GetCounter().GetValue() != 1 {
+		t.Errorf("attempts{dead_lettered} = %v", m)
+	}
+	if m := metric(t, hs, "hookrelay_delivery_attempt_duration_seconds", labels); m == nil || m.GetHistogram().GetSampleSum() != 8 {
+		t.Errorf("attempt duration{dead_lettered} = %v, want one 8 s sample", m)
+	}
+	if m := metric(t, hs, "hookrelay_delivery_attempts_total", map[string]string{"outcome": "nack"}); m != nil {
+		t.Error("the dead-lettering attempt also counted as nack")
+	}
+	if m := metric(t, hs, "hookrelay_dead_letters_total", map[string]string{"recipient_scope": "chat", "reason": "nack_exhausted"}); m == nil || m.GetCounter().GetValue() != 1 {
+		t.Errorf("dead_letters_total{nack_exhausted} = %v", m)
 	}
 }

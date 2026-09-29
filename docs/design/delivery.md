@@ -99,7 +99,7 @@ maintenance_max_continuous_batches = 5
 
 Lease expiries and retry activations use separate batches of at most 100 entries. A full batch may trigger another immediate batch, but a process yields after at most five continuous batches so maintenance does not monopolize Valkey or application capacity.
 
-Maintenance metrics must expose applied, stale, and failed transitions, batch size and duration, and lag between Valkey time and the oldest due deadline. The `result` label of `hookrelay_maintenance_processed_total` is bounded to `applied`, `stale` (the index entry no longer matched state), `blocked` (the Recipient is blocked), `deferred` (a last-attempt lease waiting for the dead-letter transition, Milestone 2 only until that transition ships), and `failed`; `kind` is `lease_expiry`, `retry_activation`, and later `dlq_retention`.
+Maintenance metrics must expose applied, stale, and failed transitions, batch size and duration, and lag between Valkey time and the oldest due deadline. The `result` label of `hookrelay_maintenance_processed_total` is bounded to `applied`, `stale` (the index entry no longer matched state), `blocked` (the Recipient is blocked), and `failed`; `kind` is `lease_expiry`, `retry_activation`, and later `dlq_retention`.
 
 Before a claim enters long polling with an empty ready index, it performs one inline maintenance pass over at most 10 due lease or retry entries, rechecks the ready index, and only then waits. This is a bounded self-healing path, not a replacement for background maintenance.
 
