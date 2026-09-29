@@ -12,6 +12,7 @@
 # ports, so it never touches a developer's .secrets/ or running stack.
 # Usage: scripts/smoke.sh            (builds the image first)
 #        SMOKE_KEEP=1 scripts/smoke.sh (leave the stack up on failure)
+#        SMOKE_PUBLIC_PORT=… SMOKE_ADMIN_PORT=… scripts/smoke.sh (chosen ports)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -20,8 +21,8 @@ work="$(mktemp -d)"
 mkdir -m 0700 "$work/secrets"
 
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
-public_port="$(free_port)"
-admin_port="$(free_port)"
+public_port="${SMOKE_PUBLIC_PORT:-$(free_port)}"
+admin_port="${SMOKE_ADMIN_PORT:-$(free_port)}"
 
 step() { printf '\n==> %s\n' "$*"; }
 fail() {
