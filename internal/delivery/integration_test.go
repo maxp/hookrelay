@@ -3,6 +3,7 @@ package delivery_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,6 +31,14 @@ const (
 // composeApp builds the public listener with ingestion and the Consumer API
 // over the pinned Valkey (this package owns database 6).
 func composeApp(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Registry) {
+	t.Helper()
+	public, consumer, reg, _ := composeStack(t)
+	return public, consumer, reg
+}
+
+// composeStack is composeApp plus the delivery store for maintenance. The
+// retry policy uses 20 ms nominal delays so retries are due quickly.
+func composeStack(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Registry, *valkey.DeliveryStore) {
 	t.Helper()
 	raw := os.Getenv("HOOKRELAY_TEST_VALKEY_URL")
 	if raw == "" {
@@ -71,7 +80,7 @@ func composeApp(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Regi
 	store := valkey.NewDeliveryStore(a, valkey.ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: time.Minute})
 	consumer, err := delivery.NewHandler(delivery.HandlerDeps{
 		Claimer: store, Acknowledger: store, NegativeAcknowledger: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
-		RetryPolicy: delivery.RetryPolicy{MaxAttempts: 4, Delays: []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}, JitterMin: 0.5, JitterMax: 1},
+		RetryPolicy: delivery.RetryPolicy{MaxAttempts: 4, Delays: []time.Duration{20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, JitterMin: 0.5, JitterMax: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +90,7 @@ func composeApp(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Regi
 		Config: cfg, Logger: observability.NewTestLogger("error", &strings.Builder{}), Registry: reg,
 		Readiness: &app.Readiness{}, Webhooks: webhooks, ConsumerAPI: consumer,
 	})
-	return application.PublicHandler(), consumer, reg
+	return application.PublicHandler(), consumer, reg, store
 }
 
 func send(h http.Handler, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -315,5 +324,68 @@ func TestLongPollOverRealValkey(t *testing.T) {
 	webhook("33")
 	if w := send(public, "/v1/deliveries/claim", `{"operation_id":"`+op+`","wait_ms":10000}`, auth); w.Code != http.StatusOK {
 		t.Errorf("repeat after cancelled wait = %d", w.Code)
+	}
+}
+
+// TestNackRetryOverRealValkey drives webhook → claim → nack → background
+// maintenance → retried claim through the composed public listener: the
+// retry is claimed with attempt 2 and a new Delivery Token, and acking the
+// nacked token conflicts.
+func TestNackRetryOverRealValkey(t *testing.T) {
+	public, _, _, store := composeStack(t)
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	update := `{"update_id":8,"message":{"message_id":1,"date":1700000000,"chat":{"id":-78},"text":"retry"}}`
+	if w := send(public, "/webhook/telegram/wh_d", update, map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}); w.Code != http.StatusOK {
+		t.Fatalf("webhook = %d", w.Code)
+	}
+	w := send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-000000000021","wait_ms":0}`, auth)
+	var first claimBody
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &first) != nil {
+		t.Fatalf("claim = %d %s", w.Code, w.Body.String())
+	}
+	token := `{"delivery_token":"` + first.Delivery.DeliveryToken + `"}`
+	nack := send(public, "/v1/deliveries/nack", `{"delivery_token":"`+first.Delivery.DeliveryToken+`","reason_code":"test_failure"}`, auth)
+	var nacked struct {
+		Status    string `json:"status"`
+		Attempt   int64  `json:"attempt"`
+		RetryAtMs int64  `json:"retry_at_ms"`
+	}
+	if nack.Code != http.StatusOK || json.Unmarshal(nack.Body.Bytes(), &nacked) != nil || nacked.Status != "retry_scheduled" || nacked.Attempt != 1 {
+		t.Fatalf("nack = %d %s", nack.Code, nack.Body.String())
+	}
+	if w := send(public, "/v1/deliveries/ack", token, auth); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "delivery_already_nacked") {
+		t.Errorf("ack after nack = %d %s", w.Code, w.Body.String())
+	}
+
+	m, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
+		Retries: store,
+		Config:  delivery.MaintenanceConfig{Interval: 10 * time.Millisecond, IntervalJitter: 5 * time.Millisecond, BatchSize: 100, MaxContinuousBatches: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	var retried claimBody
+	deadline := time.Now().Add(3 * time.Second)
+	for i := 0; ; i++ {
+		w := send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-0000000001`+fmt.Sprintf("%02d", i%100)+`","wait_ms":0}`, auth)
+		if w.Code == http.StatusOK {
+			if err := json.Unmarshal(w.Body.Bytes(), &retried); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry never became claimable; last claim = %d", w.Code)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retried.Delivery.Attempt != 2 || retried.Delivery.DeliveryCycle != 1 || retried.Delivery.DeliveryToken == first.Delivery.DeliveryToken ||
+		retried.Delivery.ClaimedMs < nacked.RetryAtMs {
+		t.Errorf("retried delivery = %+v, want attempt 2 with a new token claimed after %d", retried.Delivery, nacked.RetryAtMs)
 	}
 }

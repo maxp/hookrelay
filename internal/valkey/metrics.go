@@ -17,6 +17,7 @@ var scriptOperations = map[string]string{
 	"claim_v2":               "claim",
 	"ack_v3":                 "acknowledgement",
 	"nack_v1":                "negative_acknowledgement",
+	"activate_retry_v1":      "retry_activation",
 	"reconcile_recipient_v1": "reconciliation",
 	"reconcile_dedup_v1":     "reconciliation",
 	"reconcile_counter_v1":   "reconciliation",

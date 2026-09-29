@@ -161,3 +161,42 @@ type NackResult struct {
 type NegativeAcknowledger interface {
 	Nack(ctx context.Context, req NackRequest) NackResult
 }
+
+// DueEntry is one due maintenance index member: the Recipient and the
+// deadline (retry_at_ms or lease_expires_ms) it is due at.
+type DueEntry struct {
+	RecipientIdentity string
+	DueMs             int64
+}
+
+// DueBatch is one bounded, oldest-first read of due entries. NowMs is the
+// authoritative Valkey time the entries were compared against.
+type DueBatch struct {
+	NowMs   int64
+	Entries []DueEntry
+}
+
+// ActivationOutcome is the bounded result of one retry activation.
+type ActivationOutcome string
+
+const (
+	ActivationActivated             ActivationOutcome = "activated"
+	ActivationNotDue                ActivationOutcome = "not_due"
+	ActivationRecipientBlocked      ActivationOutcome = "recipient_blocked"
+	ActivationDependencyUnavailable ActivationOutcome = "dependency_unavailable"
+	ActivationInternalFailure       ActivationOutcome = "internal_failure"
+)
+
+// ActivationResult carries the activated head and its next attempt.
+type ActivationResult struct {
+	Outcome   ActivationOutcome
+	MessageID string
+	Attempt   int64
+}
+
+// RetryActivator reads due retries and runs the atomic activation
+// transition, which re-validates authoritative state before mutating.
+type RetryActivator interface {
+	DueRetries(ctx context.Context, limit int) (DueBatch, error)
+	ActivateRetry(ctx context.Context, recipientIdentity string) ActivationResult
+}

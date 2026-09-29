@@ -67,6 +67,12 @@ func init() {
 		"attempts_exhausted":   0,
 		"wrong_type":           0,
 	})
+	register("activate_retry_v1", 1, map[string]int{
+		"activated":         2, // message_id, attempt
+		"not_due":           0,
+		"recipient_blocked": 0,
+		"wrong_type":        0,
+	})
 	register("reconcile_recipient_v1", 1, map[string]int{
 		// repairs, queue_length, reason
 		"consistent":      3,

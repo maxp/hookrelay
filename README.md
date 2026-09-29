@@ -74,7 +74,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/ingestion` — webhook pipeline and the Telegram adapter;
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v2`, `ack_v3`, `nack_v1`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v2`, `ack_v3`, `nack_v1`, `activate_retry_v1`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -200,7 +200,8 @@ transition contracts) and
 [`.scratch/milestone-2/spec.md`](.scratch/milestone-2/spec.md) (the v2
 amendments and failure-path scripts: `accept_v2` and `ack_v2`/`ack_v3`
 maintain the `hr1:mi:<message_id>` message metadata; `claim_v2` records
-`attempt_started_ms`; `nack_v1` schedules retries); see also
+`attempt_started_ms`; `nack_v1` schedules retries and `activate_retry_v1`
+activates them); see also
 [`docs/design/storage.md`](docs/design/storage.md).
 
 ## Consumer API
@@ -243,9 +244,19 @@ curl -X POST http://<public>/v1/deliveries/claim \
   `1s,5s,30s`, × jitter `HOOKRELAY_RETRY_JITTER_MIN`–`_MAX`, default
   0.5–1.0); the failed attempt is recorded in the message's attempt history.
   `409 delivery_already_acknowledged` after an acknowledgement; otherwise the
-  same `404`/`409`/`503` outcomes as `ack`. Retry activation and
-  dead-lettering of the fourth failure are later Milestone 2 tickets; until
-  then the fourth `nack` returns `500 internal_error` without changing state.
+  same `404`/`409`/`503` outcomes as `ack`. Background maintenance makes the
+  message claimable again once its retry is due; the next claim returns it
+  with a new Delivery Token and the next `attempt`. Dead-lettering of the
+  fourth failure is a later Milestone 2 ticket; until then the fourth `nack`
+  returns `500 internal_error` without changing state.
+- Background maintenance starts once the process is ready and runs every
+  `HOOKRELAY_MAINTENANCE_INTERVAL` (1 s) plus up to
+  `HOOKRELAY_MAINTENANCE_INTERVAL_JITTER` (250 ms), activating due retries in
+  batches of `HOOKRELAY_MAINTENANCE_BATCH_SIZE` (100), at most
+  `HOOKRELAY_MAINTENANCE_MAX_CONTINUOUS_BATCHES` (5) per round. It is
+  cooperative (every transition re-validates stored state) and stops taking
+  batches at shutdown; a panic in the loop withdraws readiness and shuts the
+  process down with a non-zero exit.
 - A Recipient whose stored state is inconsistent is isolated behind a block
   marker during the claim scan and skipped; other Recipients continue.
 - `wait_ms` (0–30000, default 30000) long-polls: the claim rechecks
@@ -259,7 +270,11 @@ curl -X POST http://<public>/v1/deliveries/claim \
 - Metrics: `hookrelay_delivery_claims_total{outcome}`,
   `hookrelay_delivery_attempts_total{recipient_scope,outcome}`,
   `hookrelay_delivery_attempt_duration_seconds{recipient_scope,outcome}`,
-  `hookrelay_retries_waiting`, `hookrelay_active_leases`, `hookrelay_waiting_claims`,
+  `hookrelay_retries_waiting`,
+  `hookrelay_maintenance_processed_total{kind,result}`,
+  `hookrelay_maintenance_due_lag_seconds{kind}`,
+  `hookrelay_maintenance_batch_size{kind}`,
+  `hookrelay_maintenance_duration_seconds{kind}`, `hookrelay_active_leases`, `hookrelay_waiting_claims`,
   `hookrelay_queue_messages`, `hookrelay_ready_recipients`,
   `hookrelay_blocked_recipients`; feature event `delivery_claimed` (tokens
   are never logged), `delivery_acknowledged`, `delivery_nacked`.

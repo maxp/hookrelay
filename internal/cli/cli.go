@@ -224,6 +224,23 @@ func Serve(args []string) int {
 		return ExitError
 	}
 
+	maintenance, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
+		Retries: deliveryStore,
+		Clock:   gen.SystemClock{},
+		Config: delivery.MaintenanceConfig{
+			Interval:             cfg.MaintenanceInterval,
+			IntervalJitter:       cfg.MaintenanceIntervalJitter,
+			BatchSize:            cfg.MaintenanceBatchSize,
+			MaxContinuousBatches: cfg.MaintenanceMaxContinuousBatches,
+		},
+		Logger:     log,
+		Registerer: registry,
+	})
+	if err != nil {
+		log.Error("maintenance wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
+
 	gate := func(ctx context.Context) error {
 		_, err := adapter.ValidateReadiness(ctx, cfg.Production())
 		return err
@@ -255,6 +272,7 @@ func Serve(args []string) int {
 		Webhooks:    webhooks,
 		ConsumerAPI: consumerAPI,
 		Probes:      []func(context.Context){consumerAPI.RefreshGauges},
+		Maintenance: []func(context.Context){maintenance.Run},
 		BeforeDrain: []func(){consumerAPI.Shutdown},
 		Acceptance:  webhooks.AcceptingWebhooks,
 		Gate:        gate,

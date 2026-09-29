@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 
 	"github.com/maxp/hookrelay/internal/config"
 	"github.com/maxp/hookrelay/internal/ingestion"
+	"github.com/maxp/hookrelay/internal/observability"
 )
 
 // shutdownDeadline is the controlled shutdown deadline.
@@ -90,6 +93,13 @@ type Deps struct {
 	// Probes refresh state-derived gauges on every gate run while ready.
 	Probes []func(context.Context)
 
+	// Maintenance loops start once readiness is first acquired and run until
+	// their context ends; shutdown cancels them after readiness is
+	// withdrawn and the listeners drain, and waits for them. A panic in a loop is recovered at this
+	// seam: a redacted stack is logged, readiness is withdrawn, and Run
+	// shuts down with ErrMaintenancePanic.
+	Maintenance []func(context.Context)
+
 	// BeforeDrain runs after readiness and acceptance are withdrawn and
 	// before the listeners drain, e.g. to end outstanding long polls.
 	BeforeDrain []func()
@@ -127,6 +137,9 @@ type ConsistencyIssue struct {
 	Resolution string
 	Count      int
 }
+
+// ErrMaintenancePanic ends Run after a maintenance loop panicked.
+var ErrMaintenancePanic = errors.New("app: maintenance loop panicked")
 
 // reconcileTimeout bounds one reconciliation pass.
 const reconcileTimeout = 5 * time.Minute
@@ -233,6 +246,38 @@ func (a *App) PublicHandler() http.Handler { return a.publicServer.Handler }
 func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(context.Context) (net.Listener, error)) error {
 	log := a.deps.Logger
 	errAdmin := make(chan error, 1)
+	// A maintenance panic cancels the run as if the process were signalled.
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	maintCtx, stopMaintenance := context.WithCancel(context.Background())
+	defer stopMaintenance()
+	var maintenance sync.WaitGroup
+	var maintenanceOnce sync.Once
+	var panicked atomic.Bool
+	// readinessMu orders the panic seam against the readiness monitor: once
+	// a panic withdraws readiness, no gate run can restore it.
+	var readinessMu sync.Mutex
+	startMaintenance := func() {
+		for _, loop := range a.deps.Maintenance {
+			maintenance.Add(1)
+			go func() {
+				defer maintenance.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						readinessMu.Lock()
+						panicked.Store(true)
+						a.deps.Readiness.MarkNotReady()
+						a.deps.Readiness.SetAcceptingWebhooks(false)
+						readinessMu.Unlock()
+						log.Error("maintenance loop panicked; shutting down", "event", "maintenance_panic",
+							"error_code", "internal_error", "stack", observability.RedactedStack(debug.Stack()))
+						cancelRun()
+					}
+				}()
+				loop(maintCtx)
+			}()
+		}
+	}
 
 	log.Info("starting administrative listener", "event", "listener_started", "listener", "admin", "address", a.deps.Config.AdminAddress)
 	go func() { errAdmin <- a.adminServer.Serve(adminLn) }()
@@ -274,7 +319,7 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 	// only once the public listener is actually open. Gate is cheap enough
 	// for a fixed one-second cadence in the first version.
 	runGate := func() {
-		if a.deps.Gate == nil {
+		if a.deps.Gate == nil || panicked.Load() {
 			return
 		}
 		gateCtx, cancel := context.WithTimeout(ctx, gateTimeout)
@@ -295,7 +340,12 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 			probe(gateCtx)
 		}
 		if a.deps.Readiness.Ready() {
-			a.deps.Readiness.SetAcceptingWebhooks(a.accepting(gateCtx))
+			accepting := a.accepting(gateCtx)
+			readinessMu.Lock()
+			if !panicked.Load() && a.deps.Readiness.Ready() {
+				a.deps.Readiness.SetAcceptingWebhooks(accepting)
+			}
+			readinessMu.Unlock()
 			return
 		}
 		if !a.reconcile(ctx, !everServed.Load()) {
@@ -304,11 +354,19 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 		if !openPublicListener() {
 			return
 		}
+		accepting := a.accepting(gateCtx)
+		readinessMu.Lock()
+		if panicked.Load() || ctx.Err() != nil {
+			readinessMu.Unlock()
+			return
+		}
 		everServed.Store(true)
 		log.Info("readiness acquired", "event", "readiness_acquired")
 		// Acceptance is set first so readiness is never observed without it.
-		a.deps.Readiness.SetAcceptingWebhooks(a.accepting(gateCtx))
+		a.deps.Readiness.SetAcceptingWebhooks(accepting)
 		a.deps.Readiness.MarkReady()
+		readinessMu.Unlock()
+		maintenanceOnce.Do(startMaintenance)
 	}
 	runGate()
 	monitor := time.NewTicker(readinessProbeInterval)
@@ -349,7 +407,20 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 		ln.Close()
 	}
 	<-errAdmin
+	// After the listeners drain, maintenance takes no new batches; a batch
+	// in progress completes (platform shutdown order).
+	stopMaintenance()
+	maintenanceDone := make(chan struct{})
+	go func() { maintenance.Wait(); close(maintenanceDone) }()
+	select {
+	case <-maintenanceDone:
+	case <-shutdownCtx.Done():
+		log.Warn("maintenance did not stop before the shutdown deadline", "event", "shutdown_deadline_exceeded")
+	}
 	log.Info("shutdown complete", "event", "shutdown_complete")
+	if panicked.Load() {
+		return errors.Join(ErrMaintenancePanic, firstErr)
+	}
 	return firstErr
 }
 
