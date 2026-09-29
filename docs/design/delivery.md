@@ -153,7 +153,7 @@ Operator replay:
 - returns the same Canonical Message before all not-yet-started messages for its Recipient;
 - does not interrupt an already leased head or a head waiting for retry, and in that case inserts the replayed message immediately after the current head;
 - preserves `message_id` and payload;
-- starts a new Delivery Cycle with attempt one;
+- starts a new Delivery Cycle with attempt one; a replay inserted behind an active or retrying head retains its new cycle while waiting, and a ready retry preempted by replay retains its existing attempt until it becomes head again;
 - issues a new Delivery Token;
 - preserves previous attempt history;
 - bypasses ingestion duplicate suppression;

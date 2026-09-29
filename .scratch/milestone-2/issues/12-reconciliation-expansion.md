@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] `reconcile_recipient_v2` (retry_wait valid; due lease/retry reported without mutation) and `reconcile_dlq_v1`
+- [ ] `reconcile_recipient_v2` (retry_wait valid; due lease/retry reported without mutation) and `reconcile_dlq_v1` (missing DLQ blob fails readiness, never a clearable Recipient block)
 - [ ] Go reconciler runs `expire_lease_v1` / `activate_retry_v1` for due entries; the M1 due-lease hold is removed
-- [ ] Consistency-issue kinds/resolutions extended and documented; tests for each repair and refusal
+- [ ] Consistency-issue kinds/resolutions extended and documented; tests for each repair and refusal, including missing DLQ blob with empty active queue (ticket 08 adds checks for pending replay state)

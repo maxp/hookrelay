@@ -1,0 +1,3 @@
+# Fail readiness when a dead-letter message has no Canonical Message
+
+Startup reconciliation holds readiness if a dead-letter entry has lost its Canonical Message, even when that Recipient's active queue is otherwise healthy. We do not use the normal Recipient block marker for this case: a block clear only verifies active queue invariants, so it could remove the marker while the dead-letter record is still corrupt. Preserving general availability would require a separately verifiable per-Recipient DLQ integrity contract and recovery operation; until those exist, a reviewed incident-specific repair followed by reconciliation is safer than a falsely clearable block.

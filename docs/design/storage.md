@@ -112,7 +112,7 @@ The required invariant is:
 state.head_message_id == LINDEX(queue, 0)
 ```
 
-Only the queue head has active delivery state. Every transition affecting the List, state, and derived indexes is atomic.
+Only the queue head has active delivery state. A replay may insert a previously dead-lettered message behind a leased or retry-wait head, or preempt a ready head whose attempt is already greater than one. The new `hr1:mi:<message_id>` metadata Hash holds `pending_delivery_cycle` and `pending_attempt` for any such non-head message until it becomes head; the head-advance transition restores and removes the pending pair. This preserves Delivery Cycle and Attempt across replay without making non-head messages active. A queued message with completed attempt history but no valid saved pair must not silently become cycle 1, attempt 1. Every transition affecting the List, state, and derived indexes is atomic.
 
 ## Delivery Attempt history
 
@@ -294,7 +294,7 @@ Moving a message to dead-letter is one atomic transition that records the final 
 
 Dead-letter replay removes the dead-letter record and index entry, starts a new Delivery Cycle, and returns the same `message_id` before every not-yet-started message for its Recipient. It never interrupts an already leased head or a head waiting for retry: in those cases the replayed message is inserted immediately after that current head. If there is no active or retrying head, it is inserted directly at the queue head. The transition checks the original `dedup_identity_digest`: a record that points to another message rejects the default replay, while an explicit `keep_current` resolution proceeds without changing that newer mapping. Replay never restores the older mapping. The transition preserves the queue/state head invariant and includes the required administrative audit append in the same Lua operation.
 
-The dead-letter Hash is authoritative. Startup reconciliation removes stale global index members and restores missing index members. If the Canonical Message is missing or another ambiguity prevents safe repair, hookrelay creates the Recipient block marker described below.
+The dead-letter Hash is authoritative. Startup reconciliation removes stale global index members and restores missing index members. If a dead-letter entry lacks its Canonical Message, startup reconciliation fails readiness rather than creating a Recipient block marker: the block-clear operation only verifies active queue state and cannot establish DLQ integrity. An operator must resolve the missing dead-letter data through a reviewed incident-specific procedure and rerun reconciliation. Ambiguity in an active Recipient queue still creates the Recipient block marker described below.
 
 Administrative permanent deletion removes the global index member, dead-letter Hash, Canonical Message, and attempt history and appends the required audit event in the same Lua operation, without copying the payload into audit.
 
@@ -409,6 +409,7 @@ hr1:d:<dedup_identity_digest>              dedup record
 hr1:dedup_age                              dedup age ZSET
 hr1:dlq                                    global DLQ ZSET
 hr1:dl:<message_id>                        dead-letter metadata
+hr1:mi:<message_id>                        dedup identity digest and pending replay head state
 hr1:q:<recipient_identity>                 ambiguous Recipient block marker
 hr1:blocked                                blocked Recipient index ZSET
 hr1:success:<message_id>                   compact success metadata
