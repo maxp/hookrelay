@@ -160,6 +160,7 @@ func Serve(args []string) int {
 
 	svc, err := administration.NewService(administration.ServiceDeps{
 		Repo:        valkey.NewEndpointStore(adapter),
+		Recipients:  valkey.NewRecipientStore(adapter, cfg.MaxQueuedMessagesPerRecipient),
 		Catalog:     typeCatalog{registry: webhookTypes},
 		Audit:       valkey.NewAuditSink(adapter),
 		AdminSecret: adminSecret,

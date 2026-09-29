@@ -68,9 +68,12 @@ type AuditSink interface {
 
 // ServiceDeps carries the administrative service collaborators.
 type ServiceDeps struct {
-	Repo    EndpointRepository
-	Catalog TypeCatalog
-	Audit   AuditSink
+	Repo EndpointRepository
+	// Recipients serves the Recipient-state and block routes; nil leaves
+	// them unregistered.
+	Recipients RecipientRepository
+	Catalog    TypeCatalog
+	Audit      AuditSink
 	// AdminSecret must already be resolved and validated by the
 	// configuration layer.
 	AdminSecret string
@@ -84,9 +87,10 @@ type ServiceDeps struct {
 
 // Service implements the administrative use cases.
 type Service struct {
-	repo    EndpointRepository
-	catalog TypeCatalog
-	audit   AuditSink
+	repo       EndpointRepository
+	recipients RecipientRepository
+	catalog    TypeCatalog
+	audit      AuditSink
 	// adminSecretDigest is the SHA-256 of the Admin Secret: comparing
 	// fixed-size digests keeps the check constant-time in the secret length.
 	adminSecretDigest [sha256.Size]byte
@@ -111,6 +115,7 @@ func NewService(d ServiceDeps) (*Service, error) {
 	}
 	return &Service{
 		repo:              d.Repo,
+		recipients:        d.Recipients,
 		catalog:           d.Catalog,
 		audit:             d.Audit,
 		adminSecretDigest: sha256.Sum256([]byte(d.AdminSecret)),

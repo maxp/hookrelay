@@ -10,6 +10,7 @@ import (
 const (
 	opWebhookEndpointCreated = "webhook_endpoint_created"
 	opAdminAuthRejected      = "admin_auth_rejected"
+	opRecipientBlockCleared  = "recipient_block_cleared"
 
 	outcomeSuccess = "success"
 	outcomeFailure = "failure"
@@ -41,6 +42,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 	// Pre-create the bounded series so they are exported at zero.
 	m.auditEvents.WithLabelValues(opWebhookEndpointCreated, outcomeSuccess)
 	m.auditEvents.WithLabelValues(opAdminAuthRejected, outcomeFailure)
+	m.auditEvents.WithLabelValues(opRecipientBlockCleared, outcomeSuccess)
 	m.auditWriteFailures.WithLabelValues(opAdminAuthRejected)
 	return m, nil
 }

@@ -79,3 +79,14 @@ type UnexpectedError struct{ Err error }
 func (e UnexpectedError) Error() string   { return fmt.Sprintf("internal error: %v", e.Err) }
 func (UnexpectedError) ErrorCode() string { return "internal_error" }
 func (UnexpectedError) HTTPStatus() int   { return http.StatusInternalServerError }
+
+// StatusError maps to the given status and bounded code.
+type StatusError struct {
+	Status int
+	Code   string
+	Msg    string
+}
+
+func (e StatusError) Error() string     { return e.Msg }
+func (e StatusError) ErrorCode() string { return e.Code }
+func (e StatusError) HTTPStatus() int   { return e.Status }

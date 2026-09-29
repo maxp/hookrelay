@@ -147,14 +147,11 @@ exported as `hookrelay_reconciliation_in_progress` and
 `hookrelay_consistency_issues_total{kind,resolution}`; each block, hold, and
 repair is logged, and repairs and blocks are audited best effort.
 
-Milestone 1 has no clear or repair operation yet. Diagnosis is read-only:
-
-- **Blocked Recipient:** find it with `ZRANGE hr1:blocked 0 -1 WITHSCORES`
-  and read `HGETALL hr1:q:<recipient>` (`detected_ms`, `reason_code`). Other
-  Recipients keep serving; the blocked one stays blocked until the audited
-  clear operation of the
-  [Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md)
-  ships with the Admin block routes. Do not delete the marker by hand.
+A blocked Recipient stays blocked until an operator follows the
+[Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md):
+`hookrelay admin recipients list --status blocked`, `inspect-block`, and the
+preconditioned, audited `clear-block`. Other Recipients keep serving. Do not
+delete the marker or edit indexes by hand.
 
 ## Webhook ingestion
 
@@ -330,6 +327,21 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   retrying.
 - `GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` — read the
   endpoint metadata with its `ETag`; a missing endpoint returns `404`.
+- `GET /admin/v1/recipient-states?status=ready|leased|retry_wait|blocked&limit&cursor`
+  — Recipients in one state as structured Recipient fields with the state's
+  time (`ready_sequence`, `lease_expires_ms`, `retry_at_ms`, or `detected_ms`
+  plus `reason_code`), ascending, 50 per page by default (1–200), with an
+  opaque `next_cursor` (`400 invalid_cursor` when malformed).
+- `POST /admin/v1/recipient-blocks/inspect` with `{"recipient": {...}}` —
+  read-only: marker, queue length, bounded head state (no token), head
+  message presence, index memberships, and violated invariants.
+- `POST /admin/v1/recipient-blocks/clear` with the Recipient,
+  `expected_detected_ms`, and `expected_reason_code` — `204` after the
+  invariants re-verify, removing the marker, restoring exactly the implied
+  index, and appending the audit event atomically; `428 precondition_required`
+  without the expected values, `412 precondition_failed` for a changed
+  marker, `404 recipient_block_not_found`, `409 recipient_state_ambiguous`
+  (with the violated invariant); a `503` may be an uncertain outcome.
 
 Every mutation commits the state change and the audit append as one atomic
 Lua operation, logs a feature event such as `webhook_endpoint_created`, and
@@ -346,6 +358,10 @@ Valkey directly.
 export HOOKRELAY_ADMIN_SECRET_FILE=.secrets/admin
 hookrelay admin webhook create --type telegram --bot-id 123456 --credential-file telegram-secret
 hookrelay admin webhook get --type telegram --identifier wh_...
+hookrelay admin recipients list --status blocked
+hookrelay admin recipients inspect-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100
+hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100 \
+  --expected-detected-ms <ms> --expected-reason-code <code> --yes
 ```
 
 - Admin URL: `--admin-url`, then `HOOKRELAY_ADMIN_URL`, then
@@ -368,7 +384,10 @@ is given. If the response is lost or the server fails (transport error or
 prints `{"outcome": "desired_state_observed" | "uncertain", ...}` with a
 warning. Observing the requested state does not confirm the create or its
 audit event; check the audit before any further mutation, and reuse the same
-`--identifier` if a retry is ever needed.
+`--identifier` if a retry is ever needed. `clear-block` follows the same
+discipline: after a lost response or `5xx` it never retries, inspects the
+Recipient once, and reports `desired_state_observed` (marker gone, audit not
+confirmed) or `uncertain`, always exiting `1`.
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
 

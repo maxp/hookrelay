@@ -261,7 +261,7 @@ DELETE /admin/v1/dead-letters/{message_id}
 GET    /admin/v1/audit?limit=<n>&cursor=<opaque>
 ```
 
-Safe `GET` routes return metadata only and never payloads, credentials, Delivery Tokens, or unredacted secret-bearing diagnostics. Recipient-state results use structured Recipient fields rather than exposing internal `hr1:` keys. The `blocked` filter pages over the derived `hr1:blocked` index ordered by detection time. List routes use the common default limit 50 and range 1–200 with stable opaque cursors.
+Recipient-state items carry `recipient`, `status`, and the index time under its own name (`ready_sequence`, `lease_expires_ms`, `retry_at_ms`, or `detected_ms` with the marker `reason_code`), ascending; the cursor is base64url JSON of the last score and member. Safe `GET` routes return metadata only and never payloads, credentials, Delivery Tokens, or unredacted secret-bearing diagnostics. Recipient-state results use structured Recipient fields rather than exposing internal `hr1:` keys. The `blocked` filter pages over the derived `hr1:blocked` index ordered by detection time. List routes use the common default limit 50 and range 1–200 with stable opaque cursors.
 
 The block inspection request contains one structured Recipient:
 
@@ -291,7 +291,7 @@ It returns the marker, bounded queue-head and state metadata, presence of the re
 }
 ```
 
-It succeeds with `204 No Content` only if those preconditions and all authoritative-state invariants match; it never repairs authoritative state. One Lua operation removes the marker, restores exactly the derived index implied by the verified state, and appends the mandatory audit event. See the [Recipient block recovery runbook](../runbooks/recipient-block-recovery.md).
+It succeeds with `204 No Content` only if those preconditions and all authoritative-state invariants match; it never repairs authoritative state. As for endpoint preconditions, missing `expected_*` values return `428 precondition_required` and a changed marker `412 precondition_failed`; a missing marker returns `404 recipient_block_not_found` and failed invariants `409 recipient_state_ambiguous` naming the first violated invariant. One Lua operation removes the marker, restores exactly the derived index implied by the verified state, and appends the mandatory audit event. See the [Recipient block recovery runbook](../runbooks/recipient-block-recovery.md).
 
 `GET /admin/v1/messages/{message_id}/delivery-state` returns only `message_id`, `delivery_cycle`, the bounded state `queued`, `leased`, `retry_wait`, `dead_lettered`, or `acknowledged`, and safe queue-position classification. It exists in Milestone 2 so a replay with a lost response can be reconciled without exposing payloads or Delivery Tokens.
 

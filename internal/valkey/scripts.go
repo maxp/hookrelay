@@ -70,6 +70,20 @@ func init() {
 		"recipient_blocked":    0,
 		"wrong_type":           0,
 	})
+	register("inspect_block_v1", 1, map[string]int{
+		// marker, detected_ms, reason_code, queue_length, head_message_id,
+		// status, delivery_cycle, attempt, lease_expires_ms, retry_at_ms,
+		// head_message_present, in_ready, in_leases, in_retries, in_blocked,
+		// invariants
+		"inspected": 16,
+	})
+	register("clear_block_v1", 1, map[string]int{
+		"cleared":             1, // restored index: ready | leases | retries | none
+		"not_found":           0,
+		"precondition_failed": 0,
+		"ambiguous":           1, // first violated invariant
+		"wrong_type":          0,
+	})
 	register("extend_v1", 1, map[string]int{
 		// message_id, lease_expires_ms, max_lease_expires_ms,
 		// recipient_identity, delivery_cycle, attempt

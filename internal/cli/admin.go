@@ -72,6 +72,12 @@ const adminUsage = `usage:
   hookrelay admin webhook create --type <webhook_type> --bot-id <bot_id> [--identifier <id>]
       [--credential-kind <kind>] [--credential-file <path>] [--disabled] [common flags]
   hookrelay admin webhook get --type <webhook_type> --identifier <id> [common flags]
+  hookrelay admin recipients list --status <ready|leased|retry_wait|blocked> [--limit <n>] [--cursor <c>] [common flags]
+  hookrelay admin recipients inspect-block <recipient> [common flags]
+  hookrelay admin recipients clear-block <recipient> --expected-detected-ms <ms>
+      --expected-reason-code <code> --yes [common flags]
+
+recipient: --bot-platform <p> --bot-id <id> --scope <chat|user|bot|relay> [--chat-id <id> | --user-id <id>]
 
 common flags:
   --admin-url <url>          Admin API base URL (HOOKRELAY_ADMIN_URL, default ` + defaultAdminURL + `)
@@ -83,6 +89,9 @@ The webhook credential comes from --credential-file or HOOKRELAY_WEBHOOK_CREDENT
 `
 
 func runAdmin(args []string, env adminIO) int {
+	if len(args) >= 1 && args[0] == "recipients" {
+		return runRecipients(args[1:], env)
+	}
 	if len(args) < 2 || args[0] != "webhook" {
 		fmt.Fprint(env.Stderr, adminUsage)
 		return ExitUsage
@@ -231,7 +240,12 @@ func (c *adminClient) do(method, path string, body any) (int, []byte, error) {
 		}
 		rd = bytes.NewReader(data)
 	}
+	rawQuery := ""
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path, rawQuery = path[:i], path[i+1:]
+	}
 	target := c.baseURL.JoinPath(path)
+	target.RawQuery = rawQuery
 	req, err := http.NewRequestWithContext(context.Background(), method, target.String(), rd)
 	if err != nil {
 		return 0, nil, err
