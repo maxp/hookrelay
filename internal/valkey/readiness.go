@@ -3,6 +3,8 @@ package valkey
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 )
 
@@ -84,8 +86,14 @@ func (a *Adapter) configGet(ctx context.Context, params ...string) (map[string]s
 // readiness.
 func (a *Adapter) checkStructures(ctx context.Context) error {
 	for key, allowed := range map[string][]string{
-		auditKey:       {"none", "stream"},
-		"hr1:webhooks": {"none", "zset"},
+		auditKey:                    {"none", "stream"},
+		"hr1:webhooks":              {"none", "zset"},
+		"hr1:ready":                 {"none", "zset"},
+		"hr1:leases":                {"none", "zset"},
+		"hr1:blocked":               {"none", "zset"},
+		"hr1:dedup_age":             {"none", "zset"},
+		"hr1:ready_seq":             {"none", "string"},
+		"hr1:stats:queued_messages": {"none", "string"},
 	} {
 		t, err := a.keyType(ctx, key)
 		if err != nil {
@@ -100,6 +108,16 @@ func (a *Adapter) checkStructures(ctx context.Context) error {
 		}
 		if !ok {
 			return fmt.Errorf("valkey: key %s has unexpected type %q", key, t)
+		}
+	}
+	seq, err := a.client.Do(ctx, a.client.B().Get().Key("hr1:ready_seq").Build()).ToString()
+	if err != nil && !isNil(err) {
+		return fmt.Errorf("valkey: ready sequence: %w", err)
+	}
+	if err == nil {
+		n, parseErr := strconv.ParseInt(seq, 10, 64)
+		if parseErr != nil || n < 0 || n == math.MaxInt64 || strconv.FormatInt(n, 10) != seq {
+			return fmt.Errorf("valkey: ready sequence has invalid or exhausted value")
 		}
 	}
 	return nil

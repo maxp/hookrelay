@@ -3,10 +3,12 @@ package valkey
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 
 	"github.com/maxp/hookrelay/internal/gen"
+	"github.com/maxp/hookrelay/internal/observability"
 )
 
 // ReconcileOptions control one reconciliation pass.
@@ -22,6 +24,8 @@ type ReconcileOptions struct {
 	BatchSize int
 	// Gen supplies audit event identifiers (gen.Crypto when nil).
 	Gen gen.Gen
+	// Logger receives best-effort stdout copies of reconciliation audit events.
+	Logger *slog.Logger
 }
 
 // ReconcileReport summarizes one pass with bounded finding kinds.
@@ -62,6 +66,11 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 		opts.Gen = gen.Crypto{}
 	}
 	rep := ReconcileReport{Findings: map[string]int{}, BlockReasons: map[string]int{}}
+	// Scan administrative records at startup and after loss of readiness, not
+	// on every one-second connectivity probe while the service is healthy.
+	if err := a.checkAdminRecords(ctx); err != nil {
+		return rep, fmt.Errorf("valkey: administrative structure: %w", err)
+	}
 
 	observedCounter := ""
 	if opts.Full {
@@ -83,7 +92,7 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 			return nil
 		}
 		seen[rid] = struct{}{}
-		n, err := a.reconcileRecipient(ctx, opts.Gen, rid, opts.MessageCheckBound, &rep)
+		n, err := a.reconcileRecipient(ctx, opts.Gen, opts.Logger, rid, opts.MessageCheckBound, &rep)
 		if err != nil {
 			return err
 		}
@@ -171,7 +180,7 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 			switch res.Status {
 			case "repaired":
 				rep.Findings["counter_repaired"]++
-				a.auditRepair(ctx, opts.Gen, "reconciliation_repair", "stats:queued_messages", "counter_repaired")
+				a.auditRepair(ctx, opts.Gen, opts.Logger, "reconciliation_repair", "stats:queued_messages", "counter_repaired")
 			case "precondition_failed", "wrong_type":
 				rep.Findings["counter_unverified"]++
 			}
@@ -182,7 +191,7 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 
 // reconcileRecipient runs reconcile_recipient_v1 and returns the counted
 // queue length (-1 when uncountable).
-func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, rid string, bound int, rep *ReconcileReport) (int64, error) {
+func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, log *slog.Logger, rid string, bound int, rep *ReconcileReport) (int64, error) {
 	res, err := a.RunScript(ctx, "reconcile_recipient_v1",
 		[]string{"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked"},
 		[]string{rid, strconv.Itoa(bound), "hr1"})
@@ -200,17 +209,17 @@ func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, rid string,
 	case "blocked":
 		rep.Findings["blocked"]++
 		rep.BlockReasons[reason]++
-		a.auditRepair(ctx, g, "recipient_blocked", rid, reason)
+		a.auditRepair(ctx, g, log, "recipient_blocked", rid, reason)
 	case "already_blocked":
 		rep.Findings["already_blocked"]++
 		if repairs > 0 {
 			rep.Findings["repaired"]++
-			a.auditRepair(ctx, g, "reconciliation_repair", rid, "blocked_index_aligned")
+			a.auditRepair(ctx, g, log, "reconciliation_repair", rid, "blocked_index_aligned")
 		}
 	default: // repaired, drained, due_lease, unhandled
 		rep.Findings[res.Status]++
 		if res.Status == "repaired" || res.Status == "drained" {
-			a.auditRepair(ctx, g, "reconciliation_repair", rid, res.Status)
+			a.auditRepair(ctx, g, log, "reconciliation_repair", rid, res.Status)
 		}
 	}
 	return length, nil
@@ -231,6 +240,9 @@ func (a *Adapter) reconcileDedup(ctx context.Context, digests []string, rep *Rec
 			return fmt.Errorf("valkey: reconcile dedup: result shape")
 		}
 		rep.Findings[kind] += int(n)
+		if kind == "dedup_skipped" {
+			rep.Findings["unhandled"] += int(n)
+		}
 	}
 	return nil
 }
@@ -262,8 +274,11 @@ func (a *Adapter) scanMembers(ctx context.Context, key string, count int, fn fun
 	if err != nil {
 		return err
 	}
+	if t == "none" {
+		return nil // a fresh deployment has no index yet
+	}
 	if t != "zset" {
-		return nil // absent; a wrong type is refused by the scripts
+		return fmt.Errorf("valkey: index %s has unexpected type %q", key, t)
 	}
 	cursor := uint64(0)
 	for {
@@ -287,14 +302,20 @@ func (a *Adapter) scanMembers(ctx context.Context, key string, count int, fn fun
 
 // auditRepair appends a best-effort audit event for a reconciliation
 // repair or block; failures never stop reconciliation.
-func (a *Adapter) auditRepair(ctx context.Context, g gen.Gen, operation, target, reason string) {
+func (a *Adapter) auditRepair(ctx context.Context, g gen.Gen, log *slog.Logger, operation, target, reason string) {
+	eventID := g.UUIDv7()
+	if log != nil {
+		observability.LogEvent(log, slog.LevelInfo, "administrative_audit", "administrative audit event",
+			"event_id", eventID, "actor", "reconciliation", "operation", operation,
+			"target", target, "outcome", "success", "reason_code", reason)
+	}
 	now, err := a.serverTimeMs(ctx)
 	if err != nil {
 		return
 	}
 	a.client.Do(ctx, a.client.B().Arbitrary(
 		"XADD", auditKey, "MAXLEN", "~", "1000000", "*",
-		"event_id", g.UUIDv7(),
+		"event_id", eventID,
 		"timestamp_ms", strconv.FormatInt(now, 10),
 		"actor", "reconciliation",
 		"operation", operation,

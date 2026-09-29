@@ -111,6 +111,21 @@ if state[1] ~= 'leased' or state[2] ~= ARGV[1] or state[3] ~= messageID or head 
   return {'stale'}
 end
 
+-- Validate fallible numeric operations before deleting the head. A corrupt
+-- counter or sequence cannot be allowed to leave an ack without its tombstone.
+local queued = redis.call('GET', counterKey)
+if not queued or not string.match(queued, '^[1-9]%d*$') or #queued > 19
+    or (#queued == 19 and queued > '9223372036854775807') then
+  return {'wrong_type'}
+end
+if redis.call('LINDEX', queueKey, 1) then
+  local seq = redis.call('GET', readySeqKey)
+  if seq and (not (seq == '0' or string.match(seq, '^[1-9]%d*$')) or #seq > 19
+      or (#seq == 19 and seq >= '9223372036854775807')) then
+    return {'wrong_type'}
+  end
+end
+
 -- Writes. Compact success metadata carries only safe fields.
 local recipientScope = string.match(rid, '^[^:]+:[^:]+:([a-z]+)')
 local botPlatform = string.match(rid, '^([^:]+):')
@@ -152,9 +167,7 @@ else
   redis.call('DEL', queueKey)
   redis.call('ZREM', readyKey, rid)
 end
-if tonumber(redis.call('GET', counterKey) or '0') > 0 then
-  redis.call('DECR', counterKey)
-end
+redis.call('DECR', counterKey)
 
 -- Terminal token phase: no plaintext token copies remain.
 redis.call('DEL', tokenKey)

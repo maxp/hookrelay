@@ -183,6 +183,38 @@ func TestAckRefusals(t *testing.T) {
 	}
 }
 
+// TestAckRejectsMalformedCountersBeforeWrites pins the destructive ack path:
+// corrupt derived counters cannot delete a blob or leave a token active.
+func TestAckRejectsMalformedCountersBeforeWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, value string
+		nextHead         bool
+	}{
+		{"nonnumeric ready sequence", "hr1:ready_seq", "invalid", true},
+		{"ready sequence overflow", "hr1:ready_seq", "9223372036854775807", true},
+		{"nonnumeric queued counter", "hr1:stats:queued_messages", "invalid", false},
+		{"zero queued counter", "hr1:stats:queued_messages", "0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, s := claimSetup(t)
+			ctx := context.Background()
+			enqueueJSON(t, a, "m1", ridA)
+			if tc.nextHead {
+				enqueueJSON(t, a, "m2", ridA)
+			}
+			if r := s.Claim(ctx, claimReq("op-1", "args", "dlv_token1")); r.Outcome != delivery.ClaimClaimed {
+				t.Fatalf("claim = %+v", r)
+			}
+			a.testDo(t, "SET", tc.key, tc.value)
+			before := snapshot(t, a)
+			if r := s.Ack(ctx, ackReq("dlv_token1")); r.Outcome != delivery.AckInternalFailure {
+				t.Fatalf("ack = %+v, want internal failure", r)
+			}
+			assertUnchanged(t, a, before, tc.name)
+		})
+	}
+}
+
 // TestAckArguments pins argument and key validation.
 func TestAckArguments(t *testing.T) {
 	a, _ := claimSetup(t)

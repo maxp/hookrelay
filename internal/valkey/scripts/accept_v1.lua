@@ -99,8 +99,18 @@ end
 if not has_type(dedupKey, 'hash') then
   return {'wrong_type'}
 end
-local existing = redis.call('HMGET', dedupKey, 'message_id', 'body_digest')
-if existing[1] then
+local function valid_ms(value)
+  return value and string.match(value, '^[1-9]%d*$') and #value <= 19
+    and (#value < 19 or value <= '9223372036854775807')
+end
+if redis.call('EXISTS', dedupKey) == 1 then
+  local existing = redis.call('HMGET', dedupKey, 'message_id', 'body_digest', 'accepted_ms', 'expires_ms')
+  if not existing[1] or existing[1] == '' or not existing[2] or existing[2] == ''
+      or not valid_ms(existing[3]) or not valid_ms(existing[4])
+      or not tonumber(existing[3]) or not tonumber(existing[4])
+      or tonumber(existing[4]) <= tonumber(existing[3]) then
+    return {'wrong_type'}
+  end
   if existing[2] == ARGV[3] then
     return {'duplicate', existing[1]}
   end
@@ -115,6 +125,13 @@ if not (has_type(dedupAge, 'zset') and has_type(blobKey, 'string') and has_type(
 end
 if type_of(blobKey) ~= 'none' then
   return redis.error_reply('ERR accept_v1: message_id already stored')
+end
+-- INCR accepts only signed 64-bit integers and cannot increment MAXINT.
+-- Check before the dedup record or queue can be written.
+local seq = redis.call('GET', readySeqKey)
+if seq and (not (seq == '0' or string.match(seq, '^[1-9]%d*$')) or #seq > 19
+    or (#seq == 19 and seq >= '9223372036854775807')) then
+  return {'wrong_type'}
 end
 
 -- 4. An empty queue must not have a head state: overwriting it could hide
@@ -157,8 +174,8 @@ if queueLen == 0 then
     'head_message_id', ARGV[1],
     'delivery_cycle', 1,
     'attempt', 1)
-  local seq = redis.call('INCR', readySeqKey)
-  redis.call('ZADD', readyKey, seq, rid)
+  local nextSeq = redis.call('INCR', readySeqKey)
+  redis.call('ZADD', readyKey, nextSeq, rid)
 end
 redis.call('INCR', counterKey)
 

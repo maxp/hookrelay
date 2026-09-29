@@ -52,6 +52,13 @@ local st = type_of(readySeqKey)
 if st ~= 'none' and st ~= 'string' then
   return {'unhandled', 0, 0, 'global_index_type'}
 end
+-- A repair may allocate a fairness sequence. Reject invalid or exhausted
+-- counters before any derived membership is changed.
+local seq = redis.call('GET', readySeqKey)
+if seq and (not (seq == '0' or string.match(seq, '^[1-9]%d*$')) or #seq > 19
+    or (#seq == 19 and seq >= '9223372036854775807')) then
+  return {'unhandled', 0, 0, 'global_index_value'}
+end
 
 local time = redis.call('TIME')
 local now_ms = time[1] * 1000 + math.floor(time[2] / 1000)

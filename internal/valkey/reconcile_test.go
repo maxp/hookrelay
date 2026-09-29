@@ -1,10 +1,14 @@
 package valkey
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/maxp/hookrelay/internal/observability"
 )
 
 func reconcile(t *testing.T, a *Adapter, full bool) ReconcileReport {
@@ -143,6 +147,36 @@ func TestReconcileRepairsDerivedStructures(t *testing.T) {
 	}
 }
 
+// TestReconcileAuditStdoutCopy ties the best-effort structured log to the
+// persisted repair audit identity without exposing payloads or tokens.
+func TestReconcileAuditStdoutCopy(t *testing.T) {
+	a, _ := claimSetup(t)
+	enqueueJSON(t, a, "m1", ridA)
+	a.testDo(t, "ZREM", "hr1:ready", ridA)
+	var logs bytes.Buffer
+	rep, err := a.Reconcile(context.Background(), ReconcileOptions{
+		BatchSize: 7, MessageCheckBound: 10, Logger: observability.NewTestLogger("info", &logs),
+	})
+	if err != nil || rep.Hold() != "" || rep.Findings["repaired"] != 1 {
+		t.Fatalf("reconciliation = %+v, %v", rep, err)
+	}
+	entries, err := a.AuditEntries(context.Background(), 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("audit stream = %+v, %v", entries, err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
+		t.Fatalf("stdout audit = %s: %v", logs.String(), err)
+	}
+	if event["event"] != "administrative_audit" || event["event_id"] != entries[0]["event_id"] ||
+		event["actor"] != "reconciliation" || event["outcome"] != "success" || event["timestamp_ms"] == nil {
+		t.Errorf("audit stdout does not match stream: %v, %+v", event, entries[0])
+	}
+	if bytes.Contains(logs.Bytes(), []byte("dlv_")) || bytes.Contains(logs.Bytes(), []byte(`"payload"`)) {
+		t.Error("secret or payload leaked to stdout audit")
+	}
+}
+
 // TestReconcileBlocksEachReason pins marker creation for every bounded
 // reason while other recipients stay serviceable.
 func TestReconcileBlocksEachReason(t *testing.T) {
@@ -217,6 +251,24 @@ func TestReconcileRefusals(t *testing.T) {
 	}
 }
 
+// TestReconcileRejectsInvalidSequenceBeforeRepair prevents an INCR failure
+// after derived-index changes during startup reconciliation.
+func TestReconcileRejectsInvalidSequenceBeforeRepair(t *testing.T) {
+	a, _ := claimSetup(t)
+	enqueueJSON(t, a, "m1", ridA)
+	a.testDo(t, "ZREM", "hr1:ready", ridA)
+	a.testDo(t, "SET", "hr1:ready_seq", "invalid")
+	before := snapshot(t, a)
+	rep := reconcile(t, a, false)
+	if rep.Hold() != "unhandled_inconsistency" {
+		t.Errorf("reconciliation did not hold on invalid sequence: %+v", rep)
+	}
+	assertUnchanged(t, a, before, "invalid sequence during repair")
+	if _, err := a.ValidateReadiness(context.Background(), false); err == nil {
+		t.Error("connectivity gate passed invalid sequence")
+	}
+}
+
 // TestReconcileDedup pins expired-record removal, index restoration from
 // accepted_ms, and orphan index members, across more than one batch.
 func TestReconcileDedup(t *testing.T) {
@@ -242,6 +294,37 @@ func TestReconcileDedup(t *testing.T) {
 	}
 	if _, ok := score(t, a, "hr1:dedup_age", "orphan"); ok {
 		t.Error("orphan member kept")
+	}
+}
+
+// TestReconcileHoldsOnMalformedDedupRecord ensures an incomplete live record
+// cannot pass readiness or turn a repeated update into a new message.
+func TestReconcileHoldsOnMalformedDedupRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, value string
+	}{
+		{"missing message_id", "message_id", ""},
+		{"missing body_digest", "body_digest", ""},
+		{"missing expires_ms", "expires_ms", ""},
+		{"fractional accepted_ms", "accepted_ms", "1.5"},
+		{"overflowed expires_ms", "expires_ms", "99999999999999999999"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := claimSetup(t)
+			a.testDo(t, "HSET", "hr1:d:d1", "message_id", "m1", "body_digest", "b1",
+				"accepted_ms", "1740000000000", "expires_ms", "4102444800000")
+			if tc.value == "" {
+				a.testDo(t, "HDEL", "hr1:d:d1", tc.field)
+			} else {
+				a.testDo(t, "HSET", "hr1:d:d1", tc.field, tc.value)
+			}
+			before := snapshot(t, a)
+			rep := reconcile(t, a, false)
+			if rep.Hold() != "unhandled_inconsistency" || rep.Findings["dedup_skipped"] != 1 {
+				t.Errorf("malformed dedup readiness = %+v", rep)
+			}
+			assertUnchanged(t, a, before, tc.name)
+		})
 	}
 }
 

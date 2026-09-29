@@ -249,6 +249,36 @@ func TestAcceptRefusalsCreateNothing(t *testing.T) {
 	}
 }
 
+// TestAcceptRejectsMalformedNumericAndDedupState prevents a failed INCR or
+// a missing dedup message_id from creating a second message or partial queue.
+func TestAcceptRejectsMalformedNumericAndDedupState(t *testing.T) {
+	cases := []struct {
+		name   string
+		poison func(*testing.T, *Adapter)
+	}{
+		{"nonnumeric ready sequence", func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:ready_seq", "invalid") }},
+		{"ready sequence overflow", func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:ready_seq", "9223372036854775807") }},
+		{"noncanonical ready sequence", func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:ready_seq", "00") }},
+		{"dedup record without message_id", func(t *testing.T, a *Adapter) {
+			a.testDo(t, "HSET", "hr1:d:d1", "body_digest", "b1", "accepted_ms", "1740000000000", "expires_ms", "4102444800000")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := testAdapter(t, false)
+			flushAll(t, a)
+			gate(t, a, false)
+			tc.poison(t, a)
+			before := snapshot(t, a)
+			res := NewMessageAcceptor(a, testLimits()).Accept(context.Background(), acceptReq("m1", "d1", "b1"))
+			if res.Outcome != ingestion.AcceptInternalFailure {
+				t.Fatalf("accept = %+v, want internal failure", res)
+			}
+			assertUnchanged(t, a, before, tc.name)
+		})
+	}
+}
+
 // TestAcceptScriptRejectsInvalidArguments pins argument and key-identity
 // validation before any read or write.
 func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {

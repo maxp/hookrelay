@@ -359,6 +359,7 @@ func TestParserRejectsUnknownStatus(t *testing.T) {
 // the locally computed digest of the embedded body.
 func TestScriptLoadVerifiesDigest(t *testing.T) {
 	a := testAdapter(t, false)
+	flushAll(t, a)
 	gate(t, a, false)
 	for name, s := range registry {
 		if got := a.shaByName[name]; got != s.LoadSHA {
