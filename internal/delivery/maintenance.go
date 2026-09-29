@@ -20,7 +20,21 @@ import (
 const maintenanceOpTimeout = 5 * time.Second
 
 // Maintenance kinds (the bounded kind label).
-const kindRetryActivation = "retry_activation"
+const (
+	kindLeaseExpiry     = "lease_expiry"
+	kindRetryActivation = "retry_activation"
+)
+
+// maintenanceResult is the bounded result label of one maintenance entry.
+type maintenanceResult string
+
+const (
+	resultApplied  maintenanceResult = "applied"
+	resultStale    maintenanceResult = "stale"
+	resultBlocked  maintenanceResult = "blocked"
+	resultDeferred maintenanceResult = "deferred"
+	resultFailed   maintenanceResult = "failed"
+)
 
 // MaintenanceConfig paces cooperative background maintenance.
 type MaintenanceConfig struct {
@@ -33,8 +47,14 @@ type MaintenanceConfig struct {
 // MaintenanceDeps carries the maintenance collaborators.
 type MaintenanceDeps struct {
 	Retries RetryActivator
-	Config  MaintenanceConfig
-	// Uniform draws the interval jitter in [0, 1) (rand.Float64 when nil).
+	Leases  LeaseExpirer
+	// RetryPolicy chooses the retry delay after an expired attempt.
+	RetryPolicy RetryPolicy
+	// Attempts counts expired attempts; share the Consumer API's instance.
+	Attempts *AttemptMetrics
+	Config   MaintenanceConfig
+	// Uniform draws the interval and retry-delay jitter in [0, 1)
+	// (rand.Float64 when nil).
 	Uniform func() float64
 	// Clock times batches (gen.SystemClock when nil); due checks use
 	// Valkey time.
@@ -62,8 +82,11 @@ type Maintenance struct {
 
 // NewMaintenance composes the maintenance loop.
 func NewMaintenance(d MaintenanceDeps) (*Maintenance, error) {
-	if d.Retries == nil {
-		return nil, errors.New("delivery: maintenance needs a RetryActivator")
+	if d.Retries == nil || d.Leases == nil || d.Attempts == nil {
+		return nil, errors.New("delivery: maintenance needs a RetryActivator, a LeaseExpirer, and AttemptMetrics")
+	}
+	if err := d.RetryPolicy.Validate(); err != nil {
+		return nil, err
 	}
 	if c := d.Config; c.Interval <= 0 || c.IntervalJitter < 0 || c.BatchSize <= 0 || c.MaxContinuousBatches <= 0 {
 		return nil, fmt.Errorf("delivery: invalid maintenance configuration %+v", c)
@@ -86,7 +109,7 @@ func NewMaintenance(d MaintenanceDeps) (*Maintenance, error) {
 		log: d.Logger,
 		processed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hookrelay_maintenance_processed_total",
-			Help: "Maintenance transitions by kind and bounded result (applied, stale, blocked, failed).",
+			Help: "Maintenance transitions by kind and bounded result (applied, stale, blocked, deferred, failed).",
 		}, []string{"kind", "result"}),
 		dueLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "hookrelay_maintenance_due_lag_seconds",
@@ -126,30 +149,39 @@ func (m *Maintenance) Run(ctx context.Context) {
 	}
 }
 
-// RunRound processes due retries in batches of at most BatchSize; a full
-// batch triggers another, up to MaxContinuousBatches, then the round
-// yields. A cancelled ctx stops new batches; the batch in progress
-// completes.
+// RunRound processes due leases, then due retries, each kind in its own
+// batches of at most BatchSize; a full batch triggers another, up to
+// MaxContinuousBatches, then the kind yields. A cancelled ctx stops new
+// batches; the batch in progress completes (its transitions are atomic).
 func (m *Maintenance) RunRound(ctx context.Context) {
+	m.runKind(ctx, kindLeaseExpiry, m.d.Leases.DueLeases, m.expireLease)
+	m.runKind(ctx, kindRetryActivation, m.d.Retries.DueRetries, m.activateRetry)
+}
+
+// runKind runs the continuous batches of one maintenance kind. process
+// applies one transition and returns its bounded result label.
+func (m *Maintenance) runKind(ctx context.Context, kind string, read func(context.Context, int) (DueBatch, error),
+	process func(context.Context, DueEntry) maintenanceResult) {
 	for i := 0; i < m.d.Config.MaxContinuousBatches && ctx.Err() == nil; i++ {
-		n, ok := m.retryBatch(context.WithoutCancel(ctx), i == 0)
+		n, ok := m.batch(context.WithoutCancel(ctx), kind, i == 0, read, process)
 		if !ok || n < m.d.Config.BatchSize {
 			return
 		}
 	}
 }
 
-// retryBatch activates one batch of due retries and reports how many were
-// read; ok is false when the read failed.
-func (m *Maintenance) retryBatch(ctx context.Context, first bool) (int, bool) {
+// batch processes one batch of due entries and reports how many were read;
+// ok is false when the read failed.
+func (m *Maintenance) batch(ctx context.Context, kind string, first bool, read func(context.Context, int) (DueBatch, error),
+	process func(context.Context, DueEntry) maintenanceResult) (int, bool) {
 	start := m.d.Clock.Now()
 	readCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
-	batch, err := m.d.Retries.DueRetries(readCtx, m.d.Config.BatchSize)
+	batch, err := read(readCtx, m.d.Config.BatchSize)
 	cancel()
 	if err != nil {
 		observability.LogEvent(m.log, slog.LevelWarn, "maintenance_read_failed", "maintenance could not read due entries",
-			"kind", kindRetryActivation, "error_code", "dependency_unavailable")
-		m.processed.WithLabelValues(kindRetryActivation, "failed").Inc()
+			"kind", kind, "error_code", "dependency_unavailable")
+		m.processed.WithLabelValues(kind, string(resultFailed)).Inc()
 		return 0, false
 	}
 	if first {
@@ -157,29 +189,75 @@ func (m *Maintenance) retryBatch(ctx context.Context, first bool) (int, bool) {
 		if len(batch.Entries) > 0 && batch.NowMs > batch.Entries[0].DueMs {
 			lag = float64(batch.NowMs-batch.Entries[0].DueMs) / 1000
 		}
-		m.dueLag.WithLabelValues(kindRetryActivation).Set(lag)
+		m.dueLag.WithLabelValues(kind).Set(lag)
 	}
+	deferred := 0
 	for _, e := range batch.Entries {
 		opCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
-		res := m.d.Retries.ActivateRetry(opCtx, e.RecipientIdentity)
+		result := process(opCtx, e)
 		cancel()
-		result := "failed"
-		switch res.Outcome {
-		case ActivationActivated:
-			result = "applied"
-		case ActivationNotDue:
-			result = "stale"
-		case ActivationRecipientBlocked:
-			result = "blocked"
-		default:
-			observability.LogEvent(m.log, slog.LevelError, "maintenance_transition_failed", "maintenance transition failed",
-				"kind", kindRetryActivation, "outcome", string(res.Outcome))
+		if result == resultDeferred {
+			deferred++
 		}
-		m.processed.WithLabelValues(kindRetryActivation, result).Inc()
+		m.processed.WithLabelValues(kind, string(result)).Inc()
 	}
-	m.batchSize.WithLabelValues(kindRetryActivation).Observe(float64(len(batch.Entries)))
-	m.duration.WithLabelValues(kindRetryActivation).Observe(m.d.Clock.Now().Sub(start).Seconds())
+	if deferred > 0 {
+		observability.LogEvent(m.log, slog.LevelWarn, "maintenance_transition_deferred",
+			"due entries on their last attempt wait for the dead-letter transition", "kind", kind, "count", deferred)
+	}
+	m.batchSize.WithLabelValues(kind).Observe(float64(len(batch.Entries)))
+	m.duration.WithLabelValues(kind).Observe(m.d.Clock.Now().Sub(start).Seconds())
 	return len(batch.Entries), true
+}
+
+// activateRetry applies one retry activation.
+func (m *Maintenance) activateRetry(ctx context.Context, e DueEntry) maintenanceResult {
+	res := m.d.Retries.ActivateRetry(ctx, e.RecipientIdentity)
+	switch res.Outcome {
+	case ActivationActivated:
+		return resultApplied
+	case ActivationNotDue:
+		return resultStale
+	case ActivationRecipientBlocked:
+		return resultBlocked
+	default:
+		m.transitionFailed(kindRetryActivation, string(res.Outcome))
+		return resultFailed
+	}
+}
+
+// expireLease applies one lease expiry with freshly drawn retry delays and
+// records the expired attempt.
+func (m *Maintenance) expireLease(ctx context.Context, e DueEntry) maintenanceResult {
+	res := m.d.Leases.ExpireLease(ctx, e.RecipientIdentity, m.d.RetryPolicy.DrawDelaysMs(m.d.Uniform), m.d.RetryPolicy.MaxAttempts)
+	switch res.Outcome {
+	case ExpiryRetryScheduled:
+		fields := []any{
+			"message_id", res.MessageID, "delivery_cycle", res.DeliveryCycle, "attempt", res.Attempt,
+			"retry_at_ms", res.RetryAtMs, "expired_ms", res.ExpiredMs, "duration_ms", res.ExpiredMs - res.ClaimedMs,
+		}
+		fields, scope := recipientEventFields(e.RecipientIdentity, fields)
+		if res.ConsumerInstanceID != "" {
+			fields = append(fields, "consumer_instance_id", res.ConsumerInstanceID)
+		}
+		m.d.Attempts.Observe(scope, "expired", res.ClaimedMs, res.ExpiredMs)
+		observability.LogEvent(m.log, slog.LevelInfo, "delivery_lease_expired", "lease expired; retry scheduled", fields...)
+		return resultApplied
+	case ExpiryNotDue:
+		return resultStale
+	case ExpiryRecipientBlocked:
+		return resultBlocked
+	case ExpiryAttemptsExhausted:
+		return resultDeferred
+	default:
+		m.transitionFailed(kindLeaseExpiry, string(res.Outcome))
+		return resultFailed
+	}
+}
+
+func (m *Maintenance) transitionFailed(kind, outcome string) {
+	observability.LogEvent(m.log, slog.LevelError, "maintenance_transition_failed", "maintenance transition failed",
+		"kind", kind, "outcome", outcome)
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

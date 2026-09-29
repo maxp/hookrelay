@@ -59,6 +59,8 @@ type HandlerDeps struct {
 	Acknowledger         Acknowledger
 	NegativeAcknowledger NegativeAcknowledger
 	Stats                StatsReader
+	// Attempts counts completed attempts; maintenance shares the instance.
+	Attempts *AttemptMetrics
 	// RetryPolicy chooses the retry delay after a failed attempt.
 	RetryPolicy RetryPolicy
 	// Uniform draws the retry jitter in [0, 1) (rand.Float64 when nil).
@@ -97,8 +99,8 @@ type Handler struct {
 
 // NewHandler composes the Consumer API.
 func NewHandler(d HandlerDeps) (*Handler, error) {
-	if d.Clock == nil || d.Gen == nil || d.Claimer == nil || d.Acknowledger == nil || d.NegativeAcknowledger == nil {
-		return nil, errors.New("delivery: Claimer, Acknowledger, NegativeAcknowledger, Gen, and Clock are required")
+	if d.Clock == nil || d.Gen == nil || d.Claimer == nil || d.Acknowledger == nil || d.NegativeAcknowledger == nil || d.Attempts == nil {
+		return nil, errors.New("delivery: Claimer, Acknowledger, NegativeAcknowledger, Attempts, Gen, and Clock are required")
 	}
 	if err := d.RetryPolicy.Validate(); err != nil {
 		return nil, err
@@ -488,13 +490,23 @@ func (h *Handler) logAcknowledged(c call, res AckResult) {
 		"duration_ms", h.d.Clock.Now().Sub(c.start).Milliseconds(),
 	}
 	fields, scope := h.recipientFields(c, res.RecipientIdentity, fields)
-	h.observeAttempt(scope, "acknowledged", res.ClaimedMs, res.AcknowledgedMs)
+	h.d.Attempts.Observe(scope, "acknowledged", res.ClaimedMs, res.AcknowledgedMs)
 	observability.LogEvent(h.log, slog.LevelInfo, "delivery_acknowledged", "delivery acknowledged", fields...)
 }
 
 // recipientFields appends the Recipient and consumer diagnostics to event
 // fields and returns the bounded recipient_scope label.
 func (h *Handler) recipientFields(c call, recipientIdentity string, fields []any) ([]any, string) {
+	fields, scope := recipientEventFields(recipientIdentity, fields)
+	if c.instanceID != "" {
+		fields = append(fields, "consumer_instance_id", c.instanceID)
+	}
+	return fields, scope
+}
+
+// recipientEventFields appends the Recipient's safe identifiers to event
+// fields and returns the bounded recipient_scope label.
+func recipientEventFields(recipientIdentity string, fields []any) ([]any, string) {
 	scope := "unknown"
 	if rcpt, err := model.ParseIdentity(recipientIdentity); err == nil {
 		scope = string(rcpt.Scope)
@@ -506,19 +518,7 @@ func (h *Handler) recipientFields(c call, recipientIdentity string, fields []any
 			fields = append(fields, "user_id", rcpt.UserID)
 		}
 	}
-	if c.instanceID != "" {
-		fields = append(fields, "consumer_instance_id", c.instanceID)
-	}
 	return fields, scope
-}
-
-// observeAttempt counts one completed attempt and its Valkey-time duration
-// from claim to completion.
-func (h *Handler) observeAttempt(scope, outcome string, claimedMs, completedMs int64) {
-	h.metrics.attempts.WithLabelValues(scope, outcome).Inc()
-	if claimedMs > 0 && completedMs >= claimedMs {
-		h.metrics.attemptDuration.WithLabelValues(scope, outcome).Observe(float64(completedMs-claimedMs) / 1000)
-	}
 }
 
 type nackRequest struct {
@@ -596,6 +596,6 @@ func (h *Handler) logNacked(c call, res NackResult, reason string) {
 		fields = append(fields, "reason_code", reason)
 	}
 	fields, scope := h.recipientFields(c, res.RecipientIdentity, fields)
-	h.observeAttempt(scope, "nack", res.ClaimedMs, res.CompletedMs)
+	h.d.Attempts.Observe(scope, "nack", res.ClaimedMs, res.CompletedMs)
 	observability.LogEvent(h.log, slog.LevelInfo, "delivery_nacked", "delivery negatively acknowledged; retry scheduled", fields...)
 }

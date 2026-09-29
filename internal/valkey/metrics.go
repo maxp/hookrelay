@@ -14,10 +14,11 @@ import (
 var scriptOperations = map[string]string{
 	"endpoint_create_v1":     "endpoint_create",
 	"accept_v2":              "accept",
-	"claim_v2":               "claim",
+	"claim_v3":               "claim",
 	"ack_v3":                 "acknowledgement",
 	"nack_v1":                "negative_acknowledgement",
 	"activate_retry_v1":      "retry_activation",
+	"expire_lease_v1":        "lease_expiry",
 	"reconcile_recipient_v1": "reconciliation",
 	"reconcile_dedup_v1":     "reconciliation",
 	"reconcile_counter_v1":   "reconciliation",

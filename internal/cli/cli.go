@@ -201,23 +201,30 @@ func Serve(args []string) int {
 		MaxActiveLeases:      cfg.MaxActiveLeases,
 		InitialLeaseDuration: cfg.InitialLeaseDuration,
 	})
+	attempts, err := delivery.NewAttemptMetrics(registry)
+	if err != nil {
+		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
+	retryPolicy := delivery.RetryPolicy{
+		MaxAttempts: cfg.MaxDeliveryAttempts,
+		Delays:      cfg.RetryDelays,
+		JitterMin:   cfg.RetryJitterMin,
+		JitterMax:   cfg.RetryJitterMax,
+	}
 	consumerAPI, err := delivery.NewHandler(delivery.HandlerDeps{
 		Claimer:              deliveryStore,
 		Acknowledger:         deliveryStore,
 		NegativeAcknowledger: deliveryStore,
 		Stats:                deliveryStore,
-		RetryPolicy: delivery.RetryPolicy{
-			MaxAttempts: cfg.MaxDeliveryAttempts,
-			Delays:      cfg.RetryDelays,
-			JitterMin:   cfg.RetryJitterMin,
-			JitterMax:   cfg.RetryJitterMax,
-		},
-		ConsumerSecret:   consumerSecret,
-		MaxWaitingClaims: cfg.MaxWaitingClaims,
-		Gen:              gen.Crypto{},
-		Clock:            gen.SystemClock{},
-		Logger:           log,
-		Registerer:       registry,
+		RetryPolicy:          retryPolicy,
+		Attempts:             attempts,
+		ConsumerSecret:       consumerSecret,
+		MaxWaitingClaims:     cfg.MaxWaitingClaims,
+		Gen:                  gen.Crypto{},
+		Clock:                gen.SystemClock{},
+		Logger:               log,
+		Registerer:           registry,
 	})
 	if err != nil {
 		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
@@ -225,8 +232,11 @@ func Serve(args []string) int {
 	}
 
 	maintenance, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
-		Retries: deliveryStore,
-		Clock:   gen.SystemClock{},
+		Retries:     deliveryStore,
+		Leases:      deliveryStore,
+		RetryPolicy: retryPolicy,
+		Attempts:    attempts,
+		Clock:       gen.SystemClock{},
 		Config: delivery.MaintenanceConfig{
 			Interval:             cfg.MaintenanceInterval,
 			IntervalJitter:       cfg.MaintenanceIntervalJitter,

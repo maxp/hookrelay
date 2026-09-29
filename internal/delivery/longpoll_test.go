@@ -69,6 +69,9 @@ func newPollHarness(t *testing.T, deps HandlerDeps, next func(int) ClaimResult) 
 	deps.ConsumerSecret, deps.Gen, deps.Clock = secret, fixedGen{}, fixedClock{}
 	deps.Logger, deps.Registerer = observability.NewTestLogger("debug", ph.logs), ph.reg
 	var err error
+	if deps.Attempts, err = NewAttemptMetrics(ph.reg); err != nil {
+		t.Fatal(err)
+	}
 	if ph.h, err = NewHandler(deps); err != nil {
 		t.Fatal(err)
 	}

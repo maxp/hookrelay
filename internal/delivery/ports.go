@@ -200,3 +200,38 @@ type RetryActivator interface {
 	DueRetries(ctx context.Context, limit int) (DueBatch, error)
 	ActivateRetry(ctx context.Context, recipientIdentity string) ActivationResult
 }
+
+// ExpiryOutcome is the bounded result of one lease expiry.
+type ExpiryOutcome string
+
+const (
+	ExpiryRetryScheduled   ExpiryOutcome = "retry_scheduled"
+	ExpiryNotDue           ExpiryOutcome = "not_due"
+	ExpiryRecipientBlocked ExpiryOutcome = "recipient_blocked"
+	// ExpiryAttemptsExhausted leaves the last attempt's lease in place
+	// until the dead-letter transition exists (Milestone 2 ticket 05).
+	ExpiryAttemptsExhausted     ExpiryOutcome = "attempts_exhausted"
+	ExpiryDependencyUnavailable ExpiryOutcome = "dependency_unavailable"
+	ExpiryInternalFailure       ExpiryOutcome = "internal_failure"
+)
+
+// ExpiryResult carries the expired attempt and its scheduled retry.
+type ExpiryResult struct {
+	Outcome       ExpiryOutcome
+	MessageID     string
+	Attempt       int64
+	RetryAtMs     int64
+	DeliveryCycle int64
+	ClaimedMs     int64
+	ExpiredMs     int64
+	// ConsumerInstanceID is the diagnostics identifier recorded at claim
+	// (empty when absent).
+	ConsumerInstanceID string
+}
+
+// LeaseExpirer reads due leases and runs the atomic expiry transition,
+// which re-validates authoritative state before mutating.
+type LeaseExpirer interface {
+	DueLeases(ctx context.Context, limit int) (DueBatch, error)
+	ExpireLease(ctx context.Context, recipientIdentity string, retryDelaysMs []int64, maxAttempts int) ExpiryResult
+}

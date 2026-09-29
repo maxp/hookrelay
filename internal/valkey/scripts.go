@@ -31,7 +31,7 @@ func init() {
 		"wrong_type":         0,
 		"state_inconsistent": 0,
 	})
-	register("claim_v2", 2, map[string]int{
+	register("claim_v3", 3, map[string]int{
 		// token, message_id, delivery_cycle, attempt, claimed_ms,
 		// lease_expires_ms, message_json, blocked_detected
 		"claimed":                8,
@@ -72,6 +72,15 @@ func init() {
 		"not_due":           0,
 		"recipient_blocked": 0,
 		"wrong_type":        0,
+	})
+	register("expire_lease_v1", 1, map[string]int{
+		// message_id, attempt, retry_at_ms, delivery_cycle, claimed_ms,
+		// expired_ms, consumer_instance_id (empty when absent)
+		"retry_scheduled":    7,
+		"not_due":            0,
+		"recipient_blocked":  0,
+		"attempts_exhausted": 0,
+		"wrong_type":         0,
 	})
 	register("reconcile_recipient_v1", 1, map[string]int{
 		// repairs, queue_length, reason

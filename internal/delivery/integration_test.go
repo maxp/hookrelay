@@ -39,6 +39,13 @@ func composeApp(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Regi
 // composeStack is composeApp plus the delivery store for maintenance. The
 // retry policy uses 20 ms nominal delays so retries are due quickly.
 func composeStack(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Registry, *valkey.DeliveryStore) {
+	return composeStackWithLease(t, time.Minute)
+}
+
+// testPolicy is the short-delay retry policy of the composed stack.
+var testPolicy = delivery.RetryPolicy{MaxAttempts: 4, Delays: []time.Duration{20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, JitterMin: 0.5, JitterMax: 1}
+
+func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *delivery.Handler, *prometheus.Registry, *valkey.DeliveryStore) {
 	t.Helper()
 	raw := os.Getenv("HOOKRELAY_TEST_VALKEY_URL")
 	if raw == "" {
@@ -77,10 +84,15 @@ func composeStack(t *testing.T) (http.Handler, *delivery.Handler, *prometheus.Re
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := valkey.NewDeliveryStore(a, valkey.ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: time.Minute})
+	store := valkey.NewDeliveryStore(a, valkey.ClaimLimits{MaxActiveLeases: 10, InitialLeaseDuration: lease})
+	attempts, err := delivery.NewAttemptMetrics(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	consumer, err := delivery.NewHandler(delivery.HandlerDeps{
-		Claimer: store, Acknowledger: store, NegativeAcknowledger: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
-		RetryPolicy: delivery.RetryPolicy{MaxAttempts: 4, Delays: []time.Duration{20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, JitterMin: 0.5, JitterMax: 1},
+		Attempts: attempts,
+		Claimer:  store, Acknowledger: store, NegativeAcknowledger: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
+		RetryPolicy: testPolicy,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -357,17 +369,7 @@ func TestNackRetryOverRealValkey(t *testing.T) {
 		t.Errorf("ack after nack = %d %s", w.Code, w.Body.String())
 	}
 
-	m, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
-		Retries: store,
-		Config:  delivery.MaintenanceConfig{Interval: 10 * time.Millisecond, IntervalJitter: 5 * time.Millisecond, BatchSize: 100, MaxContinuousBatches: 5},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { m.Run(ctx); close(done) }()
-	defer func() { cancel(); <-done }()
+	defer runMaintenance(t, store)()
 
 	var retried claimBody
 	deadline := time.Now().Add(3 * time.Second)
@@ -387,5 +389,76 @@ func TestNackRetryOverRealValkey(t *testing.T) {
 	if retried.Delivery.Attempt != 2 || retried.Delivery.DeliveryCycle != 1 || retried.Delivery.DeliveryToken == first.Delivery.DeliveryToken ||
 		retried.Delivery.ClaimedMs < nacked.RetryAtMs {
 		t.Errorf("retried delivery = %+v, want attempt 2 with a new token claimed after %d", retried.Delivery, nacked.RetryAtMs)
+	}
+}
+
+// runMaintenance runs background maintenance with a 10 ms interval and
+// returns its stop function.
+func runMaintenance(t *testing.T, store *valkey.DeliveryStore) func() {
+	t.Helper()
+	attempts, err := delivery.NewAttemptMetrics(prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
+		Retries: store, Leases: store, RetryPolicy: testPolicy, Attempts: attempts,
+		Config: delivery.MaintenanceConfig{Interval: 10 * time.Millisecond, IntervalJitter: 5 * time.Millisecond, BatchSize: 100, MaxContinuousBatches: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	return func() { cancel(); <-done }
+}
+
+// TestLeaseExpiryOverRealValkey drives webhook → claim with a short lease →
+// background expiry → retried claim through the composed public listener:
+// the stalled attempt's ack, nack, and claim replay all see it as ended,
+// and the retry is claimed with attempt 2 and a new Delivery Token.
+func TestLeaseExpiryOverRealValkey(t *testing.T) {
+	public, _, _, store := composeStackWithLease(t, 30*time.Millisecond)
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	update := `{"update_id":9,"message":{"message_id":1,"date":1700000000,"chat":{"id":-79},"text":"stall"}}`
+	if w := send(public, "/webhook/telegram/wh_d", update, map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}); w.Code != http.StatusOK {
+		t.Fatalf("webhook = %d", w.Code)
+	}
+	claimBodyFor := func(op string) string { return `{"operation_id":"` + op + `","wait_ms":0}` }
+	firstOp := "0195c4d8-0000-7000-8000-000000000031"
+	w := send(public, "/v1/deliveries/claim", claimBodyFor(firstOp), auth)
+	var first claimBody
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &first) != nil {
+		t.Fatalf("claim = %d %s", w.Code, w.Body.String())
+	}
+
+	defer runMaintenance(t, store)()
+	var retried claimBody
+	deadline := time.Now().Add(3 * time.Second)
+	for i := 0; ; i++ {
+		w := send(public, "/v1/deliveries/claim", claimBodyFor("0195c4d8-0000-7000-8000-0000000002"+fmt.Sprintf("%02d", i%100)), auth)
+		if w.Code == http.StatusOK {
+			if err := json.Unmarshal(w.Body.Bytes(), &retried); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired lease never retried; last claim = %d", w.Code)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retried.Delivery.Attempt != 2 || retried.Delivery.DeliveryToken == first.Delivery.DeliveryToken {
+		t.Errorf("retried delivery = %+v, want attempt 2 with a new token", retried.Delivery)
+	}
+
+	token := `{"delivery_token":"` + first.Delivery.DeliveryToken + `"}`
+	for _, path := range []string{"/v1/deliveries/ack", "/v1/deliveries/nack"} {
+		if w := send(public, path, token, auth); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "stale_delivery_token") {
+			t.Errorf("%s with the expired token = %d %s", path, w.Code, w.Body.String())
+		}
+	}
+	if w := send(public, "/v1/deliveries/claim", claimBodyFor(firstOp), auth); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "claim_no_longer_active") {
+		t.Errorf("claim replay after expiry = %d %s", w.Code, w.Body.String())
 	}
 }

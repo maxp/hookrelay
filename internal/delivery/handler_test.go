@@ -63,9 +63,13 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	hs := &harness{claimer: &fakeClaimer{}, acker: &fakeAcker{}, nacker: &fakeNacker{}, logs: &bytes.Buffer{}, reg: prometheus.NewRegistry()}
-	var err error
+	attempts, err := NewAttemptMetrics(hs.reg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	hs.h, err = NewHandler(HandlerDeps{
-		Claimer: hs.claimer, Acknowledger: hs.acker, NegativeAcknowledger: hs.nacker, RetryPolicy: defaultPolicy(),
+		Attempts: attempts,
+		Claimer:  hs.claimer, Acknowledger: hs.acker, NegativeAcknowledger: hs.nacker, RetryPolicy: defaultPolicy(),
 		Uniform: func() float64 { return 0 }, ConsumerSecret: secret, Gen: fixedGen{}, Clock: fixedClock{},
 		Logger: observability.NewTestLogger("debug", hs.logs), Registerer: hs.reg,
 	})

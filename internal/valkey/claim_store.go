@@ -14,13 +14,13 @@ import (
 // ClaimOpTTL is the fixed claim operation record retention.
 const ClaimOpTTL = 10 * time.Minute
 
-// ClaimLimits are the lease bounds passed to claim_v2.
+// ClaimLimits are the lease bounds passed to claim_v3.
 type ClaimLimits struct {
 	MaxActiveLeases      int
 	InitialLeaseDuration time.Duration
 }
 
-// DeliveryStore implements delivery.Claimer with claim_v2 and
+// DeliveryStore implements delivery.Claimer with claim_v3 and
 // delivery.StatsReader for the delivery gauges.
 type DeliveryStore struct {
 	a      *Adapter
@@ -37,7 +37,7 @@ func (s *DeliveryStore) Claim(ctx context.Context, req delivery.ClaimRequest) de
 	if req.RecordEmpty {
 		recordEmpty = "1"
 	}
-	res, err := s.a.RunScript(ctx, "claim_v2",
+	res, err := s.a.RunScript(ctx, "claim_v3",
 		[]string{"hr1:ready", "hr1:leases", "hr1:blocked"},
 		[]string{
 			req.OperationID,

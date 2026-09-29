@@ -75,7 +75,7 @@ func TestClaimClaimedAndKeys(t *testing.T) {
 	state := "hr1:r:" + ridA + ":s"
 	for field, want := range map[string]string{
 		"status": "leased", "delivery_token": "dlv_token1", "head_message_id": "m1",
-		"claimed_ms": itoa64(d.ClaimedMs), "attempt_started_ms": itoa64(d.ClaimedMs),
+		"claimed_ms": itoa64(d.ClaimedMs), "attempt_started_ms": itoa64(d.ClaimedMs), "delivery_token_digest": req.TokenDigest,
 		"lease_expires_ms": itoa64(d.LeaseExpiresMs), "consumer_instance_id": "worker-1",
 	} {
 		if got := hget(t, a, state, field); got != want {
@@ -305,7 +305,7 @@ func TestClaimWrongTypeAndArguments(t *testing.T) {
 		"bad flag":        with(8, "yes"),
 		"prefix mismatch": with(9, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "claim_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "claim_v3", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

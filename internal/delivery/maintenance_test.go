@@ -51,6 +51,40 @@ func (f *fakeActivator) ActivateRetry(_ context.Context, rid string) ActivationR
 	return ActivationResult{Outcome: ActivationActivated, MessageID: "m-" + rid, Attempt: 2}
 }
 
+// fakeExpirer serves due leases from a pending list, oldest first, and
+// removes each one it expires.
+type fakeExpirer struct {
+	nowMs   int64
+	pending []DueEntry
+	reads   []int
+	expired []string
+	delays  [][]int64
+	max     []int
+	outcome func(rid string) ExpiryOutcome
+}
+
+func (f *fakeExpirer) DueLeases(_ context.Context, limit int) (DueBatch, error) {
+	f.reads = append(f.reads, limit)
+	n := min(limit, len(f.pending))
+	return DueBatch{NowMs: f.nowMs, Entries: append([]DueEntry(nil), f.pending[:n]...)}, nil
+}
+
+func (f *fakeExpirer) ExpireLease(_ context.Context, rid string, delaysMs []int64, maxAttempts int) ExpiryResult {
+	f.expired = append(f.expired, rid)
+	f.delays = append(f.delays, delaysMs)
+	f.max = append(f.max, maxAttempts)
+	for i, e := range f.pending {
+		if e.RecipientIdentity == rid {
+			f.pending = append(f.pending[:i], f.pending[i+1:]...)
+			break
+		}
+	}
+	if f.outcome != nil {
+		return ExpiryResult{Outcome: f.outcome(rid)}
+	}
+	return ExpiryResult{Outcome: ExpiryRetryScheduled, MessageID: "m-" + rid, Attempt: 1, RetryAtMs: 20_000, DeliveryCycle: 1, ClaimedMs: 1_000, ExpiredMs: 3_000, ConsumerInstanceID: "worker-3"}
+}
+
 func dueEntries(n int, firstDueMs int64) []DueEntry {
 	out := make([]DueEntry, n)
 	for i := range out {
@@ -62,6 +96,7 @@ func dueEntries(n int, firstDueMs int64) []DueEntry {
 type maintenanceHarness struct {
 	m          *Maintenance
 	fake       *fakeActivator
+	expirer    *fakeExpirer
 	reg        *prometheus.Registry
 	logs       *bytes.Buffer
 	sleeps     []time.Duration
@@ -77,16 +112,27 @@ func (c countingClock) Now() time.Time {
 
 func newMaintenanceHarness(t *testing.T, fake *fakeActivator, sleep func(ctx context.Context, d time.Duration) error) *maintenanceHarness {
 	t.Helper()
-	mh := &maintenanceHarness{fake: fake, reg: prometheus.NewRegistry(), logs: &bytes.Buffer{}}
+	return newExpiryHarness(t, fake, &fakeExpirer{}, sleep)
+}
+
+func newExpiryHarness(t *testing.T, fake *fakeActivator, expirer *fakeExpirer, sleep func(ctx context.Context, d time.Duration) error) *maintenanceHarness {
+	t.Helper()
+	mh := &maintenanceHarness{fake: fake, expirer: expirer, reg: prometheus.NewRegistry(), logs: &bytes.Buffer{}}
+	attempts, err := NewAttemptMetrics(mh.reg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sleep == nil {
 		sleep = func(ctx context.Context, d time.Duration) error { return ctx.Err() }
 	}
-	var err error
 	mh.m, err = NewMaintenance(MaintenanceDeps{
-		Retries: fake,
-		Config:  MaintenanceConfig{Interval: time.Second, IntervalJitter: 250 * time.Millisecond, BatchSize: 100, MaxContinuousBatches: 5},
-		Uniform: func() float64 { return 0.5 },
-		Clock:   countingClock{calls: &mh.clockCalls},
+		Retries:     fake,
+		Leases:      expirer,
+		RetryPolicy: defaultPolicy(),
+		Attempts:    attempts,
+		Config:      MaintenanceConfig{Interval: time.Second, IntervalJitter: 250 * time.Millisecond, BatchSize: 100, MaxContinuousBatches: 5},
+		Uniform:     func() float64 { return 0.5 },
+		Clock:       countingClock{calls: &mh.clockCalls},
 		Sleep: func(ctx context.Context, d time.Duration) error {
 			mh.sleeps = append(mh.sleeps, d)
 			return sleep(ctx, d)
@@ -259,5 +305,76 @@ func TestMaintenanceStopsTakingBatchesWhenCancelled(t *testing.T) {
 	mh.m.RunRound(ctx)
 	if len(fake.activated) != 100 || len(fake.reads) != 1 {
 		t.Errorf("activated %d in %d batches after cancellation, want the one batch in progress", len(fake.activated), len(fake.reads))
+	}
+}
+
+// TestMaintenanceExpiresDueLeasesInTheirOwnBatches pins lease expiry: due
+// leases are processed in their own bounded batches before retries, each
+// with freshly drawn retry delays and the attempt limit; every expired
+// attempt emits delivery_lease_expired and counts as outcome=expired.
+func TestMaintenanceExpiresDueLeasesInTheirOwnBatches(t *testing.T) {
+	expirer := &fakeExpirer{nowMs: 10_000, pending: dueEntries(150, 8_000)}
+	activator := &fakeActivator{nowMs: 10_000, pending: dueEntries(50, 9_000)}
+	mh := newExpiryHarness(t, activator, expirer, nil)
+	mh.m.RunRound(context.Background())
+
+	if len(expirer.expired) != 150 || len(expirer.reads) != 2 || len(activator.activated) != 50 || len(activator.reads) != 1 {
+		t.Fatalf("expired %d in %d batches, activated %d in %d batches", len(expirer.expired), len(expirer.reads), len(activator.activated), len(activator.reads))
+	}
+	if d := expirer.delays[0]; len(d) != 3 || d[0] != 750 || d[1] != 3750 || d[2] != 22500 || expirer.max[0] != 4 {
+		t.Errorf("expiry arguments = %v max %d, want the drawn policy delays and 4", d, expirer.max[0])
+	}
+	leaseKind := map[string]string{"kind": "lease_expiry"}
+	if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": "lease_expiry", "result": "applied"}); got != 150 {
+		t.Errorf("processed{lease_expiry,applied} = %v", got)
+	}
+	if got := mh.value(t, "hookrelay_maintenance_due_lag_seconds", leaseKind); got != 2 {
+		t.Errorf("lease due lag = %v, want 2", got)
+	}
+	if got := mh.value(t, "hookrelay_maintenance_batch_size", leaseKind); got != 2 {
+		t.Errorf("lease batch samples = %v, want 2", got)
+	}
+	expiredLabels := map[string]string{"recipient_scope": "chat", "outcome": "expired"}
+	if got := mh.value(t, "hookrelay_delivery_attempts_total", expiredLabels); got != 150 {
+		t.Errorf("attempts{expired} = %v", got)
+	}
+	if got := mh.value(t, "hookrelay_delivery_attempt_duration_seconds", expiredLabels); got != 150 {
+		t.Errorf("attempt duration{expired} samples = %v", got)
+	}
+	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"delivery_lease_expired"`)); n != 150 {
+		t.Errorf("delivery_lease_expired events = %d", n)
+	}
+	first := mh.logs.Bytes()[:bytes.IndexByte(mh.logs.Bytes(), '\n')]
+	for _, want := range []string{`"message_id":"m-telegram:42:chat:0"`, `"recipient_scope":"chat"`, `"chat_id":"0"`, `"attempt":1`, `"retry_at_ms":20000`, `"delivery_cycle":1`, `"consumer_instance_id":"worker-3"`, `"duration_ms":2000`} {
+		if !bytes.Contains(first, []byte(want)) {
+			t.Errorf("event lacks %s: %s", want, first)
+		}
+	}
+}
+
+// TestMaintenanceExpiryOutcomes pins the lease result labels: a lease on
+// the last attempt is deferred (one warning per batch) until the
+// dead-letter transition exists.
+func TestMaintenanceExpiryOutcomes(t *testing.T) {
+	outcomes := map[string]ExpiryOutcome{
+		"telegram:42:chat:0": ExpiryNotDue,
+		"telegram:42:chat:1": ExpiryRecipientBlocked,
+		"telegram:42:chat:2": ExpiryAttemptsExhausted,
+		"telegram:42:chat:3": ExpiryAttemptsExhausted,
+		"telegram:42:chat:4": ExpiryInternalFailure,
+	}
+	expirer := &fakeExpirer{nowMs: 10_000, pending: dueEntries(5, 9_000), outcome: func(rid string) ExpiryOutcome { return outcomes[rid] }}
+	mh := newExpiryHarness(t, &fakeActivator{}, expirer, nil)
+	mh.m.RunRound(context.Background())
+	for result, want := range map[string]float64{"stale": 1, "blocked": 1, "deferred": 2, "failed": 1} {
+		if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": "lease_expiry", "result": result}); got != want {
+			t.Errorf("processed{%s} = %v, want %v", result, got, want)
+		}
+	}
+	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"maintenance_transition_deferred"`)); n != 1 {
+		t.Errorf("deferred warnings = %d, want one per batch:\n%s", n, mh.logs.String())
+	}
+	if bytes.Contains(mh.logs.Bytes(), []byte(`"event":"delivery_lease_expired"`)) {
+		t.Error("lease_expired event for a lease that did not expire")
 	}
 }
