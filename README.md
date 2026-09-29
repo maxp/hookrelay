@@ -139,7 +139,7 @@ false (`"startup_reconciliation":"held"` in `/health/ready`) until an
 operator intervenes; see the
 [Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md).
 Progress is exported as `hookrelay_reconciliation_in_progress` and
-`hookrelay_reconciliation_findings_total{kind}`.
+`hookrelay_consistency_issues_total{kind,resolution}`.
 
 ## Webhook ingestion
 

@@ -27,8 +27,10 @@ func (a *Adapter) ValidateReadiness(ctx context.Context, production bool) (Readi
 	report := ReadinessReport{}
 
 	if err := a.Ping(ctx); err != nil {
+		a.metrics.setConnected(false)
 		return report, err
 	}
+	a.metrics.setConnected(true)
 	report.Ping = true
 
 	if production {

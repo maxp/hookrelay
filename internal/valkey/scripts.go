@@ -87,14 +87,14 @@ type Result struct {
 func parseResult(script string, arity map[string]int, msg valkey.ValkeyMessage) (*Result, error) {
 	items, err := msg.ToArray()
 	if err != nil {
-		return nil, fmt.Errorf("valkey: script %s: result is not an array: %w", script, err)
+		return nil, fmt.Errorf("%w: script %s: result is not an array: %w", errScriptResult, script, err)
 	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("valkey: script %s: empty result array", script)
+		return nil, fmt.Errorf("%w: script %s: empty result array", errScriptResult, script)
 	}
 	status, err := items[0].ToString()
 	if err != nil {
-		return nil, fmt.Errorf("valkey: script %s: status is not a string: %w", script, err)
+		return nil, fmt.Errorf("%w: script %s: status is not a string: %w", errScriptResult, script, err)
 	}
 	want, known := arity[status]
 	if !known {
@@ -103,10 +103,10 @@ func parseResult(script string, arity map[string]int, msg valkey.ValkeyMessage) 
 			statuses = append(statuses, s)
 		}
 		sort.Strings(statuses)
-		return nil, fmt.Errorf("valkey: script %s: unknown status %q (expected one of: %s)", script, status, strings.Join(statuses, ", "))
+		return nil, fmt.Errorf("%w: script %s: unknown status %q (expected one of: %s)", errScriptResult, script, status, strings.Join(statuses, ", "))
 	}
 	if got := len(items) - 1; got != want {
-		return nil, fmt.Errorf("valkey: script %s status %s: invalid shape: %d fields, want %d", script, status, got, want)
+		return nil, fmt.Errorf("%w: script %s status %s: invalid shape: %d fields, want %d", errScriptResult, script, status, got, want)
 	}
 	return &Result{Script: script, Status: status, Fields: items[1:]}, nil
 }

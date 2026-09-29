@@ -105,7 +105,9 @@ func (a *Adapter) CreateEndpoint(ctx context.Context, e Endpoint, eventID, opera
 // GetEndpoint reads one endpoint in a single HGETALL. It returns (nil, nil)
 // when absent. BotPlatform is not stored; the caller derives it from the
 // Webhook Type mapping.
-func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier string) (*Endpoint, error) {
+func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier string) (_ *Endpoint, err error) {
+	start := time.Now()
+	defer func() { a.metrics.observe("endpoint_read", start, err) }()
 	key := "hr1:wh:" + webhookType + ":" + identifier
 	msg, err := a.client.Do(ctx, a.client.B().Hgetall().Key(key).Build()).ToMessage()
 	if err != nil {

@@ -462,9 +462,9 @@ func TestReconciliationGatesReadiness(t *testing.T) {
 		passes = append(passes, full)
 		mu.Unlock()
 		if hold.Load() {
-			return ReconcileResult{Findings: map[string]int{"due_lease": 1}, Hold: "due_lease"}, nil
+			return ReconcileResult{Findings: map[string]int{"due_lease": 1}, Issues: []ConsistencyIssue{{"due_lease", "held", 1}}, Hold: "due_lease"}, nil
 		}
-		return ReconcileResult{Findings: map[string]int{"repaired": 2}}, nil
+		return ReconcileResult{Findings: map[string]int{"repaired": 2}, Issues: []ConsistencyIssue{{"derived_index_drift", "repaired", 2}}}, nil
 	}
 	app, stop := runApp(t, deps)
 	defer stop()
@@ -487,7 +487,7 @@ func TestReconciliationGatesReadiness(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	app.AdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	for _, want := range []string{`hookrelay_reconciliation_findings_total{kind="repaired"} 2`, `hookrelay_reconciliation_findings_total{kind="due_lease"}`, "hookrelay_reconciliation_in_progress 0"} {
+	for _, want := range []string{`hookrelay_consistency_issues_total{kind="derived_index_drift",resolution="repaired"} 2`, `hookrelay_consistency_issues_total{kind="due_lease",resolution="held"}`, "hookrelay_reconciliation_in_progress 0"} {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("metrics missing %s", want)
 		}

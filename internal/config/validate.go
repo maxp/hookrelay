@@ -25,8 +25,8 @@ func (c *Config) validate() error {
 	if c.MaxInflightWebhooks <= 0 {
 		return fmt.Errorf("HOOKRELAY_MAX_INFLIGHT_WEBHOOKS: must be positive, got %d", c.MaxInflightWebhooks)
 	}
-	if c.ValkeyMaxConnections <= 0 {
-		return fmt.Errorf("HOOKRELAY_VALKEY_MAX_CONNECTIONS: must be positive, got %d", c.ValkeyMaxConnections)
+	if c.ValkeyMaxConnections < 2 {
+		return fmt.Errorf("HOOKRELAY_VALKEY_MAX_CONNECTIONS: must be at least 2 (pipelined ring plus blocking pool), got %d", c.ValkeyMaxConnections)
 	}
 	if c.ValkeyMinIdle <= 0 {
 		return fmt.Errorf("HOOKRELAY_VALKEY_MIN_IDLE: must be positive, got %d", c.ValkeyMinIdle)

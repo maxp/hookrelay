@@ -126,26 +126,30 @@ func Serve(args []string) int {
 	observability.SetBuildVersion(version)
 	log := observability.NewLogger(cfg.LogLevel)
 	registry := observability.NewMetricsRegistry()
+	if cfg.PprofEnabled {
+		log.Warn("profiling is not available in this build; HOOKRELAY_PPROF_ENABLED has no effect yet",
+			"event", "configuration_not_enforced", "setting", "HOOKRELAY_PPROF_ENABLED")
+	}
 
 	// Valkey adapter: eager dial is the first dependency check (ADR 0006).
-	// Connection bounds follow the verified client model: the pipeline ring
-	// is capped at 2^2 = 4 connections (well under MaxConnections), and the
-	// blocking pool is bounded by the waiting-claim limit with the configured
-	// idle floor. Exact long-poll sizing joins with the Consumer API slice.
+	// HOOKRELAY_VALKEY_MAX_CONNECTIONS bounds the pipelined ring plus the
+	// blocking pool; long polls are periodic atomic rechecks on the ring.
 	opt, err := valkey.ParseURL(cfg.ValkeyURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
 		return ExitUsage
 	}
-	opt.PipelineMultiplex = 2
-	opt.BlockingPoolSize = cfg.MaxWaitingClaims
-	opt.BlockingPoolMinSize = cfg.ValkeyMinIdle
+	valkey.ApplyConnectionLimits(&opt, cfg.ValkeyMaxConnections, cfg.ValkeyMinIdle)
 	adapter, err := valkey.NewAdapter(opt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
 		return ExitError
 	}
 	defer adapter.Close()
+	if err := adapter.Instrument(registry); err != nil {
+		log.Error("valkey metrics wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
 
 	// The serving registry carries the operator's adapter configuration.
 	webhookTypes, err := ingestion.Builtin(ingestion.BuiltinOptions{TelegramSourceCIDRs: cfg.TelegramSourceCIDRs})
@@ -228,7 +232,11 @@ func Serve(args []string) int {
 		for reason, n := range report.BlockReasons {
 			findings["blocked_"+reason] = n
 		}
-		return app.ReconcileResult{Findings: findings, Hold: report.Hold()}, err
+		var issues []app.ConsistencyIssue
+		for _, i := range report.ConsistencyIssues() {
+			issues = append(issues, app.ConsistencyIssue{Kind: i.Kind, Resolution: i.Resolution, Count: i.Count})
+		}
+		return app.ReconcileResult{Findings: findings, Issues: issues, Hold: report.Hold()}, err
 	}
 
 	application := app.New(app.Deps{

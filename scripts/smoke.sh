@@ -152,6 +152,8 @@ metric() { grep -E "^$1 " <<<"$metrics" | awk '{print $2}'; }
 expect "accepted" "$(metric 'hookrelay_messages_accepted_total\{bot_platform="telegram",recipient_scope="chat"\}')" 1
 expect "duplicates" "$(metric 'hookrelay_messages_duplicate_total\{webhook_type="telegram"\}')" 1
 expect "acknowledged attempts" "$(metric 'hookrelay_delivery_attempts_total\{outcome="acknowledged",recipient_scope="chat"\}')" 1
+expect "valkey connected" "$(metric 'hookrelay_valkey_connected')" 1
+expect "valkey accept operations" "$(metric 'hookrelay_valkey_operations_total\{operation="accept",outcome="success"\}')" 2
 expect "live" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/health/live")" 200
 expect "accepting webhooks" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/health/accepting-webhooks")" 200
 
@@ -165,6 +167,6 @@ expect "webhook after restart" "$(send_webhook)" 200
 expect "stored messages after repeat" "$(vk --scan --pattern 'hr1:m:*' | wc -l | tr -d ' ')" 0
 metrics="$(curl_ "$admin/metrics")"
 expect "deduplicated after restart" "$(metric 'hookrelay_messages_duplicate_total\{webhook_type="telegram"\}')" 1
-expect "reconciliation findings" "$(grep -c '^hookrelay_reconciliation_findings_total' <<<"$metrics" || true)" 0
+expect "consistency issues" "$(grep -c '^hookrelay_consistency_issues_total' <<<"$metrics" || true)" 0
 
 printf '\nSMOKE PASSED\n'

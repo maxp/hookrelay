@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/valkey-io/valkey-go"
 )
@@ -68,6 +69,7 @@ type Adapter struct {
 	client    valkey.Client
 	mu        sync.RWMutex
 	shaByName map[string]string // script name → server-side SHA (from SCRIPT LOAD)
+	metrics   *adapterMetrics   // nil until Instrument
 }
 
 // ParseURL re-exports the client URL parser so composition modules do not
@@ -146,7 +148,9 @@ var ErrNotDispatched = errors.New("valkey: script not dispatched")
 // the same embedded body on NOSCRIPT. Ambiguous transport errors are returned
 // as-is and never retried (server errors are *valkey.ValkeyError; transport
 // failures are ordinary errors — see ADR 0006).
-func (a *Adapter) RunScript(ctx context.Context, name string, keys, args []string) (*Result, error) {
+func (a *Adapter) RunScript(ctx context.Context, name string, keys, args []string) (res *Result, err error) {
+	start := time.Now()
+	defer func() { a.metrics.observeScript(name, start, err) }()
 	script, ok := registry[name]
 	if !ok {
 		return nil, fmt.Errorf("%w: unknown script %q", ErrNotDispatched, name)
@@ -176,7 +180,7 @@ func (a *Adapter) RunScript(ctx context.Context, name string, keys, args []strin
 		return parseResult(name, script.Arity, msg)
 	}
 
-	res, err := run(true)
+	res, err = run(true)
 	if err == nil {
 		return res, nil
 	}

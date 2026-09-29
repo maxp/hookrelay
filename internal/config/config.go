@@ -57,6 +57,10 @@ type Config struct {
 	AdminOrigin       *url.URL
 	AdminCookieSecure bool
 
+	// PprofEnabled is validated in Milestone 1; the profiling handlers
+	// arrive with a later slice.
+	PprofEnabled bool
+
 	// Source-address trust and adapter defense-in-depth.
 	TrustedProxyCIDRs   []*net.IPNet
 	TelegramSourceCIDRs []*net.IPNet
@@ -251,6 +255,15 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 		c.AdminCookieSecure = false
 	default:
 		return nil, fmt.Errorf("HOOKRELAY_ADMIN_COOKIE_SECURE: must be a boolean, got %q", cookieSecureRaw)
+	}
+
+	switch raw := get("HOOKRELAY_PPROF_ENABLED"); raw {
+	case "", "false", "0":
+		c.PprofEnabled = false
+	case "true", "1":
+		c.PprofEnabled = true
+	default:
+		return nil, fmt.Errorf("HOOKRELAY_PPROF_ENABLED: must be a boolean, got %q", raw)
 	}
 
 	parseCIDRs := func(env string) ([]*net.IPNet, error) {

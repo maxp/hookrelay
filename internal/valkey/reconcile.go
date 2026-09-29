@@ -324,3 +324,39 @@ func (a *Adapter) auditRepair(ctx context.Context, g gen.Gen, log *slog.Logger, 
 		"reason", reason,
 	).Build())
 }
+
+// ConsistencyIssue is one bounded (kind, resolution) pair with its count,
+// the shape of hookrelay_consistency_issues_total.
+type ConsistencyIssue struct {
+	Kind       string
+	Resolution string
+	Count      int
+}
+
+// ConsistencyIssues maps the pass's findings onto bounded kinds and
+// resolutions: repaired, removed, restored, blocked, kept, held, skipped.
+func (r ReconcileReport) ConsistencyIssues() []ConsistencyIssue {
+	f := r.Findings
+	var out []ConsistencyIssue
+	add := func(kind, resolution string, n int) {
+		if n > 0 {
+			out = append(out, ConsistencyIssue{Kind: kind, Resolution: resolution, Count: n})
+		}
+	}
+	add("derived_index_drift", "repaired", f["repaired"])
+	add("stale_index_entry", "removed", f["drained"])
+	for reason, n := range r.BlockReasons {
+		add(reason, "blocked", n)
+	}
+	add("existing_block", "kept", f["already_blocked"])
+	add("due_lease", "held", f["due_lease"])
+	// Invalid dedup records are also counted as unhandled; report them once.
+	add("dedup_record_invalid", "held", f["dedup_skipped"])
+	add("unhandled_state", "held", f["unhandled"]-f["dedup_skipped"])
+	add("dedup_record_expired", "removed", f["dedup_expired_removed"])
+	add("dedup_index_missing", "restored", f["dedup_restored"])
+	add("dedup_index_orphan", "removed", f["dedup_orphans_removed"])
+	add("queued_counter_drift", "repaired", f["counter_repaired"])
+	add("queued_counter_unverified", "skipped", f["counter_unverified"])
+	return out
+}

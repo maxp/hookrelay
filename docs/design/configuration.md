@@ -81,7 +81,7 @@ Supported levels are `debug`, `info`, `warn`, and `error`. With no explicit over
 HOOKRELAY_PPROF_ENABLED=false
 ```
 
-When enabled, selected pprof handlers are exposed only on the administrative listener and require Admin Bearer authentication. Browser sessions cannot access them. CPU duration is capped at 30 seconds, trace duration at 5 seconds, and only one profile request may run at once. Access logging to standard output and auditing in Valkey are best effort; a Valkey outage or audit-write failure does not itself block an authorized profile request. This diagnostic exception does not relax authentication or profiling limits.
+Milestone 1 parses and validates this setting (a boolean, default `false`) but does not yet serve profiling handlers; enabling it logs a startup warning. When the profiling slice lands and the setting is enabled, selected pprof handlers are exposed only on the administrative listener and require Admin Bearer authentication. Browser sessions cannot access them. CPU duration is capped at 30 seconds, trace duration at 5 seconds, and only one profile request may run at once. Access logging to standard output and auditing in Valkey are best effort; a Valkey outage or audit-write failure does not itself block an authorized profile request. This diagnostic exception does not relax authentication or profiling limits.
 
 ## Administrative origin and cookie
 
@@ -131,7 +131,7 @@ HOOKRELAY_VALKEY_MAX_CONNECTIONS=20
 HOOKRELAY_VALKEY_MIN_IDLE=2
 ```
 
-Client resources are bounded. These accepted initial values are verified against the selected `valkey-go` connection and multiplexing model during the client spike.
+Client resources are bounded. These accepted initial values are verified against the selected `valkey-go` connection and multiplexing model during the client spike. `HOOKRELAY_VALKEY_MAX_CONNECTIONS` (at least 2) bounds the pipelined connection ring plus the blocking pool: the ring uses 2^N connections with N at most 2 (the verified multiplexing) and 2^N ≤ max − 1, and the blocking pool receives the remainder with `HOOKRELAY_VALKEY_MIN_IDLE` as its idle floor. Every Milestone 1 command, including long-poll rechecks, runs on the ring; no blocking commands are issued.
 
 ## Queue capacity and retention
 

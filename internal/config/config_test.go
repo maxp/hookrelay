@@ -284,3 +284,28 @@ func TestEnvironmentVocabulary(t *testing.T) {
 		t.Errorf("staging accepted: %v", err)
 	}
 }
+
+// TestPprofEnabledValidation pins the Milestone 1 contract for a setting
+// consumed by a later slice: parsed and validated, default false.
+func TestPprofEnabledValidation(t *testing.T) {
+	for raw, want := range map[string]bool{"": false, "false": false, "0": false, "true": true, "1": true} {
+		c, err := Load(nil, getenv(map[string]string{"HOOKRELAY_PPROF_ENABLED": raw}))
+		if err != nil || c.PprofEnabled != want {
+			t.Errorf("%q: PprofEnabled = %v, %v; want %v", raw, c != nil && c.PprofEnabled, err, want)
+		}
+	}
+	if _, err := Load(nil, getenv(map[string]string{"HOOKRELAY_PPROF_ENABLED": "yes"})); err == nil || !strings.Contains(err.Error(), "HOOKRELAY_PPROF_ENABLED") {
+		t.Errorf("invalid value accepted: %v", err)
+	}
+}
+
+// TestValkeyMaxConnectionsMinimum pins the lower bound that lets the
+// pipelined ring and the blocking pool both exist within the limit.
+func TestValkeyMaxConnectionsMinimum(t *testing.T) {
+	if _, err := Load(nil, getenv(map[string]string{"HOOKRELAY_VALKEY_MAX_CONNECTIONS": "1", "HOOKRELAY_VALKEY_MIN_IDLE": "1"})); err == nil {
+		t.Error("a single connection accepted")
+	}
+	if _, err := Load(nil, getenv(map[string]string{"HOOKRELAY_VALKEY_MAX_CONNECTIONS": "2", "HOOKRELAY_VALKEY_MIN_IDLE": "1"})); err != nil {
+		t.Errorf("two connections rejected: %v", err)
+	}
+}

@@ -112,10 +112,20 @@ type Deps struct {
 }
 
 // ReconcileResult is the outcome of one reconciliation pass: bounded
-// finding counts and, when readiness must stay false, the hold reason.
+// finding counts for the completion log, the consistency issues for
+// hookrelay_consistency_issues_total, and, when readiness must stay false,
+// the hold reason.
 type ReconcileResult struct {
 	Findings map[string]int
+	Issues   []ConsistencyIssue
 	Hold     string
+}
+
+// ConsistencyIssue is one bounded (kind, resolution) count.
+type ConsistencyIssue struct {
+	Kind       string
+	Resolution string
+	Count      int
 }
 
 // reconcileTimeout bounds one reconciliation pass.
@@ -149,9 +159,9 @@ func New(deps Deps) *App {
 	adminMux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
 	if deps.Registry != nil {
 		a.findings = prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "hookrelay_reconciliation_findings_total",
-			Help: "Reconciliation findings and repairs by bounded kind.",
-		}, []string{"kind"})
+			Name: "hookrelay_consistency_issues_total",
+			Help: "Consistency issues found by reconciliation, by bounded kind and resolution.",
+		}, []string{"kind", "resolution"})
 		deps.Registry.MustRegister(a.findings, prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "hookrelay_reconciliation_in_progress",
 			Help: "1 while a reconciliation pass runs.",
@@ -381,9 +391,9 @@ func (a *App) reconcile(ctx context.Context, full bool) bool {
 	rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 	res, err := a.deps.Reconcile(rctx, full)
-	for kind, n := range res.Findings {
-		if n > 0 && a.findings != nil {
-			a.findings.WithLabelValues(kind).Add(float64(n))
+	for _, issue := range res.Issues {
+		if issue.Count > 0 && a.findings != nil {
+			a.findings.WithLabelValues(issue.Kind, issue.Resolution).Add(float64(issue.Count))
 		}
 	}
 	switch {
