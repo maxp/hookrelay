@@ -213,7 +213,7 @@ func composedHandler(t *testing.T, a *valkey.Adapter) http.Handler {
 type builtinCatalog struct{}
 
 func (builtinCatalog) Lookup(webhookType string) (string, []string, bool) {
-	r, err := ingestion.Builtin()
+	r, err := ingestion.Builtin(ingestion.BuiltinOptions{})
 	if err != nil {
 		return "", nil, false
 	}

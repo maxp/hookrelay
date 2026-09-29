@@ -111,3 +111,23 @@ jobs:
             --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --build-arg DIRTY="$( [ -n "$(git status --porcelain)" ] && echo true || echo false )" \
             -t hookrelay:ci .
+      - name: Verify embedded version metadata and runtime user
+        run: |
+          version="$(docker run --rm hookrelay:ci version --json)"
+          echo "$version"
+          test "$(jq -r .version <<<"$version")" = "${GITHUB_SHA::7}"
+          test "$(jq -r .commit <<<"$version")" = "${GITHUB_SHA::7}"
+          test "$(jq -r .build_time <<<"$version")" != "unknown"
+          user="$(docker image inspect --format '{{.Config.User}}' hookrelay:ci)"
+          echo "runtime user: $user"
+          test -n "$user" && test "$user" != "root" && test "$user" != "0"
+
+  smoke:
+    # The Compose smoke is the Milestone 1 exit criterion: the full vertical
+    # slice against the pinned stack in production mode, including a restart
+    # that keeps the Valkey volume.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compose smoke
+        run: scripts/smoke.sh

@@ -166,9 +166,10 @@ hookrelay_dedup_capacity_rejections_total
 hookrelay_webhook_inflight
 hookrelay_accepting_webhooks
 hookrelay_routing_issues_total{bot_platform,reason}
+hookrelay_event_time_issues_total{bot_platform,reason}
 ```
 
-`hookrelay_accepting_webhooks` is `1` only while new-message acceptance is enabled; it becomes `0` under the accepted queue, memory, or deduplication stop conditions without implying that Consumer draining is unavailable. Deduplication gauges and counters provide the capacity signals required by the deduplication contract. Webhook outcomes are bounded to accepted, duplicate, unknown endpoint, verification failure, invalid JSON, oversized body, rate limited, Recipient blocked, capacity rejection, dependency unavailable, and internal error.
+`hookrelay_accepting_webhooks` is `1` only while new-message acceptance is enabled; it becomes `0` under the accepted queue, memory, or deduplication stop conditions without implying that Consumer draining is unavailable. Deduplication gauges and counters provide the capacity signals required by the deduplication contract. Webhook outcomes are bounded to accepted, duplicate, unknown endpoint, method not allowed, verification failure, invalid JSON, oversized body, unsupported media type, request timeout, body read failed, rate limited, overloaded (in-flight limit), Recipient blocked, capacity rejection, dependency unavailable, and internal error. Requests whose route does not name a registered Webhook Type use `webhook_type="unknown"`. `hookrelay_event_time_issues_total` counts events whose documented timestamp was `missing`, of `invalid_type`, or an `invalid_value` (non-integer or out of range), so `occurred_ms` was omitted.
 
 ### Required delivery metrics
 

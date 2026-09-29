@@ -20,6 +20,59 @@ func init() {
 		"bot_endpoint_limit": 0,
 		"wrong_type":         0,
 	})
+	register("accept_v1", 1, map[string]int{
+		"accepted":           1, // accepted_ms
+		"duplicate":          1, // original message_id
+		"duplicate_conflict": 1, // original message_id
+		"recipient_blocked":  0,
+		"recipient_capacity": 0,
+		"global_capacity":    0,
+		"dedup_capacity":     0,
+		"wrong_type":         0,
+		"state_inconsistent": 0,
+	})
+	register("claim_v1", 1, map[string]int{
+		// token, message_id, delivery_cycle, attempt, claimed_ms,
+		// lease_expires_ms, message_json, blocked_detected
+		"claimed":                8,
+		"replay_active":          8,
+		"replay_empty":           0,
+		"claim_no_longer_active": 0,
+		"operation_conflict":     0,
+		"limit_exceeded":         0,
+		"empty":                  1, // blocked_detected
+		"wrong_type":             0,
+	})
+	register("ack_v1", 1, map[string]int{
+		// message_id, acknowledged_ms, recipient_identity, delivery_cycle,
+		// attempt (the last three are empty/zero for a repeat)
+		"acknowledged":         5,
+		"already_acknowledged": 5,
+		"not_found":            0,
+		"stale":                0,
+		"recipient_blocked":    0,
+		"wrong_type":           0,
+	})
+	register("reconcile_recipient_v1", 1, map[string]int{
+		// repairs, queue_length, reason
+		"consistent":      3,
+		"repaired":        3,
+		"blocked":         3,
+		"already_blocked": 3,
+		"drained":         3,
+		"due_lease":       3,
+		"unhandled":       3,
+	})
+	register("reconcile_dedup_v1", 1, map[string]int{
+		"reconciled": 4, // expired_removed, restored, orphans_removed, skipped
+		"wrong_type": 0,
+	})
+	register("reconcile_counter_v1", 1, map[string]int{
+		"repaired":            0,
+		"consistent":          0,
+		"precondition_failed": 0,
+		"wrong_type":          0,
+	})
 }
 
 // Result is a typed script result: the bounded status code plus the

@@ -4,7 +4,7 @@ Webhook relay that distributes incoming events to recipients through ordered del
 
 ## Status
 
-Milestone 1 (the tracer-bullet vertical slice) is in progress. Done so far: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey — and the Admin CLI (`hookrelay admin webhook create|get`) on top of that API. The ingestion, delivery, and Consumer API slices are pending. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/).
+Milestone 1 (the tracer-bullet vertical slice) is implemented; its exit criterion is a green CI pipeline including the Compose smoke. Done: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey — the Admin CLI (`hookrelay admin webhook create|get`) on top of that API, and the webhook ingestion happy path: signed Telegram updates are verified, converted into Canonical Messages, deduplicated, and atomically queued per Recipient in Valkey. The ingestion rejection matrix, process protections, and the complete Telegram classification surface (every event-to-Recipient row, routing issues, fallback deduplication) are in place, and consumers can claim and acknowledge queued messages through the Consumer API (`POST /v1/deliveries/claim`, `POST /v1/deliveries/ack`). Claims long-poll for up to 30 seconds, startup reconciliation validates and safely repairs persisted state before readiness, and an automated Compose smoke test proves the whole slice. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/).
 
 ## Goals
 
@@ -70,7 +70,11 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/observability` — structured logging and the private metrics registry;
 - `internal/cli` — serve, admin, version, generate, and healthcheck commands;
 - `internal/administration` — Admin API service and HTTP transport;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts, readiness gate, endpoint store;
+- `internal/model` — Recipient Identity and the Canonical Message codec;
+- `internal/ingestion` — webhook pipeline and the Telegram adapter;
+- `internal/delivery` — Consumer API transport and delivery use cases;
+- `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v1`, `claim_v1`, `ack_v1`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
 - `internal/ingestion` — Webhook Type registry (verification and conversion seams);
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
@@ -104,6 +108,17 @@ chmod 600 .secrets/consumer .secrets/admin
 docker compose up --build
 ```
 
+The Compose smoke test proves the whole Milestone 1 slice against that stack
+in production mode (endpoint via the Admin CLI → signed webhook and its
+duplicate → claim → ack and repeated ack → empty queue → metrics and health →
+restart keeping the Valkey volume → persisted endpoint and continued
+deduplication). It uses its own Compose project, generated secrets, and free
+loopback ports, and cleans up after itself; CI runs it as the `smoke` job:
+
+```sh
+scripts/smoke.sh
+```
+
 Health endpoints live on the administrative listener:
 `/health/live`, `/health/ready`, `/health/accepting-webhooks`, `/metrics`.
 The public listener opens only after the readiness gate (Valkey availability,
@@ -111,6 +126,110 @@ script load with digest verification, known-structure validation) has
 succeeded, and `/health/ready` reports ready only once that listener is open.
 The gate re-runs every second; losing Valkey withdraws readiness until the
 full gate passes again.
+
+Before readiness (and again after Valkey recovers) hookrelay reconciles
+persisted state in bounded `SCAN`/`ZSCAN` batches: it repairs derived ready,
+lease, blocked, and deduplication indexes and (at startup) the queued-message
+counter, and isolates any Recipient whose queue or head state is ambiguous
+behind a persistent block marker (`hr1:q:<recipient>`) while every other
+Recipient serves normally. Authoritative state is never rewritten. A lease
+already past its deadline, or state that cannot be isolated, holds readiness
+false (`"startup_reconciliation":"held"` in `/health/ready`) until an
+operator intervenes; see the
+[Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md).
+Progress is exported as `hookrelay_reconciliation_in_progress` and
+`hookrelay_reconciliation_findings_total{kind}`.
+
+## Webhook ingestion
+
+The public listener serves `POST /webhook/{webhook_type}/{webhook_identifier}`
+(Telegram: `/webhook/telegram/<webhook_identifier>`, configured at Telegram
+with the endpoint's `secret_token`). The pipeline resolves the route,
+verifies the `X-Telegram-Bot-Api-Secret-Token` header (and the optional
+`HOOKRELAY_TELEGRAM_SOURCE_CIDRS` allowlist), converts the update into a
+Canonical Message for its chat, user, bot, or relay Recipient, and runs one
+atomic `accept_v1` transition that deduplicates and queues it.
+
+- Accepted and duplicate updates both receive an empty `200`, returned only
+  after Valkey commits or proves the duplicate. A repeated `update_id` with
+  different bytes is still a duplicate and increments
+  `hookrelay_dedup_conflicts_total`.
+- Unknown, disabled, or malformed routes: `404`; other methods: `405` with
+  `Allow: POST`; verification failure: `403`; invalid JSON: `400`; body over
+  256 KiB: `413`; non-JSON media type or compressed body: `415`; body not
+  received within the 10-second request deadline: `408`; Valkey
+  unavailable, blocked Recipient, capacity reached, or more than
+  `HOOKRELAY_MAX_INFLIGHT_WEBHOOKS` (default 100) requests in flight: `503`
+  with `Retry-After: 1`; corrupt storage state: `500`. Bodies are always
+  empty; every response carries `X-Request-Id`.
+- `/health/accepting-webhooks` (and `hookrelay_accepting_webhooks`) reports
+  `503`/`0` when Valkey is unavailable or the global queue
+  (`HOOKRELAY_MAX_QUEUED_MESSAGES`) or live deduplication records
+  (`HOOKRELAY_MAX_DEDUP_RECORDS`) are at capacity; it is re-evaluated every
+  second. `/health/ready` stays `200` under capacity pressure so consumers
+  can drain, and a single full Recipient only rejects its own messages.
+- Feature events `webhook_accepted` and `webhook_duplicate`; metrics
+  `hookrelay_webhook_requests_total{webhook_type,outcome}`,
+  `hookrelay_webhook_request_duration_seconds`,
+  `hookrelay_webhook_request_body_bytes`,
+  `hookrelay_messages_accepted_total{bot_platform,recipient_scope}`,
+  `hookrelay_messages_duplicate_total`, `hookrelay_dedup_conflicts_total`,
+  `hookrelay_dedup_capacity_rejections_total`,
+  `hookrelay_routing_issues_total{bot_platform,reason}`,
+  `hookrelay_event_time_issues_total{bot_platform,reason}`,
+  `hookrelay_webhook_inflight`, `hookrelay_dedup_records`,
+  `hookrelay_dedup_record_capacity`, and `hookrelay_accepting_webhooks`.
+
+Storage keys, the `accept_v1` contract, and capacity limits are specified in
+[`.scratch/milestone-1/spec.md`](.scratch/milestone-1/spec.md) and
+[`docs/design/storage.md`](docs/design/storage.md).
+
+## Consumer API
+
+Queue consumers use the public listener with the shared Consumer Secret
+(`Authorization: Bearer <consumer secret>`):
+
+```sh
+curl -X POST http://<public>/v1/deliveries/claim \
+  -H 'Authorization: Bearer <consumer secret>' -H 'Content-Type: application/json' \
+  -d '{"operation_id":"<uuidv7>","wait_ms":0}'
+```
+
+- `200` returns `{"delivery": {delivery_token, delivery_cycle, attempt,
+  claimed_ms, lease_expires_ms}, "message": <Canonical Message>}`; `204` means
+  no ready work. Each claim holds the Recipient's head under a 60-second
+  lease (`HOOKRELAY_INITIAL_LEASE_DURATION`); later messages for that
+  Recipient wait.
+- Repeating an `operation_id` with the same arguments replays the recorded
+  outcome (the same token while the attempt is active) for 10 minutes;
+  `409 operation_conflict` for other arguments, `409 claim_no_longer_active`
+  once the attempt ended; `429 consumer_limit_exceeded` with
+  `Retry-After: 1` at `HOOKRELAY_MAX_ACTIVE_LEASES` unexpired leases;
+  `503` means repeat the same `operation_id`.
+- `POST /v1/deliveries/ack` with `{"delivery_token": "dlv_..."}` completes the
+  attempt: `200 {"status":"acknowledged","message_id","acknowledged_ms"}`,
+  and repeating it returns the same recorded result for one hour. The
+  message leaves the queue and the Recipient's next message becomes ready.
+  `404 delivery_token_not_found` for an unknown or expired token,
+  `409 stale_delivery_token` after the lease deadline or when superseded,
+  `409 recipient_blocked` while the Recipient is blocked. Compact success
+  metadata (no identifiers or payload) is kept for 24 hours.
+- A Recipient whose stored state is inconsistent is isolated behind a block
+  marker during the claim scan and skipped; other Recipients continue.
+- `wait_ms` (0–30000, default 30000) long-polls: the claim rechecks
+  atomically every 250 ms plus 0–50 ms jitter until work appears (returned
+  at once) or the deadline passes (`204`, recorded for replay). A client that
+  disconnects abandons the wait; repeating the same `operation_id` recovers
+  a lease that raced with the disconnect. At most
+  `HOOKRELAY_MAX_WAITING_CLAIMS` (default 20) claims wait per process;
+  more receive `429 consumer_limit_exceeded` with `Retry-After: 1`.
+  Graceful shutdown ends waiting claims with `503` and `Retry-After: 1`.
+- Metrics: `hookrelay_delivery_claims_total{outcome}`,
+  `hookrelay_delivery_attempts_total{recipient_scope,outcome}`,
+  `hookrelay_active_leases`, `hookrelay_waiting_claims`,
+  `hookrelay_queue_messages`, `hookrelay_ready_recipients`,
+  `hookrelay_blocked_recipients`; feature event `delivery_claimed` (tokens
+  are never logged), `delivery_acknowledged`.
 
 ## Admin API
 

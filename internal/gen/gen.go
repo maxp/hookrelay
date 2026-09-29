@@ -1,5 +1,5 @@
-// Package gen provides injectable generation for UUIDv7 identifiers and
-// cryptographically random tokens. Production randomness uses crypto/rand and
+// Package gen provides injectable generation for UUIDv7 identifiers,
+// cryptographically random tokens, and process timestamps. Production randomness uses crypto/rand and
 // never falls back to non-cryptographic randomness; tests use deterministic
 // adapters.
 package gen
@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -58,3 +59,14 @@ func (f *Fixed) Base64URL(n int) (string, error) {
 	f.calls++
 	return v, nil
 }
+
+// Clock supplies process timestamps to feature logic. Leases, retries, and
+// dedup expiry use authoritative Valkey TIME instead.
+type Clock interface {
+	Now() time.Time
+}
+
+// SystemClock is the production Clock.
+type SystemClock struct{}
+
+func (SystemClock) Now() time.Time { return time.Now() }

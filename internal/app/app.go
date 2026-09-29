@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/maxp/hookrelay/internal/config"
+	"github.com/maxp/hookrelay/internal/ingestion"
 )
 
 // shutdownDeadline is the controlled shutdown deadline.
@@ -33,7 +35,21 @@ const gateTimeout = 5 * time.Second
 type Readiness struct {
 	ready     atomic.Bool
 	accepting atomic.Bool
+	// reconciliation is the bounded startup/recovery reconciliation state
+	// shown in the readiness body: pending, in_progress, held, failed,
+	// complete.
+	reconciliation atomic.Value
 }
+
+// ReconciliationState reports the bounded reconciliation state.
+func (r *Readiness) ReconciliationState() string {
+	if v, ok := r.reconciliation.Load().(string); ok {
+		return v
+	}
+	return "pending"
+}
+
+func (r *Readiness) setReconciliation(state string) { r.reconciliation.Store(state) }
 
 // MarkReady reports that startup validation and reconciliation succeeded.
 func (r *Readiness) MarkReady() { r.ready.Store(true) }
@@ -63,12 +79,47 @@ type Deps struct {
 	// they are protected by the listener placement.
 	AdminAPI http.Handler
 
+	// Webhooks serves the /webhook/ routes on the public listener. It
+	// receives those paths before the standard mux so path cleaning and its
+	// redirects never alter webhook route validation.
+	Webhooks http.Handler
+
+	// ConsumerAPI serves the /v1/ Consumer API routes on the public listener.
+	ConsumerAPI http.Handler
+
+	// Probes refresh state-derived gauges on every gate run while ready.
+	Probes []func(context.Context)
+
+	// BeforeDrain runs after readiness and acceptance are withdrawn and
+	// before the listeners drain, e.g. to end outstanding long polls.
+	BeforeDrain []func()
+
+	// Reconcile validates and safely repairs persisted state before
+	// readiness. full is true until the public listener has served once
+	// (the startup pass); recovery after Valkey loss runs lightweight
+	// passes. A non-empty Hold keeps readiness false.
+	Reconcile func(ctx context.Context, full bool) (ReconcileResult, error)
+
+	// Acceptance evaluates the global acceptance stop conditions on every
+	// gate run while ready; nil means acceptance follows readiness.
+	Acceptance func(context.Context) bool
+
 	// Gate is the startup/recovery readiness gate: connectivity, production
 	// persistence checks, script loads, and structure validation. The
 	// administrative listener starts before the gate; the public listener
 	// opens only after the first successful gate.
 	Gate func(context.Context) error
 }
+
+// ReconcileResult is the outcome of one reconciliation pass: bounded
+// finding counts and, when readiness must stay false, the hold reason.
+type ReconcileResult struct {
+	Findings map[string]int
+	Hold     string
+}
+
+// reconcileTimeout bounds one reconciliation pass.
+const reconcileTimeout = 5 * time.Minute
 
 type logger interface {
 	Info(msg string, args ...any)
@@ -79,6 +130,9 @@ type logger interface {
 // App owns the listeners and the shutdown sequence.
 type App struct {
 	deps Deps
+
+	reconciling atomic.Bool
+	findings    *prometheus.CounterVec
 
 	adminServer  *http.Server
 	publicServer *http.Server
@@ -93,14 +147,53 @@ func New(deps Deps) *App {
 	adminMux.HandleFunc("GET /health/ready", a.handleReady)
 	adminMux.HandleFunc("GET /health/accepting-webhooks", a.handleAcceptingWebhooks)
 	adminMux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
+	if deps.Registry != nil {
+		a.findings = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hookrelay_reconciliation_findings_total",
+			Help: "Reconciliation findings and repairs by bounded kind.",
+		}, []string{"kind"})
+		deps.Registry.MustRegister(a.findings, prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "hookrelay_reconciliation_in_progress",
+			Help: "1 while a reconciliation pass runs.",
+		}, func() float64 {
+			if a.reconciling.Load() {
+				return 1
+			}
+			return 0
+		}))
+	}
+	if deps.Registry != nil && deps.Readiness != nil {
+		readiness := deps.Readiness
+		deps.Registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "hookrelay_accepting_webhooks",
+			Help: "1 while new webhook messages may be accepted, 0 under a stop condition.",
+		}, func() float64 {
+			if readiness.Ready() && readiness.AcceptingWebhooks() {
+				return 1
+			}
+			return 0
+		}))
+	}
 	if deps.AdminAPI != nil {
 		adminMux.Handle("/", deps.AdminAPI)
 	}
 
-	// The public listener carries webhook and Consumer API routes in later
-	// slices; it serves nothing yet and starts only after the readiness gate
-	// succeeds.
+	// The public listener carries the webhook routes and the Consumer API;
+	// it starts only after the readiness gate succeeds.
 	publicMux := http.NewServeMux()
+	if deps.ConsumerAPI != nil {
+		publicMux.Handle("/v1/", deps.ConsumerAPI)
+	}
+	var publicHandler http.Handler = publicMux
+	if deps.Webhooks != nil {
+		publicHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, ingestion.RoutePrefix) {
+				deps.Webhooks.ServeHTTP(w, r)
+				return
+			}
+			publicMux.ServeHTTP(w, r)
+		})
+	}
 
 	a.adminServer = &http.Server{
 		Handler:           adminMux,
@@ -109,7 +202,7 @@ func New(deps Deps) *App {
 		IdleTimeout:       60 * time.Second,
 	}
 	a.publicServer = &http.Server{
-		Handler:           publicMux,
+		Handler:           publicHandler,
 		MaxHeaderBytes:    32 << 10,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -134,6 +227,10 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 	log.Info("starting administrative listener", "event", "listener_started", "listener", "admin", "address", a.deps.Config.AdminAddress)
 	go func() { errAdmin <- a.adminServer.Serve(adminLn) }()
 
+	// everServed records that readiness was acquired once; later passes are
+	// recovery (lightweight) reconciliation.
+	var everServed atomic.Bool
+
 	// Public listener lifecycle: opened after the first successful gate. A
 	// public server that stops unexpectedly clears publicOpen and withdraws
 	// readiness, so the next gate run reopens it.
@@ -155,6 +252,7 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 			if err := a.publicServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Error("public listener stopped", "event", "listener_failed", "listener", "public", "error_code", "internal_error")
 				a.deps.Readiness.MarkNotReady()
+				a.deps.Readiness.SetAcceptingWebhooks(false)
 				publicOpen.Store(false)
 			}
 		}()
@@ -170,22 +268,36 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 			return
 		}
 		gateCtx, cancel := context.WithTimeout(ctx, gateTimeout)
+		defer cancel()
 		err := a.deps.Gate(gateCtx)
-		cancel()
 		if err != nil {
 			if a.deps.Readiness.Ready() {
 				log.Warn("readiness withdrawn", "event", "readiness_withdrawn", "reason", "gate_failed")
 			}
 			a.deps.Readiness.MarkNotReady()
+			a.deps.Readiness.SetAcceptingWebhooks(false)
 			return
 		}
-		if a.deps.Readiness.Ready() || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		for _, probe := range a.deps.Probes {
+			probe(gateCtx)
+		}
+		if a.deps.Readiness.Ready() {
+			a.deps.Readiness.SetAcceptingWebhooks(a.accepting(gateCtx))
+			return
+		}
+		if !a.reconcile(ctx, !everServed.Load()) {
 			return
 		}
 		if !openPublicListener() {
 			return
 		}
+		everServed.Store(true)
 		log.Info("readiness acquired", "event", "readiness_acquired")
+		// Acceptance is set first so readiness is never observed without it.
+		a.deps.Readiness.SetAcceptingWebhooks(a.accepting(gateCtx))
 		a.deps.Readiness.MarkReady()
 	}
 	runGate()
@@ -210,6 +322,9 @@ func (a *App) Run(ctx context.Context, adminLn net.Listener, openPublic func(con
 	log.Info("shutdown initiated", "event", "shutdown_initiated", "deadline_ms", shutdownDeadline.Milliseconds())
 	a.deps.Readiness.MarkNotReady()
 	a.deps.Readiness.SetAcceptingWebhooks(false)
+	for _, stop := range a.deps.BeforeDrain {
+		stop()
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownDeadline)
 	defer cancel()
@@ -246,13 +361,62 @@ func (a *App) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeBoundedJSON(w, http.StatusServiceUnavailable, map[string]any{
 		"status":             "not_ready",
 		"accepting_webhooks": false,
-		"checks":             map[string]string{"startup_reconciliation": "pending"},
+		"checks":             map[string]string{"startup_reconciliation": a.deps.Readiness.ReconciliationState()},
 	})
 }
 
-// handleAcceptingWebhooks is the ingestion-acceptance signal. Before the
-// ingestion slice exists nothing may be accepted, so the endpoint reports
-// not-accepting rather than making a false claim.
+// reconcile runs one reconciliation pass and reports whether readiness may
+// be acquired.
+func (a *App) reconcile(ctx context.Context, full bool) bool {
+	if a.deps.Reconcile == nil {
+		a.deps.Readiness.setReconciliation("complete")
+		return true
+	}
+	log := a.deps.Logger
+	a.deps.Readiness.setReconciliation("in_progress")
+	a.reconciling.Store(true)
+	defer a.reconciling.Store(false)
+	log.Info("reconciliation started", "event", "reconciliation_started", "full", full)
+
+	rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+	res, err := a.deps.Reconcile(rctx, full)
+	for kind, n := range res.Findings {
+		if n > 0 && a.findings != nil {
+			a.findings.WithLabelValues(kind).Add(float64(n))
+		}
+	}
+	switch {
+	case err != nil:
+		a.deps.Readiness.setReconciliation("failed")
+		log.Error("reconciliation failed", "event", "reconciliation_failed", "error_code", "dependency_unavailable")
+		return false
+	case res.Hold != "":
+		a.deps.Readiness.setReconciliation("held")
+		log.Error("readiness held by reconciliation", "event", "reconciliation_hold", "reason_code", res.Hold, "error_code", "internal_error")
+		return false
+	}
+	a.deps.Readiness.setReconciliation("complete")
+	args := []any{"event", "reconciliation_completed", "full", full}
+	for kind, n := range res.Findings {
+		args = append(args, kind, n)
+	}
+	log.Info("reconciliation completed", args...)
+	return true
+}
+
+// accepting reports whether new webhook messages may be accepted: ingestion
+// is wired and no global stop condition applies.
+func (a *App) accepting(ctx context.Context) bool {
+	if a.deps.Webhooks == nil {
+		return false
+	}
+	return a.deps.Acceptance == nil || a.deps.Acceptance(ctx)
+}
+
+// handleAcceptingWebhooks is the ingestion-acceptance signal: accepting only
+// while ready, with ingestion wired, and below the global queue and
+// deduplication stop conditions.
 func (a *App) handleAcceptingWebhooks(w http.ResponseWriter, _ *http.Request) {
 	if a.deps.Readiness.Ready() && a.deps.Readiness.AcceptingWebhooks() {
 		writeBoundedJSON(w, http.StatusOK, map[string]any{"status": "accepting", "accepting_webhooks": true})

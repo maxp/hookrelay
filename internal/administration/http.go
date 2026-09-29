@@ -1,17 +1,16 @@
 package administration
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"mime"
 	"net/http"
 	"strings"
+
+	"github.com/maxp/hookrelay/internal/jsonbody"
 )
 
 // requestIDKey carries the per-request identifier from the auth middleware
@@ -26,12 +25,6 @@ func requestIDFrom(ctx context.Context) string {
 	}
 	return ""
 }
-
-// Body limits from the Admin API contract.
-const (
-	maxBodyBytes = 16 << 10
-	maxJSONDepth = 40
-)
 
 // Handler builds the administrative API routes. Authentication applies only
 // to the API routes; health and metrics stay on the surrounding admin mux
@@ -80,12 +73,8 @@ func (s *Service) secretMatches(provided string) bool {
 func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r.Context())
 
-	if err := requireJSON(r.Header.Get("Content-Type")); err != nil {
-		writeAPIError(w, err, requestID)
-		return
-	}
 	var req CreateRequest
-	if err := decodeStrict(r.Body, &req); err != nil {
+	if err := decodeBody(r, &req); err != nil {
 		writeAPIError(w, err, requestID)
 		return
 	}
@@ -174,79 +163,22 @@ type endpointResponse struct {
 	WebhookPath       string             `json:"webhook_path"`
 }
 
-// requireJSON accepts only application/json, optionally with a UTF-8
-// charset, parsed as a media type.
-func requireJSON(contentType string) error {
-	unsupported := BadRequestError{
-		msg:    "Content-Type must be application/json",
-		code:   "unsupported_media_type",
-		status: http.StatusUnsupportedMediaType,
+// decodeBody applies the shared strict JSON discipline and maps its failure
+// classes to the bounded Admin API errors.
+func decodeBody(r *http.Request, dst any) error {
+	err := jsonbody.RequireJSON(r.Header.Get("Content-Type"))
+	if err == nil {
+		err = jsonbody.Decode(r.Body, dst)
 	}
-	mediaType, params, err := mime.ParseMediaType(contentType)
-	if err != nil || mediaType != "application/json" {
-		return unsupported
-	}
-	for name, value := range params {
-		if name != "charset" || !strings.EqualFold(value, "utf-8") {
-			return unsupported
-		}
-	}
-	return nil
-}
-
-// decodeStrict enforces the 16 KiB limit, JSON content framing, maximum
-// nesting depth, and unknown-field rejection.
-func decodeStrict(body io.Reader, dst any) error {
-	data, err := io.ReadAll(io.LimitReader(body, maxBodyBytes+1))
-	if err != nil {
-		return BadRequestError{msg: "read body"}
-	}
-	if len(data) > maxBodyBytes {
-		return BadRequestError{
-			msg:    "request body larger than 16 KiB",
-			code:   "request_too_large",
-			status: http.StatusRequestEntityTooLarge,
-		}
-	}
-	if err := checkDepth(data, maxJSONDepth); err != nil {
-		return err
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return BadRequestError{msg: "invalid request body"}
-	}
-	// Trailing non-whitespace data is rejected.
-	if dec.More() {
-		return BadRequestError{msg: "trailing data after JSON body"}
-	}
-	return nil
-}
-
-// checkDepth walks JSON tokens to enforce the maximum nesting depth.
-func checkDepth(data []byte, max int) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	depth := 0
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return BadRequestError{msg: "invalid request body"}
-		}
-		switch tok.(type) {
-		case json.Delim:
-			switch tok.(json.Delim) {
-			case '{', '[':
-				depth++
-				if depth > max {
-					return BadRequestError{msg: "maximum JSON nesting depth exceeded"}
-				}
-			case '}', ']':
-				depth--
-			}
-		}
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, jsonbody.ErrUnsupportedMediaType):
+		return BadRequestError{msg: err.Error(), code: "unsupported_media_type", status: http.StatusUnsupportedMediaType}
+	case errors.Is(err, jsonbody.ErrTooLarge):
+		return BadRequestError{msg: err.Error(), code: "request_too_large", status: http.StatusRequestEntityTooLarge}
+	default:
+		return BadRequestError{msg: err.Error()}
 	}
 }
 

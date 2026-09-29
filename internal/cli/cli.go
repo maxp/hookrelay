@@ -20,6 +20,7 @@ import (
 	"github.com/maxp/hookrelay/internal/administration"
 	"github.com/maxp/hookrelay/internal/app"
 	"github.com/maxp/hookrelay/internal/config"
+	"github.com/maxp/hookrelay/internal/delivery"
 	"github.com/maxp/hookrelay/internal/gen"
 	"github.com/maxp/hookrelay/internal/ingestion"
 	"github.com/maxp/hookrelay/internal/observability"
@@ -31,7 +32,7 @@ import (
 var types *ingestion.Registry
 
 func init() {
-	r, err := ingestion.Builtin()
+	r, err := ingestion.Builtin(ingestion.BuiltinOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -121,9 +122,6 @@ func Serve(args []string) int {
 		fmt.Fprintf(os.Stderr, "hookrelay serve: %v\n", err)
 		return ExitUsage
 	}
-	// Secrets are validated and length-checked here; the API slices consume
-	// them through composition. They are never logged.
-	_, _ = consumerSecret, adminSecret
 
 	observability.SetBuildVersion(version)
 	log := observability.NewLogger(cfg.LogLevel)
@@ -149,9 +147,16 @@ func Serve(args []string) int {
 	}
 	defer adapter.Close()
 
+	// The serving registry carries the operator's adapter configuration.
+	webhookTypes, err := ingestion.Builtin(ingestion.BuiltinOptions{TelegramSourceCIDRs: cfg.TelegramSourceCIDRs})
+	if err != nil {
+		log.Error("webhook type registry failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
+
 	svc, err := administration.NewService(administration.ServiceDeps{
 		Repo:        valkey.NewEndpointStore(adapter),
-		Catalog:     typeCatalog{registry: types},
+		Catalog:     typeCatalog{registry: webhookTypes},
 		Audit:       valkey.NewAuditSink(adapter),
 		AdminSecret: adminSecret,
 		Gen:         gen.Crypto{},
@@ -164,18 +169,80 @@ func Serve(args []string) int {
 	}
 
 	readiness := &app.Readiness{}
+	acceptor := valkey.NewMessageAcceptor(adapter, valkey.AcceptLimits{
+		MaxQueuedMessages:             cfg.MaxQueuedMessages,
+		MaxQueuedMessagesPerRecipient: cfg.MaxQueuedMessagesPerRecipient,
+		MaxDedupRecords:               cfg.MaxDedupRecords,
+		DedupRetention:                cfg.DedupRetention,
+	})
+	webhooks, err := ingestion.NewHandler(ingestion.HandlerDeps{
+		Registry:         webhookTypes,
+		Endpoints:        valkey.NewEndpointLookup(adapter),
+		Acceptor:         acceptor,
+		Capacity:         acceptor,
+		OnAcceptanceStop: func() { readiness.SetAcceptingWebhooks(false) },
+		MaxInflight:      cfg.MaxInflightWebhooks,
+		Gen:              gen.Crypto{},
+		Clock:            gen.SystemClock{},
+		TrustedProxies:   cfg.TrustedProxyCIDRs,
+		Logger:           log,
+		Registerer:       registry,
+	})
+	if err != nil {
+		log.Error("ingestion wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
+
+	deliveryStore := valkey.NewDeliveryStore(adapter, valkey.ClaimLimits{
+		MaxActiveLeases:      cfg.MaxActiveLeases,
+		InitialLeaseDuration: cfg.InitialLeaseDuration,
+	})
+	consumerAPI, err := delivery.NewHandler(delivery.HandlerDeps{
+		Claimer:          deliveryStore,
+		Acknowledger:     deliveryStore,
+		Stats:            deliveryStore,
+		ConsumerSecret:   consumerSecret,
+		MaxWaitingClaims: cfg.MaxWaitingClaims,
+		Gen:              gen.Crypto{},
+		Clock:            gen.SystemClock{},
+		Logger:           log,
+		Registerer:       registry,
+	})
+	if err != nil {
+		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
+
 	gate := func(ctx context.Context) error {
 		_, err := adapter.ValidateReadiness(ctx, cfg.Production())
 		return err
 	}
 
+	reconcile := func(ctx context.Context, full bool) (app.ReconcileResult, error) {
+		report, err := adapter.Reconcile(ctx, valkey.ReconcileOptions{
+			Full:              full,
+			MessageCheckBound: cfg.MaxQueuedMessagesPerRecipient,
+		})
+		findings := report.Findings
+		for reason, n := range report.BlockReasons {
+			findings["blocked_"+reason] = n
+		}
+		return app.ReconcileResult{Findings: findings, Hold: report.Hold()}, err
+	}
+
 	application := app.New(app.Deps{
-		Config:    cfg,
-		Logger:    log,
-		Registry:  registry,
-		Readiness: readiness,
-		AdminAPI:  administration.Handler(svc),
-		Gate:      gate,
+		Config:      cfg,
+		Logger:      log,
+		Registry:    registry,
+		Readiness:   readiness,
+		AdminAPI:    administration.Handler(svc),
+		Webhooks:    webhooks,
+		ConsumerAPI: consumerAPI,
+		Probes:      []func(context.Context){consumerAPI.RefreshGauges},
+		BeforeDrain: []func(){consumerAPI.Shutdown},
+		Acceptance:  webhooks.AcceptingWebhooks,
+		Gate:        gate,
+		Reconcile:   reconcile,
 	})
 
 	log.Info("hookrelay starting",

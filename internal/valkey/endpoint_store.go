@@ -160,20 +160,10 @@ func isWrongType(err error) bool {
 func (a *Adapter) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) error {
 	auditCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	msg, err := a.client.Do(auditCtx, a.client.B().Time().Build()).ToMessage()
+	timestampMs, err := a.serverTimeMs(auditCtx)
 	if err != nil {
-		return fmt.Errorf("valkey: audit time: %w", err)
+		return err
 	}
-	parts, err := msg.ToArray()
-	if err != nil || len(parts) != 2 {
-		return fmt.Errorf("valkey: audit time shape")
-	}
-	sec, e1 := parts[0].AsInt64()
-	usec, e2 := parts[1].AsInt64()
-	if e1 != nil || e2 != nil {
-		return fmt.Errorf("valkey: audit time shape")
-	}
-	timestampMs := sec*1000 + usec/1000
 	_, err = a.client.Do(auditCtx, a.client.B().Arbitrary(
 		"XADD", auditKey, "MAXLEN", "~", "1000000", "*",
 		"event_id", eventID,
@@ -294,4 +284,22 @@ func (a *Adapter) AuditEntries(ctx context.Context, count int64) ([]map[string]s
 		out = append(out, entry)
 	}
 	return out, nil
+}
+
+// serverTimeMs reads authoritative Valkey TIME in milliseconds.
+func (a *Adapter) serverTimeMs(ctx context.Context) (int64, error) {
+	msg, err := a.client.Do(ctx, a.client.B().Time().Build()).ToMessage()
+	if err != nil {
+		return 0, fmt.Errorf("valkey: time: %w", err)
+	}
+	parts, err := msg.ToArray()
+	if err != nil || len(parts) != 2 {
+		return 0, fmt.Errorf("valkey: time shape")
+	}
+	sec, e1 := parts[0].AsInt64()
+	usec, e2 := parts[1].AsInt64()
+	if e1 != nil || e2 != nil {
+		return 0, fmt.Errorf("valkey: time shape")
+	}
+	return sec*1000 + usec/1000, nil
 }
