@@ -1,0 +1,132 @@
+# Milestone 2 — complete delivery failure path
+
+Status: needs-review
+
+Specification source of truth: `CONTEXT.md`, `docs/design/*`, `docs/adr/*`, and the implemented Milestone 1 contracts in `.scratch/milestone-1/spec.md`. This spec fixes the Milestone 2 storage encodings, Lua script contracts, maintenance and reconciliation contracts, and the M2 subsets of the Consumer and Admin APIs before any transition code is written (`docs/design/implementation-milestones.md`, `docs/design/open-questions.md`). Domain vocabulary follows `CONTEXT.md`.
+
+## Problem Statement
+
+Milestone 1 delivers every message exactly once on the happy path, but a consumer that fails, crashes, or stalls has no way out: there is no negative acknowledgement, a lease never expires (readiness is held instead), nothing retries, and a message that keeps failing blocks its Recipient forever. Operators cannot see or replay failed messages, cannot clear a protective Recipient block, and the webhook side still lacks the configured rate limits, the memory stop, and deduplication early eviction.
+
+## Solution
+
+Complete the ordered-delivery state machine and make hookrelay deployable:
+
+```text
+claim → nack or lease expiry → bounded retry delay → claim with a new Delivery Token
+      → four failed attempts → global DLQ → operator replay
+```
+
+plus lease extension, cooperative background maintenance and the bounded inline pre-poll pass that execute expiry and retry activation, DLQ retention, the Admin replay / delivery-state / DLQ read / Recipient-block inspect-and-clear operations with matching CLI commands, reconciliation that executes the new transitions before readiness, token-bucket rate limiting, the memory acceptance stop, deduplication early eviction, and their metrics. Milestone 2 is the first deployable release candidate.
+
+## User Stories
+
+1. As a consumer developer, I want to `nack` a claimed message with an optional bounded `reason_code`, so that a failure is retried after the server-chosen delay instead of blocking my Recipient.
+2. As a consumer developer, I want repeating the same `nack` to return the recorded result, and `ack` after `nack` (or the inverse) to return a bounded conflict, so that lost responses never double-count attempts.
+3. As a consumer developer, I want `extend` with an `operation_id` to push my lease deadline by the server-chosen interval, never beyond five minutes from the attempt start, and to replay the same deadline when repeated, so that long work does not expire while alive.
+4. As a consumer developer, I want a lease that passes its deadline to count as a failed attempt and every later `ack`/`nack`/`extend` with that token to return `409 stale_delivery_token`, so that a stalled worker can never commit a stale result.
+5. As a consumer developer, I want each retry to be claimed with a new Delivery Token and an incremented `attempt`, so that I can distinguish attempts and fence stale work.
+6. As a bot owner, I want a message that fails its fourth attempt in a Delivery Cycle to move to the global DLQ and the Recipient's next message to become deliverable, so that one poison message cannot stall a conversation forever.
+7. As an operator, I want to list and inspect dead-letter entries by safe metadata, so that I can find what failed without seeing payloads.
+8. As an operator, I want to replay a dead-letter message ahead of all not-yet-started messages of its Recipient with a new Delivery Cycle, rejecting a conflicting deduplication mapping unless I explicitly choose `keep_current`, so that I can recover failures without reordering in-flight work or corrupting deduplication.
+9. As an operator, I want replay to be audited in the same atomic operation and a lost replay response to be reconcilable through a delivery-state read, so that I never trust an unaudited replay or blindly repeat it.
+10. As an operator, I want to list blocked Recipients, inspect one without mutation, and clear it only with exact marker preconditions after invariants re-verify, audited atomically, so that the recovery runbook is executable.
+11. As an operator, I want dead-letter entries to be deleted with an audit event after the configured retention (default 30 days), so that the DLQ is bounded.
+12. As an on-call engineer, I want expiry and retry activation to run in cooperative background maintenance with bounded batches and due-lag metrics, and a claim to run one bounded inline pass before it waits, so that failures recover without an operator.
+13. As an on-call engineer, I want startup reconciliation to execute overdue expiries, activate due retries, and repair retry and DLQ indexes before readiness, instead of holding readiness on a due lease, so that restarts recover by themselves.
+14. As Telegram, I want requests beyond the configured global or per-endpoint rate to receive a retryable response before verification, so that one noisy endpoint cannot starve the others.
+15. As an on-call engineer, I want new-message acceptance to stop at the configured share of Valkey `maxmemory` while draining continues, so that Valkey never reaches `noeviction` write failures from ingestion.
+16. As an on-call engineer, I want the oldest deduplication records evicted early under capacity pressure, never below the minimum retention window, with the effective retention and early evictions observable, so that deduplication degrades gracefully instead of rejecting all ingestion.
+17. As an on-call engineer, I want metrics for retries waiting, dead letters, replays, attempt outcomes and durations, oldest ready message age, maintenance work and lag, and Valkey memory/AOF state, so that the failure path is observable and alertable.
+18. As a maintainer, I want every new Lua transition covered at the storage seam (every status tuple, every affected key, no mutation on refusals) and the Compose smoke extended with the full failure path, so that the release candidate is proven end to end.
+
+## Implementation Decisions
+
+### Scope and sequence
+
+- Tickets follow the dependency order: failure transitions first (nack, expiry, retry activation, dead-letter), then maintenance and extension, then operator surfaces, then reconciliation, then ingestion protections, then the release-candidate smoke.
+- Every new transition is an embedded versioned Lua script (`*_v1.lua`) registered with its arity map, loaded before readiness, and covered by storage-seam tests exactly like Milestone 1. M1 scripts change only through amended contracts recorded here.
+- Background maintenance is cooperative: any process may run it, no leader is elected, and every transition re-validates authoritative state (head state, token, attempt, deadline) before mutating, so a stale index entry is ignored or removed without changing state.
+
+### Retry policy (fixed defaults, configurable per the configuration contract)
+
+- One Delivery Cycle permits `HOOKRELAY_MAX_DELIVERY_ATTEMPTS` = 4 attempts including the first.
+- After failed attempt `n` (1-based, `n < max`) the nominal delay is `HOOKRELAY_RETRY_DELAYS[n-1]` (default `1s,5s,30s`); the effective delay is `nominal × U[HOOKRELAY_RETRY_JITTER_MIN, HOOKRELAY_RETRY_JITTER_MAX]` (default `[0.5, 1.0]`), drawn app-side and passed to the script as `retry_delay_ms`; `retry_at_ms = TIME + retry_delay_ms` inside the script.
+- `nack` and lease expiry follow the same policy and both increment the attempt count. Failing attempt `max` moves the message to dead-letter.
+
+### New and changed Valkey records
+
+Encodings follow the M1 conventions (Hash fields are strings; `*_ms` are base-10 integer milliseconds; booleans `"0"`/`"1"`).
+
+- Head state `hr1:r:<recipient_identity>:s` gains `status=retry_wait` with `retry_at_ms`, `delivery_cycle`, `attempt` (the attempt that will be claimed next), `head_message_id`; no `delivery_token`, `claimed_ms`, `lease_expires_ms`, or `consumer_instance_id` while waiting. `attempt_started_ms` is added to leased state (set by claim) so extension can enforce the maximum lifetime; claim, nack, expiry, and ack keep the M1 fields otherwise.
+- `hr1:retries` ZSET, member `recipient_identity`, score `retry_at_ms`; a member exists only while head state is `retry_wait`. Never in `ready`, `leases`, or `blocked` at the same time.
+- `hr1:a:<message_id>` attempt history List (contract fixed in M1, first written in M2): one compact JSON entry per completed attempt: `{"kind":"attempt","delivery_cycle","attempt","claimed_ms","lease_expires_ms","completed_ms","outcome","reason_code"?,"consumer_instance_id"?}` with `outcome ∈ {nack, expired}` (ack deletes history, as in M1). When more than 10 Delivery Cycles are present, the oldest cycles are folded into one leading `{"kind":"archived_cycles_summary","archived_cycles","archived_attempts","first_archived_ms","last_archived_ms"}` entry.
+- `hr1:t:<delivery_token_digest>` gains terminal phases: `state=nacked` with the recorded result (`result=retry_scheduled` + `message_id`, `attempt`, `retry_at_ms`, or `result=dead_lettered` + `message_id`, `delivery_cycle`, `dead_lettered_ms`) and `state=expired` (`message_id`, `expired_ms`); both TTL 1 hour, no plaintext token.
+- `hr1:op:<operation_id>` gains `kind=extend`: `args_digest` (over `operation_id` and the token digest), `state=completed`, `message_id`, `lease_expires_ms`, `max_lease_expires_ms`; TTL 10 minutes. A claim op record whose attempt ended by nack or expiry is rewritten to `state=no_longer_active` exactly as ack does.
+- `hr1:dl:<message_id>` dead-letter Hash (authoritative): `bot_platform`, `bot_id`, `recipient_scope`, `chat_id` (chat scope only), `user_id` (user scope only), `recipient_identity`, `dead_lettered_ms`, `dead_letter_reason` (`nack_exhausted` | `expiry_exhausted`), `delivery_cycle`, `dedup_identity_digest`. The blob `hr1:m:<message_id>` and history `hr1:a:<message_id>` are retained.
+- `hr1:dlq` ZSET, member `message_id`, score `dead_lettered_ms` (derived; also the retention index).
+- `hr1:mi:<message_id>` message index Hash (new authoritative key family): `dedup_identity_digest`. The dead-letter Hash must retain the original Deduplication Identity for replay conflict checks, and the Canonical Message blob (the public Consumer API message) carries no such field. **`accept_v2`** (replacing `accept_v1` in the registry) is `accept_v1` plus `HSET hr1:mi:<message_id> dedup_identity_digest <digest>` in the same writes; **`ack_v2`** is `ack_v1` plus deleting `hr1:mi` with the blob. The key is deleted wherever the blob is deleted (ack, DLQ expiry). M1-era messages without `hr1:mi` dead-letter with an empty `dedup_identity_digest`, and their replay is `not_conflicting`; reconciliation does not treat a missing `hr1:mi` as an inconsistency.
+- Memory and capacity: `hr1:dedup_age` gains early eviction (below); no new keys.
+
+### Lua script contracts (v1 unless amended)
+
+- **`nack_v1`** — KEYS: token record, `ready`, `ready_seq`, `leases`, `retries`, `blocked`, `dlq`, stats counter; per-recipient keys resolved from the token record (standalone precondition). ARGV: `delivery_token`, `token_digest`, `reason_code` (empty or bounded), `retry_delay_ms`, `max_attempts`, `tombstone_ttl_ms`, prefix. Preconditions in order: token absent → `not_found`; `state=nacked` → `already_nacked` + recorded result; `state=acknowledged` → `already_acknowledged`; `state=expired` → `stale`; marker → `recipient_blocked`; key types → `wrong_type`; token is the current unexpired leased head's token → else `stale`. Writes: append history entry (`outcome=nack`); if `attempt < max_attempts`: state → `retry_wait` (`attempt+1`, `retry_at_ms`), `leases` ZREM, `retries` ZADD; else the **dead-letter transition** (below, reason `nack_exhausted`); token record → `nacked` phase with the result; claim op → `no_longer_active`. Returns: `retry_scheduled` + `message_id`, `attempt` (the failed attempt), `retry_at_ms`, `recipient_identity`, `delivery_cycle` | `dead_lettered` + `message_id`, `delivery_cycle`, `dead_lettered_ms`, `recipient_identity`, `attempt` | `already_nacked` + recorded result fields | `already_acknowledged` | `not_found` | `stale` | `recipient_blocked` | `wrong_type`.
+- **Dead-letter transition** (shared Lua fragment in `nack_v1` and `expire_lease_v1`): HSET `hr1:dl:<message_id>` from the Recipient identity, the message index, and state; ZADD `dlq`; LPOP queue; DECR stats counter; expose the next head exactly like `ack_v1` (fresh `ready` state + `ready_seq`) or delete queue and state; remove `leases`/`retries` membership. Blob and history are retained.
+- **`expire_lease_v1`** — KEYS: `ready`, `ready_seq`, `leases`, `retries`, `blocked`, `dlq`, stats counter. ARGV: `recipient_identity`, `retry_delay_ms`, `max_attempts`, `tombstone_ttl_ms`, prefix. Preconditions: marker → `recipient_blocked` (also removes the stale `leases` member); state not `leased` or lease not due (`lease_expires_ms > TIME`) → `not_due` (removes a stale `leases` member whose state is not leased; leaves a not-yet-due one); key types → `wrong_type`. Writes: history entry (`outcome=expired`), token record → `expired` phase (resolved via the state's token digest), claim op → `no_longer_active`, then retry scheduling or the dead-letter transition (reason `expiry_exhausted`) as for nack. Returns: `retry_scheduled` + `message_id`, `attempt`, `retry_at_ms` | `dead_lettered` + `message_id`, `delivery_cycle`, `dead_lettered_ms` | `not_due` | `recipient_blocked` | `wrong_type`.
+- **`activate_retry_v1`** — KEYS: `ready`, `ready_seq`, `retries`, `blocked`. ARGV: `recipient_identity`, prefix. Preconditions: marker → `recipient_blocked` (removes the stale `retries` member); state not `retry_wait` or `retry_at_ms > TIME` → `not_due` (stale members removed as for expiry). Writes: state → `ready` (keeps `delivery_cycle`, `attempt`; clears `retry_at_ms`), `retries` ZREM, `ready` ZADD with fresh `ready_seq`. Returns: `activated` + `message_id`, `attempt` | `not_due` | `recipient_blocked` | `wrong_type`.
+- **`extend_v1`** — KEYS: token record, op record, `leases`. ARGV: `delivery_token`, `token_digest`, `operation_id`, `args_digest`, `extension_ms`, `max_lifetime_ms`, `op_ttl_ms`, prefix. Preconditions: op record exists → `operation_conflict` if `kind`/`args_digest` differ, else `replay` + recorded `lease_expires_ms`, `max_lease_expires_ms`; token absent → `not_found`; terminal token phase or not the current unexpired leased head → `stale`; marker → `recipient_blocked`; `lease_expires_ms ≥ attempt_started_ms + max_lifetime_ms` → `maximum_lease_lifetime_reached`. Writes: `lease_expires_ms = min(lease + extension_ms, attempt_started + max_lifetime)` in state, `leases` score, and the token record's active phase TTL; op record `kind=extend`. Returns: `extended` + `message_id`, `lease_expires_ms`, `max_lease_expires_ms` | `replay` + same | `operation_conflict` | `not_found` | `stale` | `recipient_blocked` | `maximum_lease_lifetime_reached` | `wrong_type`.
+- **`claim_v1` amendment (v2):** `claim_v2` writes `attempt_started_ms` and reads the claimed `attempt` from `retry_wait`-activated state unchanged (already the case); a `retry_wait` head in `ready` is a stale derived entry (dropped, like `leased`). Registered as a new script name so v1 contracts on persisted state stay explicit.
+- **`replay_dlq_v1`** — KEYS: `dlq`, `ready`, `ready_seq`, `retries`, `leases`, `blocked`, stats counter, audit Stream. ARGV: `message_id`, `resolution` (`reject` | `keep_current`), `event_id`, `request_id`, prefix. Preconditions: `hr1:dl` absent → `not_found`; blob missing → `message_missing`; Recipient marker → `recipient_blocked`; dedup record for `dedup_identity_digest` exists and points to another message → `deduplication_conflict` unless `keep_current`; key types → `wrong_type`. Writes: new cycle = `dl.delivery_cycle + 1`, `attempt=1`; if the head state is `leased` or `retry_wait`, `LINSERT` the message right after the head (`queue_position=after_active_head`); otherwise `LPUSH` it as the head, write fresh `ready` state, ZADD `ready` with fresh `ready_seq` (`queue_position=head`; any previously ready head keeps its queue position behind it); DEL `hr1:dl`, ZREM `dlq`; INCR stats counter; archive cycles beyond 10 in history; XADD audit `operation=dead_letter_replayed`, `target=<message_id>`. Returns: `replayed` + `delivery_cycle`, `queue_position`, `replayed_ms`, `deduplication_resolution` (`not_conflicting` | `kept_current`) | `not_found` | `message_missing` | `recipient_blocked` | `deduplication_conflict` | `wrong_type`.
+- **`clear_block_v1`** — KEYS: `ready`, `ready_seq`, `leases`, `retries`, `blocked`, audit Stream. ARGV: `recipient_identity`, `expected_detected_ms`, `expected_reason_code`, `event_id`, `request_id`, message check bound, prefix. Preconditions: marker absent → `not_found`; `detected_ms`/`reason_code` differ → `precondition_failed`; the same invariant checks as `reconcile_recipient_v1` (types, head invariant, head-state completeness, blobs within bound, status/deadline agreement) → `ambiguous` + first violated invariant. Writes: DEL marker, ZREM `blocked`, restore exactly the membership implied by state (`ready` with fresh sequence, `leases` with `lease_expires_ms`, `retries` with `retry_at_ms`, or none for an empty queue), XADD audit `operation=recipient_block_cleared`. Returns: `cleared` + restored index name | `not_found` | `precondition_failed` | `ambiguous` + invariant | `wrong_type`.
+- **`inspect_block`** is a read-only Go operation (no script): marker, queue length, bounded head-state fields (no token), head blob presence, index memberships, and the invariant list computed by the same rules.
+- **`expire_dlq_v1`** — KEYS: `dlq`, audit Stream. ARGV: `message_id`, `retention_ms`, `event_id`, prefix. Preconditions: `dead_lettered_ms + retention_ms > TIME` → `not_due`; `hr1:dl` absent → removes the stale `dlq` member, `stale`. Writes: DEL `hr1:dl`, `hr1:m`, `hr1:mi`, `hr1:a`; ZREM `dlq`; XADD audit `operation=dead_letter_expired`. Returns: `expired` | `not_due` | `stale` | `wrong_type`.
+- **`evict_dedup_v1`** — KEYS: `dedup_age`. ARGV: `max_records`, `min_retention_ms`, `batch`, prefix. Removes (record + member) the oldest live records while live count ≥ `max_records` and the oldest `accepted_ms ≤ TIME − min_retention_ms`, at most `batch` per call. Returns: `evicted` + count, `oldest_accepted_ms`, `live_records`.
+- **Reconciliation amendments (`reconcile_recipient_v2`, `reconcile_dlq_v1`):** `retry_wait` is a valid status (derived `retries` membership repaired to `retry_at_ms`); a due lease or due retry is reported as `due_lease` / `due_retry` with no mutation, and the Go reconciler then runs `expire_lease_v1` / `activate_retry_v1` for it before readiness (the M1 readiness hold is removed); `reconcile_dlq_v1` checks each DLQ entry: missing `hr1:dl` for a member → member removed; `hr1:dl` missing from `dlq` → restored with `dead_lettered_ms`; missing blob → the Recipient is blocked with `head_message_missing` semantics recorded as `dead_letter_message_missing`.
+
+### Maintenance
+
+- One cooperative loop per process, started after readiness: every `HOOKRELAY_MAINTENANCE_INTERVAL` (1 s) plus uniform jitter up to `HOOKRELAY_MAINTENANCE_INTERVAL_JITTER` (250 ms). Each round processes separate batches of due leases (`ZRANGEBYSCORE leases -inf now LIMIT 0 batch`), due retries, and expired DLQ entries, each at most `HOOKRELAY_MAINTENANCE_BATCH_SIZE` (100); a full batch triggers another batch up to `HOOKRELAY_MAINTENANCE_MAX_CONTINUOUS_BATCHES` (5), then the round yields. Each round also samples Valkey memory (`INFO memory`) and AOF state (`INFO persistence`) and runs one `evict_dedup_v1` batch when the dedup cap is reached.
+- Inline pre-poll pass: before a claim enters its waiting loop with an empty result, it runs at most 10 due lease expiries and retry activations, then rechecks once.
+- A panic in the maintenance loop is recovered at the loop seam, logged with a redacted stack, marks readiness false, and initiates shutdown (platform lifecycle contract).
+
+### Consumer API (M2 subset)
+
+- `POST /v1/deliveries/nack` `{delivery_token, reason_code?}`; `reason_code` ≤ 64 ASCII `[A-Za-z0-9_.:-]`; responses per the Consumer API contract (`retry_scheduled` / `dead_lettered`, recorded result on repeat, `409 delivery_already_acknowledged`, `409 stale_delivery_token`, `404 delivery_token_not_found`, `409 recipient_blocked`); request deadline 5 s.
+- `POST /v1/deliveries/extend` `{delivery_token, operation_id}`; responses per contract (`extended`, replay, `409 operation_conflict`, `409 stale_delivery_token`, `409 maximum_lease_lifetime_reached`); request deadline 5 s.
+- `POST /v1/deliveries/ack` after `nack` returns `409 delivery_already_nacked`; after expiry `409 stale_delivery_token` (M1 behavior, now through the `expired` phase).
+
+### Admin API and CLI (M2 subset)
+
+- `GET /admin/v1/dead-letters?limit&cursor` (metadata only, newest first, opaque base64url cursor over `dlq` score+member), `GET /admin/v1/dead-letters/{message_id}`, `POST /admin/v1/dead-letters/{message_id}/replay` (`deduplication_conflict_resolution` default `reject`), `GET /admin/v1/messages/{message_id}/delivery-state`, `GET /admin/v1/recipient-states?status=…&limit&cursor`, `POST /admin/v1/recipient-blocks/inspect`, `POST /admin/v1/recipient-blocks/clear`.
+- CLI: `hookrelay admin dlq list|get|replay`, `hookrelay admin message delivery-state`, `hookrelay admin recipients list|inspect-block|clear-block`. Replay and clear follow the M1 uncertain-outcome discipline (no blind retry; reconcile through delivery-state / inspect and report observed state with the audit caveat).
+- Payload inspection, permanent deletion, `operations/summary`, and the audit listing remain later milestones.
+
+### Ingestion protections
+
+- Token buckets: one global and one per Webhook Endpoint Identity (`HOOKRELAY_WEBHOOK_*_RATE`/`_BURST`; zero disables in development), checked after route resolution and before the in-flight semaphore and body read; exhaustion → `rate_limited` → Telegram `429` with `Retry-After` (seconds until a token, at least 1). Endpoint buckets are bounded (LRU of at most 10,000 endpoints).
+- Memory stop: acceptance stops when `used_memory ≥ HOOKRELAY_MEMORY_ACCEPTANCE_STOP_PERCENT` of `maxmemory` (maxmemory 0 = no stop), evaluated by the maintenance sample and the acceptance probe; `/health/ready` unaffected.
+- Deduplication early eviction per `evict_dedup_v1`; `dedup_capacity` rejection remains only when eviction cannot free a record without violating the minimum window.
+
+### Reconciliation
+
+Startup and recovery passes additionally validate `retry_wait` state, `retries` membership, and the DLQ (above); due leases and retries found by reconciliation are processed through `expire_lease_v1` / `activate_retry_v1` before readiness; unhandled inconsistencies still hold readiness.
+
+### Observability (M2 additions)
+
+Metrics: `hookrelay_delivery_attempts_total{recipient_scope,outcome}` with `nack`, `expired`, `dead_lettered`; `hookrelay_delivery_attempt_duration_seconds{recipient_scope,outcome}`; `hookrelay_retries_waiting`; `hookrelay_dead_letter_messages`; `hookrelay_dead_letters_total{recipient_scope,reason}`; `hookrelay_dead_letter_replays_total{outcome}`; `hookrelay_oldest_ready_message_age_seconds`; `hookrelay_maintenance_processed_total{kind,result}`, `hookrelay_maintenance_due_lag_seconds{kind}`, `hookrelay_maintenance_batch_size{kind}`, `hookrelay_maintenance_duration_seconds{kind}`; `hookrelay_valkey_aof_enabled`, `hookrelay_valkey_aof_delayed_fsync_total`, `hookrelay_valkey_memory_used_bytes`, `hookrelay_valkey_memory_max_bytes`; `hookrelay_dedup_oldest_record_age_seconds`, `hookrelay_dedup_effective_retention_seconds`, `hookrelay_dedup_early_evictions_total`. Feature events: `delivery_nacked`, `delivery_lease_extended`, `delivery_lease_expired`, `delivery_dead_lettered`, `delivery_replayed`.
+
+## Testing Decisions
+
+Same three layers and discipline as Milestone 1: storage-seam tests for every script (every tuple, every affected key, snapshot-equal state on refusals, arity/argument rejection, `SCRIPT FLUSH` reload); HTTP-seam unit tests with fakes; composed integration over real Valkey; tolerant timing windows for maintenance and retry delays (tests configure short delays). The Compose smoke gains the failure path: nack three times with retries observed, fourth failure → DLQ via CLI list, replay via CLI, claim the replayed message with `delivery_cycle=2`, ack, and restart recovery of a lease left expired across the restart.
+
+## Out of Scope
+
+- DLQ payload inspection, permanent deletion, `operations/summary`, audit listing, browser sessions, UI (later milestones).
+- Notification-based long-poll wake-up; periodic consistency checking while serving; multi-process deployment validation.
+- Admin Webhook Endpoint CRUD beyond create/get.
+- Image publishing to a registry (a release decision outside this spec).
+
+## Further Notes
+
+- `hr1:mi:<message_id>` is the one new authoritative key family; it exists because the dead-letter Hash must retain the Deduplication Identity for replay conflict checks and the M1 blob contract carries no such field. Alternative considered: adding `dedup_identity_digest` to the Canonical Message JSON — rejected because the blob is the public Consumer API message.
+- `accept_v2`, `ack_v2`, `claim_v2`, and `reconcile_recipient_v2` replace their v1 names in the registry; the v1 files remain until no persisted-state dependency exists, per the script versioning policy.
