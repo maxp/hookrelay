@@ -87,7 +87,7 @@ func init() {
 		"recipient_blocked": 0,
 		"wrong_type":        0,
 	})
-	register("reconcile_recipient_v1", 1, map[string]int{
+	register("reconcile_recipient_v2", 2, map[string]int{
 		// repairs, queue_length, reason
 		"consistent":      3,
 		"repaired":        3,
@@ -95,7 +95,13 @@ func init() {
 		"already_blocked": 3,
 		"drained":         3,
 		"due_lease":       3,
+		"due_retry":       3,
 		"unhandled":       3,
+	})
+	register("reconcile_dlq_v1", 1, map[string]int{
+		// message id lists: orphans removed, restored, invalid, missing
+		"reconciled": 4,
+		"wrong_type": 0,
 	})
 	register("reconcile_dedup_v1", 1, map[string]int{
 		"reconciled": 4, // expired_removed, restored, orphans_removed, skipped

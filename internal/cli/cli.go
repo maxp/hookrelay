@@ -257,11 +257,11 @@ func Serve(args []string) int {
 	}
 
 	reconcile := func(ctx context.Context, full bool) (app.ReconcileResult, error) {
-		report, err := adapter.Reconcile(ctx, valkey.ReconcileOptions{
+		report, err := adapter.ReconcileAndProcessDue(ctx, valkey.ReconcileOptions{
 			Full:              full,
 			MessageCheckBound: cfg.MaxQueuedMessagesPerRecipient,
 			Logger:            log,
-		})
+		}, maintenance.ProcessDue)
 		findings := report.Findings
 		for reason, n := range report.BlockReasons {
 			findings["blocked_"+reason] = n

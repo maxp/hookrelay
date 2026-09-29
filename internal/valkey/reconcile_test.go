@@ -255,22 +255,11 @@ func TestReconcileBlocksEachReason(t *testing.T) {
 	}
 }
 
-// TestReconcileRefusals pins the due-lease hold without mutation and the
-// unhandled refusal.
+// TestReconcileRefusals pins the unhandled refusal.
 func TestReconcileRefusals(t *testing.T) {
 	a, _ := consistentState(t)
-	a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "lease_expires_ms", "1")
-	a.testDo(t, "ZADD", "hr1:leases", "1", ridA)
-	before := snapshot(t, a)
-	rep := reconcile(t, a, false)
-	if rep.Hold() != "due_lease" || rep.Findings["due_lease"] != 1 {
-		t.Errorf("due lease report = %+v", rep.Findings)
-	}
-	assertUnchanged(t, a, before, "due lease")
-
-	a, _ = consistentState(t)
 	a.testDo(t, "SET", "hr1:q:"+ridB, "not-a-hash")
-	rep = reconcile(t, a, true)
+	rep := reconcile(t, a, true)
 	if rep.Hold() != "unhandled_inconsistency" || rep.Findings["counter_unverified"] != 1 {
 		t.Errorf("unhandled report = %+v", rep.Findings)
 	}

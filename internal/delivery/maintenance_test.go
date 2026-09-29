@@ -393,3 +393,28 @@ func TestMaintenanceExpiryOutcomes(t *testing.T) {
 		t.Errorf("dead_letters_total{expiry_exhausted} = %v", got)
 	}
 }
+
+// TestMaintenanceProcessDue pins the reconciliation hand-off: the named due
+// leases are expired and the named due retries activated through the same
+// transitions, events, and metrics as a maintenance round.
+func TestMaintenanceProcessDue(t *testing.T) {
+	expirer := &fakeExpirer{}
+	activator := &fakeActivator{}
+	mh := newExpiryHarness(t, activator, expirer, nil)
+	mh.m.ProcessDue(context.Background(), []string{"telegram:42:chat:1", "telegram:42:chat:2"}, []string{"telegram:42:chat:3"})
+	if len(expirer.expired) != 2 || expirer.expired[1] != "telegram:42:chat:2" || len(activator.activated) != 1 {
+		t.Fatalf("expired %v, activated %v", expirer.expired, activator.activated)
+	}
+	if len(expirer.reads) != 0 || len(activator.reads) != 0 {
+		t.Error("ProcessDue read the due indexes instead of using the named Recipients")
+	}
+	if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": "lease_expiry", "result": "applied"}); got != 2 {
+		t.Errorf("processed{lease_expiry,applied} = %v", got)
+	}
+	if got := mh.value(t, "hookrelay_maintenance_processed_total", map[string]string{"kind": "retry_activation", "result": "applied"}); got != 1 {
+		t.Errorf("processed{retry_activation,applied} = %v", got)
+	}
+	if n := bytes.Count(mh.logs.Bytes(), []byte(`"event":"delivery_lease_expired"`)); n != 2 {
+		t.Errorf("delivery_lease_expired events = %d", n)
+	}
+}

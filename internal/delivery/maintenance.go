@@ -157,6 +157,23 @@ func (m *Maintenance) RunRound(ctx context.Context) {
 	m.runKind(ctx, kindRetryActivation, m.d.Retries.DueRetries, m.activateRetry)
 }
 
+// ProcessDue expires the named due leases and activates the named due
+// retries through the same transitions, events, and metrics as a round.
+// Startup reconciliation reports these Recipients (without mutating them)
+// and hands them over before readiness. Each transition re-validates
+// state, so a Recipient that is no longer due is counted as stale.
+func (m *Maintenance) ProcessDue(ctx context.Context, leases, retries []string) {
+	for _, set := range []struct {
+		kind    string
+		rids    []string
+		process func(context.Context, DueEntry) maintenanceResult
+	}{{kindLeaseExpiry, leases, m.expireLease}, {kindRetryActivation, retries, m.activateRetry}} {
+		for _, rid := range set.rids {
+			m.processOne(ctx, set.kind, set.process, DueEntry{RecipientIdentity: rid})
+		}
+	}
+}
+
 // runKind runs the continuous batches of one maintenance kind. process
 // applies one transition and returns its bounded result label.
 func (m *Maintenance) runKind(ctx context.Context, kind string, read func(context.Context, int) (DueBatch, error),
@@ -191,14 +208,19 @@ func (m *Maintenance) batch(ctx context.Context, kind string, first bool, read f
 		m.dueLag.WithLabelValues(kind).Set(lag)
 	}
 	for _, e := range batch.Entries {
-		opCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
-		result := process(opCtx, e)
-		cancel()
-		m.processed.WithLabelValues(kind, string(result)).Inc()
+		m.processOne(ctx, kind, process, e)
 	}
 	m.batchSize.WithLabelValues(kind).Observe(float64(len(batch.Entries)))
 	m.duration.WithLabelValues(kind).Observe(m.d.Clock.Now().Sub(start).Seconds())
 	return len(batch.Entries), true
+}
+
+// processOne applies one transition with its own deadline and counts its
+// result.
+func (m *Maintenance) processOne(ctx context.Context, kind string, process func(context.Context, DueEntry) maintenanceResult, e DueEntry) {
+	opCtx, cancel := context.WithTimeout(ctx, maintenanceOpTimeout)
+	defer cancel()
+	m.processed.WithLabelValues(kind, string(process(opCtx, e))).Inc()
 }
 
 // activateRetry applies one retry activation.

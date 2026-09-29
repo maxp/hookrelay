@@ -74,7 +74,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/ingestion` — webhook pipeline and the Telegram adapter;
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v3`, `ack_v3`, `nack_v2`, `expire_lease_v2`, `activate_retry_v1`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v3`, `ack_v3`, `nack_v2`, `expire_lease_v2`, `activate_retry_v1`, `reconcile_recipient_v2`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`), readiness gate, endpoint store, message acceptance;
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -129,13 +129,20 @@ full gate passes again.
 Before readiness (and again after Valkey recovers) hookrelay reconciles
 persisted state in bounded `SCAN`/`ZSCAN` batches: it validates Webhook
 Endpoints, Bot Identity sets, and global index types, holds readiness on
-malformed live deduplication records, repairs derived ready, lease, blocked,
-and deduplication indexes and (at startup) the queued-message
+malformed live deduplication records, repairs derived ready, lease, retry,
+blocked, DLQ, and deduplication indexes and (at startup) the queued-message
 counter, and isolates any Recipient whose queue or head state is ambiguous
 behind a persistent block marker (`hr1:q:<recipient>`) while every other
-Recipient serves normally. Authoritative state is never rewritten. A lease
-already past its deadline, or state that cannot be isolated, holds readiness
-false (`"startup_reconciliation":"held"` in `/health/ready`). Progress is
+Recipient serves normally. Authoritative state is never rewritten. Leases
+already past their deadline are expired and due retries activated through
+the normal transitions (with their events and metrics) before readiness,
+followed by a verifying pass. State that cannot be isolated holds readiness
+false (`"startup_reconciliation":"held"` in `/health/ready`), and so does a
+dead-letter entry whose Canonical Message is missing
+(`reason_code=dead_letter_message_missing`; each such entry is logged as
+`dead_letter_message_missing` with its `message_id`) — never a Recipient
+block, because clearing a block cannot certify DLQ integrity; recovery is a
+reviewed incident correction followed by a restart. Progress is
 exported as `hookrelay_reconciliation_in_progress` and
 `hookrelay_consistency_issues_total{kind,resolution}`; each block, hold, and
 repair is logged, and repairs and blocks are audited best effort.
@@ -148,11 +155,6 @@ Milestone 1 has no clear or repair operation yet. Diagnosis is read-only:
   clear operation of the
   [Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md)
   ships with the Admin block routes. Do not delete the marker by hand.
-- **Readiness held by a due lease** (`reconciliation_hold` log,
-  `reason_code=due_lease`): Milestone 1 deliberately invents no expiry. The
-  hold ends when the Milestone 2 lease-expiry transition processes the
-  lease; until then recovery requires a reviewed incident procedure, not ad
-  hoc Valkey edits.
 
 ## Webhook ingestion
 
