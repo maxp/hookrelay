@@ -1,6 +1,7 @@
 package administration
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -97,7 +98,7 @@ func TestAuthContract(t *testing.T) {
 // rejected-authentication appends: a failed append is counted and the
 // response stays the uniform 401.
 func TestRejectedAuthAuditMetrics(t *testing.T) {
-	svc, audit, _, reg := observedService(t, newFakeRepo())
+	svc, audit, logs, reg := observedService(t, newFakeRepo())
 	h := Handler(svc)
 
 	doJSON(t, h, http.MethodGet, "/admin/v1/webhooks/telegram/wh_x", "wrong-secret-00000000001", "")
@@ -113,6 +114,18 @@ func TestRejectedAuthAuditMetrics(t *testing.T) {
 	if got := counterValue(t, reg, "hookrelay_audit_write_failures_total", map[string]string{"operation": "admin_auth_rejected"}); got != 1 {
 		t.Errorf("audit write failures = %v, want 1", got)
 	}
+	for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n")) {
+		var event map[string]any
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatal(err)
+		}
+		if event["event"] != "administrative_audit" || event["operation"] != "admin_auth_rejected" || event["outcome"] != "failure" || event["event_id"] == "" || event["timestamp_ms"] == nil {
+			t.Errorf("rejected-auth audit stdout = %v", event)
+		}
+	}
+	if strings.Contains(logs.String(), "wrong-secret-00000000001") {
+		t.Error("rejected secret leaked to stdout audit")
+	}
 }
 
 // TestCreateFeatureEventAndAuditMetric pins the webhook_endpoint_created
@@ -127,9 +140,28 @@ func TestCreateFeatureEventAndAuditMetric(t *testing.T) {
 	if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "webhook_endpoint_created", "outcome": "success"}); got != 1 {
 		t.Errorf("audit events = %v, want 1", got)
 	}
-	var event map[string]any
-	if err := json.Unmarshal(logs.Bytes(), &event); err != nil {
-		t.Fatalf("feature event is not one JSON record: %v (%s)", err, logs.String())
+	lines := bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n"))
+	if len(lines) != 2 {
+		t.Fatalf("create emitted %d records, want audit + feature: %s", len(lines), logs.String())
+	}
+	var auditEvent, event map[string]any
+	if err := json.Unmarshal(lines[0], &auditEvent); err != nil {
+		t.Fatal(err)
+	}
+	for field, want := range map[string]any{
+		"event": "administrative_audit", "event_id": "0195-uuid", "actor": "admin_bearer",
+		"operation": "webhook_endpoint_created", "target": "telegram:wh_AAAAAAAAAAAAAAAAAAAAAA",
+		"request_id": "0195-uuid", "outcome": "success",
+	} {
+		if auditEvent[field] != want {
+			t.Errorf("audit stdout %s = %v, want %v", field, auditEvent[field], want)
+		}
+	}
+	if auditEvent["timestamp_ms"] == nil {
+		t.Error("audit stdout missing timestamp_ms")
+	}
+	if err := json.Unmarshal(lines[1], &event); err != nil {
+		t.Fatal(err)
 	}
 	for field, want := range map[string]any{
 		"event":              "webhook_endpoint_created",

@@ -79,13 +79,15 @@ func (s *Service) CreateWebhook(ctx context.Context, req CreateRequest, requestI
 		CredentialValue: req.Credential.Value,
 		GenerationID:    s.gen.UUIDv7(),
 	}
-	createdMs, updatedMs, result := s.repo.CreateEndpoint(ctx, e, s.gen.UUIDv7(), opWebhookEndpointCreated, requestID)
+	eventID := s.gen.UUIDv7()
+	createdMs, updatedMs, result := s.repo.CreateEndpoint(ctx, e, eventID, opWebhookEndpointCreated, requestID)
 	switch result {
 	case CreateOK:
 		e.CreatedMs = createdMs
 		e.UpdatedMs = updatedMs
 		e.ConfigVersion = 1 // fixed by the endpoint_create_v1 contract
 		s.metrics.auditEvents.WithLabelValues(opWebhookEndpointCreated, outcomeSuccess).Inc()
+		s.logAudit(eventID, opWebhookEndpointCreated, e.Type+":"+e.Identifier, requestID, outcomeSuccess)
 		observability.LogEvent(s.log, slog.LevelInfo, opWebhookEndpointCreated, "webhook endpoint created",
 			"request_id", requestID,
 			"webhook_type", e.Type,
@@ -127,14 +129,30 @@ func (s *Service) logCreateFailure(requestID string, e Endpoint, reason string) 
 // recordRejectedAuth appends the best-effort rejected-authentication audit
 // event and counts its outcome. It never changes the refusal.
 func (s *Service) recordRejectedAuth(ctx context.Context, requestID string) {
+	eventID := s.gen.UUIDv7()
+	s.logAudit(eventID, opAdminAuthRejected, "admin_api", requestID, outcomeFailure)
 	if s.audit == nil {
 		return
 	}
-	if err := s.audit.AppendRejectedAuth(ctx, s.gen.UUIDv7(), requestID, "admin_api"); err != nil {
+	if err := s.audit.AppendRejectedAuth(ctx, eventID, requestID, "admin_api"); err != nil {
 		s.metrics.auditWriteFailures.WithLabelValues(opAdminAuthRejected).Inc()
 		return
 	}
 	s.metrics.auditEvents.WithLabelValues(opAdminAuthRejected, outcomeFailure).Inc()
+}
+
+// logAudit is the best-effort stdout copy of an administrative audit event.
+// It shares its identity with the Valkey Stream entry but carries only bounded
+// metadata. The log handler provides the millisecond timestamp envelope.
+func (s *Service) logAudit(eventID, operation, target, requestID, outcome string) {
+	observability.LogEvent(s.log, slog.LevelInfo, "administrative_audit", "administrative audit event",
+		"event_id", eventID,
+		"actor", "admin_bearer",
+		"operation", operation,
+		"target", target,
+		"request_id", requestID,
+		"outcome", outcome,
+	)
 }
 
 // GetWebhook returns the safe read model for one endpoint. The Bot Platform

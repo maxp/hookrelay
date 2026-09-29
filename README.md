@@ -75,7 +75,6 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
 - `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v1`, `claim_v1`, `ack_v1`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
-- `internal/ingestion` — Webhook Type registry (verification and conversion seams);
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -128,8 +127,10 @@ The gate re-runs every second; losing Valkey withdraws readiness until the
 full gate passes again.
 
 Before readiness (and again after Valkey recovers) hookrelay reconciles
-persisted state in bounded `SCAN`/`ZSCAN` batches: it repairs derived ready,
-lease, blocked, and deduplication indexes and (at startup) the queued-message
+persisted state in bounded `SCAN`/`ZSCAN` batches: it validates Webhook
+Endpoints, Bot Identity sets, and global index types, holds readiness on
+malformed live deduplication records, repairs derived ready, lease, blocked,
+and deduplication indexes and (at startup) the queued-message
 counter, and isolates any Recipient whose queue or head state is ambiguous
 behind a persistent block marker (`hr1:q:<recipient>`) while every other
 Recipient serves normally. Authoritative state is never rewritten. A lease

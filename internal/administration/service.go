@@ -75,7 +75,7 @@ type ServiceDeps struct {
 	// configuration layer.
 	AdminSecret string
 	Gen         gen.Gen
-	// Logger receives feature events; nil discards them.
+	// Logger receives feature events and best-effort audit copies; nil discards them.
 	Logger *slog.Logger
 	// Registerer receives the administrative audit metrics; nil keeps them
 	// on a private registry.

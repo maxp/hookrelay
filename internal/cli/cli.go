@@ -222,6 +222,7 @@ func Serve(args []string) int {
 		report, err := adapter.Reconcile(ctx, valkey.ReconcileOptions{
 			Full:              full,
 			MessageCheckBound: cfg.MaxQueuedMessagesPerRecipient,
+			Logger:            log,
 		})
 		findings := report.Findings
 		for reason, n := range report.BlockReasons {
