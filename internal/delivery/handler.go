@@ -228,6 +228,13 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 		// rechecks under the same operation_id never replay an early empty.
 		claimReq.RecordEmpty = final
 		res := h.d.Claimer.Claim(ctx, claimReq)
+		if res.Outcome == ClaimDependencyUnavailable && r.Context().Err() != nil {
+			// The client left while the check ran; its failure is the
+			// cancellation, not a Valkey outage. A lease the check may have
+			// created is recovered by repeating the same operation_id.
+			h.metrics.claims.WithLabelValues("cancelled").Inc()
+			return
+		}
 		if res.Outcome != ClaimEmpty || final {
 			h.respondClaim(w, c, req.OperationID, res)
 			return

@@ -256,3 +256,46 @@ func TestLongPollShutdown(t *testing.T) {
 	}
 	ph.h.Shutdown() // idempotent
 }
+
+// ctxAwareClaimer blocks inside the check until its context ends and then
+// fails like a cancelled Valkey call.
+type ctxAwareClaimer struct{ entered chan struct{} }
+
+func (c *ctxAwareClaimer) Claim(ctx context.Context, _ ClaimRequest) ClaimResult {
+	close(c.entered)
+	<-ctx.Done()
+	return ClaimResult{Outcome: ClaimDependencyUnavailable}
+}
+
+// TestClientCancelDuringCheck pins that a client leaving while a check is
+// in flight is a cancellation, not a dependency failure: no response body,
+// no error log, and the cancelled outcome is counted.
+func TestClientCancelDuringCheck(t *testing.T) {
+	ph := newPollHarness(t, HandlerDeps{}, alwaysEmpty)
+	blocker := &ctxAwareClaimer{entered: make(chan struct{})}
+	ph.h.d.Claimer = blocker
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- ph.claim(ctx, "0") }()
+	<-blocker.entered
+	cancel()
+	w := <-result
+	if w.Body.Len() != 0 {
+		t.Errorf("cancelled check wrote a response: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(ph.logs.String(), "delivery_claim_failed") {
+		t.Errorf("cancellation logged as a failure: %s", ph.logs.String())
+	}
+	families, _ := ph.reg.Gather()
+	counts := map[string]float64{}
+	for _, f := range families {
+		if f.GetName() == "hookrelay_delivery_claims_total" {
+			for _, m := range f.GetMetric() {
+				counts[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+			}
+		}
+	}
+	if counts["cancelled"] != 1 || counts["dependency_unavailable"] != 0 {
+		t.Errorf("claim outcomes = %v", counts)
+	}
+}
