@@ -101,6 +101,7 @@ delivery_cycle
 attempt
 delivery_token
 claimed_ms
+attempt_started_ms
 lease_expires_ms
 retry_at_ms
 consumer_instance_id
@@ -111,6 +112,10 @@ The required invariant is:
 ```text
 state.head_message_id == LINDEX(queue, 0)
 ```
+
+`attempt_started_ms` is written by claim with `claimed_ms`; lease extension uses it as the base of the maximum lease lifetime. A lease claimed before the field existed has no `attempt_started_ms`.
+
+Acceptance also writes the message metadata Hash `hr1:mi:<message_id>` with `dedup_identity_digest`, because the dead-letter record must keep the Deduplication Identity for replay conflict checks and the Canonical Message blob is the public Consumer API message. The metadata key is deleted wherever the blob is deleted. Messages accepted before the key existed have none; reconciliation does not treat its absence as an inconsistency.
 
 Only the queue head has active delivery state. A replay may insert a previously dead-lettered message behind a leased or retry-wait head, or preempt a ready head whose attempt is already greater than one. The new `hr1:mi:<message_id>` metadata Hash holds `pending_delivery_cycle` and `pending_attempt` for any such non-head message until it becomes head; the head-advance transition restores and removes the pending pair. This preserves Delivery Cycle and Attempt across replay without making non-head messages active. A queued message with completed attempt history but no valid saved pair must not silently become cycle 1, attempt 1. Every transition affecting the List, state, and derived indexes is atomic.
 

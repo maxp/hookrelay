@@ -63,8 +63,11 @@ func TestAckWithNextHead(t *testing.T) {
 	if ttl, _ := a.client.Do(ctx, a.client.B().Pttl().Key(success).Build()).AsInt64(); ttl <= 0 || ttl > SuccessTTL.Milliseconds() {
 		t.Errorf("success TTL = %d", ttl)
 	}
-	if exists(t, a, "hr1:m:m1") || exists(t, a, "hr1:a:m1") {
-		t.Error("acknowledged blob or history kept")
+	if exists(t, a, "hr1:m:m1") || exists(t, a, "hr1:mi:m1") || exists(t, a, "hr1:a:m1") {
+		t.Error("acknowledged blob, metadata, or history kept")
+	}
+	if got := hget(t, a, "hr1:mi:m2", "dedup_identity_digest"); got != "d-m2" {
+		t.Errorf("next head metadata dedup_identity_digest = %q, want kept", got)
 	}
 	queue, _ := a.client.Do(ctx, a.client.B().Lrange().Key("hr1:r:"+ridA+":q").Start(0).Stop(-1).Build()).AsStrSlice()
 	if len(queue) != 1 || queue[0] != "m2" {
@@ -147,6 +150,22 @@ func TestAckDrainsQueue(t *testing.T) {
 	assertUnchanged(t, a, before, "repeated ack")
 }
 
+// TestAckMessageWithoutMetadata pins that a message accepted before the
+// message metadata key existed (M1 era) still acknowledges normally.
+func TestAckMessageWithoutMetadata(t *testing.T) {
+	a, s := claimSetup(t)
+	ctx := context.Background()
+	enqueueJSON(t, a, "m1", ridA)
+	a.testDo(t, "DEL", "hr1:mi:m1")
+	s.Claim(ctx, claimReq("op-1", "args", "dlv_token1"))
+	if r := s.Ack(ctx, ackReq("dlv_token1")); r.Outcome != delivery.AckAcknowledged || r.MessageID != "m1" {
+		t.Fatalf("ack = %+v", r)
+	}
+	if exists(t, a, "hr1:m:m1") || exists(t, a, "hr1:mi:m1") {
+		t.Error("acknowledged blob or metadata kept")
+	}
+}
+
 // TestAckRefusals pins not_found, stale, recipient_blocked, and wrong_type
 // with no mutation.
 func TestAckRefusals(t *testing.T) {
@@ -164,6 +183,10 @@ func TestAckRefusals(t *testing.T) {
 			a.testDo(t, "HSET", "hr1:q:"+ridA, "detected_ms", "1", "reason_code", "queue_head_mismatch")
 		}, "dlv_token1", delivery.AckRecipientBlocked},
 		{"wrong type", func(a *Adapter) { a.testDo(t, "SET", "hr1:success:m1", "x") }, "dlv_token1", delivery.AckInternalFailure},
+		{"wrong type metadata", func(a *Adapter) {
+			a.testDo(t, "DEL", "hr1:mi:m1")
+			a.testDo(t, "SET", "hr1:mi:m1", "x")
+		}, "dlv_token1", delivery.AckInternalFailure},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,7 +255,7 @@ func TestAckArguments(t *testing.T) {
 		"zero ttl":        with(3, "0"),
 		"digest mismatch": with(1, "other"),
 	} {
-		if _, err := a.RunScript(ctx, "ack_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "ack_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

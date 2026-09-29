@@ -61,6 +61,31 @@ func TestReconcileConsistentStateIsNoOp(t *testing.T) {
 	assertUnchanged(t, a, before, "consistent reconcile")
 }
 
+// TestReconcileAcceptsMixedV1AndV2Data pins the upgrade path: messages
+// accepted before the message metadata key existed and a lease claimed
+// before attempt_started_ms existed sit beside v2 data without findings,
+// repairs, or a readiness hold.
+func TestReconcileAcceptsMixedV1AndV2Data(t *testing.T) {
+	a, _ := consistentState(t)
+	if !exists(t, a, "hr1:mi:a2") || hget(t, a, "hr1:r:"+ridA+":s", "attempt_started_ms") == "" {
+		t.Fatal("setup did not produce v2 data")
+	}
+	a.testDo(t, "DEL", "hr1:mi:a1", "hr1:mi:b1")
+	a.testDo(t, "HDEL", "hr1:r:"+ridA+":s", "attempt_started_ms")
+	before := snapshot(t, a)
+	rep := reconcile(t, a, true)
+	if rep.Hold() != "" || rep.Recipients != 2 {
+		t.Errorf("report = %+v", rep)
+	}
+	for kind, n := range rep.Findings {
+		if n != 0 {
+			t.Errorf("finding %s = %d on mixed v1/v2 state", kind, n)
+		}
+	}
+	assertUnchanged(t, a, before, "mixed v1/v2 reconcile")
+	gate(t, a, false)
+}
+
 // TestReconcileRepairsDerivedStructures pins each derived repair.
 func TestReconcileRepairsDerivedStructures(t *testing.T) {
 	cases := []struct {

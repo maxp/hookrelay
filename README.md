@@ -74,7 +74,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/ingestion` — webhook pipeline and the Telegram adapter;
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v1`, `claim_v1`, `ack_v1`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v2`, `ack_v2`, `reconcile_*_v1`), readiness gate, endpoint store, message acceptance;
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -162,7 +162,7 @@ with the endpoint's `secret_token`). The pipeline resolves the route,
 verifies the `X-Telegram-Bot-Api-Secret-Token` header (and the optional
 `HOOKRELAY_TELEGRAM_SOURCE_CIDRS` allowlist), converts the update into a
 Canonical Message for its chat, user, bot, or relay Recipient, and runs one
-atomic `accept_v1` transition that deduplicates and queues it.
+atomic `accept_v2` transition that deduplicates and queues it.
 
 - Accepted and duplicate updates both receive an empty `200`, returned only
   after Valkey commits or proves the duplicate. A repeated `update_id` with
@@ -194,8 +194,12 @@ atomic `accept_v1` transition that deduplicates and queues it.
   `hookrelay_webhook_inflight`, `hookrelay_dedup_records`,
   `hookrelay_dedup_record_capacity`, and `hookrelay_accepting_webhooks`.
 
-Storage keys, the `accept_v1` contract, and capacity limits are specified in
-[`.scratch/milestone-1/spec.md`](.scratch/milestone-1/spec.md) and
+Storage keys and capacity limits are specified in
+[`.scratch/milestone-1/spec.md`](.scratch/milestone-1/spec.md) (the v1
+transition contracts) and
+[`.scratch/milestone-2/spec.md`](.scratch/milestone-2/spec.md) (the v2
+amendments: `accept_v2` and `ack_v2` maintain the `hr1:mi:<message_id>`
+message metadata; `claim_v2` records `attempt_started_ms`); see also
 [`docs/design/storage.md`](docs/design/storage.md).
 
 ## Consumer API

@@ -13,9 +13,9 @@ import (
 // label; non-script reads use endpoint_read.
 var scriptOperations = map[string]string{
 	"endpoint_create_v1":     "endpoint_create",
-	"accept_v1":              "accept",
-	"claim_v1":               "claim",
-	"ack_v1":                 "acknowledgement",
+	"accept_v2":              "accept",
+	"claim_v2":               "claim",
+	"ack_v2":                 "acknowledgement",
 	"reconcile_recipient_v1": "reconciliation",
 	"reconcile_dedup_v1":     "reconciliation",
 	"reconcile_counter_v1":   "reconciliation",

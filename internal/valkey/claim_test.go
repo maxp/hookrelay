@@ -26,7 +26,7 @@ func claimReq(op, args, token string) delivery.ClaimRequest {
 	return delivery.ClaimRequest{OperationID: op, ArgsDigest: args, Token: token, TokenDigest: hex.EncodeToString(sum[:]), RecordEmpty: true}
 }
 
-// enqueue accepts one message for a recipient through accept_v1.
+// enqueue accepts one message for a recipient through accept_v2.
 func enqueue(t *testing.T, a *Adapter, messageID, rid string) {
 	t.Helper()
 	r := acceptReq(messageID, "d-"+messageID, "b-"+messageID)
@@ -75,7 +75,8 @@ func TestClaimClaimedAndKeys(t *testing.T) {
 	state := "hr1:r:" + ridA + ":s"
 	for field, want := range map[string]string{
 		"status": "leased", "delivery_token": "dlv_token1", "head_message_id": "m1",
-		"claimed_ms": itoa64(d.ClaimedMs), "lease_expires_ms": itoa64(d.LeaseExpiresMs), "consumer_instance_id": "worker-1",
+		"claimed_ms": itoa64(d.ClaimedMs), "attempt_started_ms": itoa64(d.ClaimedMs),
+		"lease_expires_ms": itoa64(d.LeaseExpiresMs), "consumer_instance_id": "worker-1",
 	} {
 		if got := hget(t, a, state, field); got != want {
 			t.Errorf("state %s = %q, want %q", field, got, want)
@@ -209,12 +210,15 @@ func TestClaimBlocksInconsistentCandidates(t *testing.T) {
 		}, "unsupported_key_type"},
 		{"head state missing", func(a *Adapter) { a.testDo(t, "DEL", "hr1:r:"+ridA+":s") }, "head_state_missing"},
 		{"head mismatch", func(a *Adapter) { a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "head_message_id", "other") }, "queue_head_mismatch"},
-		{"unknown status", func(a *Adapter) { a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "status", "retry_wait") }, "queue_head_mismatch"},
+		{"unknown status", func(a *Adapter) { a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "status", "unknown") }, "queue_head_mismatch"},
 		{"head blob missing", func(a *Adapter) { a.testDo(t, "DEL", "hr1:m:m1") }, "head_message_missing"},
 		{"drained queue", func(a *Adapter) {
 			a.testDo(t, "DEL", "hr1:r:"+ridA+":q", "hr1:r:"+ridA+":s")
 		}, ""},
 		{"leased head in ready", func(a *Adapter) { a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "status", "leased") }, ""},
+		{"retry_wait head in ready", func(a *Adapter) {
+			a.testDo(t, "HSET", "hr1:r:"+ridA+":s", "status", "retry_wait", "retry_at_ms", "4102444800000")
+		}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -301,7 +305,7 @@ func TestClaimWrongTypeAndArguments(t *testing.T) {
 		"bad flag":        with(8, "yes"),
 		"prefix mismatch": with(9, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "claim_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "claim_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

@@ -13,13 +13,13 @@ import (
 // ClaimOpTTL is the fixed claim operation record retention.
 const ClaimOpTTL = 10 * time.Minute
 
-// ClaimLimits are the lease bounds passed to claim_v1.
+// ClaimLimits are the lease bounds passed to claim_v2.
 type ClaimLimits struct {
 	MaxActiveLeases      int
 	InitialLeaseDuration time.Duration
 }
 
-// DeliveryStore implements delivery.Claimer with claim_v1 and
+// DeliveryStore implements delivery.Claimer with claim_v2 and
 // delivery.StatsReader for the delivery gauges.
 type DeliveryStore struct {
 	a      *Adapter
@@ -36,7 +36,7 @@ func (s *DeliveryStore) Claim(ctx context.Context, req delivery.ClaimRequest) de
 	if req.RecordEmpty {
 		recordEmpty = "1"
 	}
-	res, err := s.a.RunScript(ctx, "claim_v1",
+	res, err := s.a.RunScript(ctx, "claim_v2",
 		[]string{"hr1:ready", "hr1:leases", "hr1:blocked"},
 		[]string{
 			req.OperationID,
@@ -135,9 +135,9 @@ const (
 	TombstoneTTL = time.Hour
 )
 
-// Ack runs ack_v1.
+// Ack runs ack_v2.
 func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delivery.AckResult {
-	res, err := s.a.RunScript(ctx, "ack_v1",
+	res, err := s.a.RunScript(ctx, "ack_v2",
 		[]string{"hr1:t:" + req.TokenDigest, "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages"},
 		[]string{req.Token, req.TokenDigest, itoa64(SuccessTTL.Milliseconds()), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {

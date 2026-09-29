@@ -79,8 +79,9 @@ func hget(t *testing.T, a *Adapter, key, field string) string {
 }
 
 // TestAcceptAcceptedAndKeys pins the accepted tuple and every affected key:
-// dedup record + TTL + age member, blob, queue, head state and ready member
-// created only for the first message, and the queued counter.
+// dedup record + TTL + age member, blob, message metadata, queue, head state
+// and ready member created only for the first message, and the queued
+// counter.
 func TestAcceptAcceptedAndKeys(t *testing.T) {
 	a := testAdapter(t, false)
 	ctx := context.Background()
@@ -108,6 +109,12 @@ func TestAcceptAcceptedAndKeys(t *testing.T) {
 	}
 	if blob, _ := a.client.Do(ctx, a.client.B().Get().Key("hr1:m:m1").Build()).ToString(); blob != `{"message_id":"m1"}` {
 		t.Errorf("blob = %q", blob)
+	}
+	if mi, _ := a.client.Do(ctx, a.client.B().Hgetall().Key("hr1:mi:m1").Build()).AsStrMap(); len(mi) != 1 || mi["dedup_identity_digest"] != "d1" {
+		t.Errorf("message metadata = %v, want only dedup_identity_digest d1", mi)
+	}
+	if ttl, _ := a.client.Do(ctx, a.client.B().Pttl().Key("hr1:mi:m1").Build()).AsInt64(); ttl != -1 {
+		t.Errorf("message metadata TTL = %d, want none (deleted with the blob)", ttl)
 	}
 	state := "hr1:r:" + testRecipient + ":s"
 	for field, want := range map[string]string{"status": "ready", "head_message_id": "m1", "delivery_cycle": "1", "attempt": "1"} {
@@ -203,7 +210,7 @@ func TestAcceptRefusalsCreateNothing(t *testing.T) {
 			NewMessageAcceptor(a, testLimits()).Accept(ctx, r)
 		}, ingestion.AcceptDedupCapacity},
 	}
-	for _, key := range []string{"hr1:d:d1", "hr1:dedup_age", "hr1:r:" + testRecipient + ":q", "hr1:r:" + testRecipient + ":s", "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages"} {
+	for _, key := range []string{"hr1:d:d1", "hr1:dedup_age", "hr1:mi:m1", "hr1:r:" + testRecipient + ":q", "hr1:r:" + testRecipient + ":s", "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages"} {
 		key := key
 		poison := "SET"
 		if key == "hr1:ready_seq" || key == "hr1:stats:queued_messages" {
@@ -288,14 +295,14 @@ func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {
 	gate(t, a, false)
 
 	keys := []string{"hr1:d:d1", "hr1:dedup_age", "hr1:m:m1", "hr1:r:" + testRecipient + ":q", "hr1:r:" + testRecipient + ":s",
-		"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:q:" + testRecipient, "hr1:stats:queued_messages"}
+		"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:q:" + testRecipient, "hr1:stats:queued_messages", "hr1:mi:m1"}
 	valid := []string{"m1", "d1", "b1", "1740000000000", "", "{}", testRecipient, "100", "10", "100", "3600000"}
 	with := func(i int, v string) []string {
 		args := append([]string(nil), valid...)
 		args[i] = v
 		return args
 	}
-	if _, err := a.RunScript(ctx, "accept_v1", keys, valid); err != nil {
+	if _, err := a.RunScript(ctx, "accept_v2", keys, valid); err != nil {
 		t.Fatalf("valid call failed: %v", err)
 	}
 	flushAll(t, a)
@@ -308,14 +315,36 @@ func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {
 		"recipient key mismatch": with(6, "telegram:42:chat:other"),
 		"message key mismatch":   with(0, "m2"),
 	} {
-		_, err := a.RunScript(ctx, "accept_v1", keys, args)
+		_, err := a.RunScript(ctx, "accept_v2", keys, args)
 		if err == nil || errors.Is(err, ErrNotDispatched) {
+			t.Errorf("%s: err = %v, want a script error", name, err)
+		}
+	}
+	withKey := func(i int, v string) []string {
+		k := append([]string(nil), keys...)
+		k[i] = v
+		return k
+	}
+	for name, k := range map[string][]string{
+		"too few keys":          keys[:11],
+		"metadata key mismatch": withKey(11, "hr1:mi:other"),
+	} {
+		if _, err := a.RunScript(ctx, "accept_v2", k, valid); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v, want a script error", name, err)
 		}
 	}
 	if n, _ := a.client.Do(ctx, a.client.B().Dbsize().Build()).ToMessage(); nInt(n) != 0 {
 		t.Errorf("rejected arguments left %d keys behind", nInt(n))
 	}
+
+	// Metadata already stored for the candidate message_id is a caller bug,
+	// like an existing blob: an error reply and no writes.
+	a.testDo(t, "HSET", "hr1:mi:m1", "dedup_identity_digest", "other")
+	before := snapshot(t, a)
+	if _, err := a.RunScript(ctx, "accept_v2", keys, valid); err == nil || errors.Is(err, ErrNotDispatched) {
+		t.Errorf("existing metadata: err = %v, want a script error", err)
+	}
+	assertUnchanged(t, a, before, "existing metadata")
 }
 
 // TestEndpointLookup pins the ingestion endpoint reader.

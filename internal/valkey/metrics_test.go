@@ -33,7 +33,7 @@ func TestValkeyMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A Lua argument error is a server-side script error.
-	if _, err := a.RunScript(ctx, "accept_v1", []string{"x"}, []string{"y"}); err == nil {
+	if _, err := a.RunScript(ctx, "accept_v2", []string{"x"}, []string{"y"}); err == nil {
 		t.Fatal("malformed call succeeded")
 	}
 	for _, tc := range []struct {
@@ -48,7 +48,7 @@ func TestValkeyMetrics(t *testing.T) {
 			t.Errorf("operations{%s,%s} = %v, want %v", tc.operation, tc.outcome, got, tc.want)
 		}
 	}
-	if got := value(t, reg, "hookrelay_valkey_script_errors_total", "script", "accept_v1"); got != 1 {
+	if got := value(t, reg, "hookrelay_valkey_script_errors_total", "script", "accept_v2"); got != 1 {
 		t.Errorf("script errors = %v, want 1", got)
 	}
 	if n := value(t, reg, "hookrelay_valkey_operation_duration_seconds", "operation", "accept"); n != 2 {
@@ -62,7 +62,7 @@ func TestValkeyMetrics(t *testing.T) {
 	if got := value(t, reg, "hookrelay_valkey_operations_total", "operation", "accept", "outcome", "error"); got != 2 {
 		t.Errorf("accept errors after close = %v, want 2", got)
 	}
-	if got := value(t, reg, "hookrelay_valkey_script_errors_total", "script", "accept_v1"); got != 1 {
+	if got := value(t, reg, "hookrelay_valkey_script_errors_total", "script", "accept_v2"); got != 1 {
 		t.Errorf("transport failure counted as a script error: %v", got)
 	}
 	if _, err := a.ValidateReadiness(ctx, false); err == nil {
@@ -77,7 +77,7 @@ func TestValkeyMetrics(t *testing.T) {
 func TestUninstrumentedAdapterRecordsNothing(t *testing.T) {
 	var m *adapterMetrics
 	m.observe("accept", timeZero, nil)
-	m.observeScript("accept_v1", timeZero, errScriptResult)
+	m.observeScript("accept_v2", timeZero, errScriptResult)
 	m.setConnected(true)
 }
 

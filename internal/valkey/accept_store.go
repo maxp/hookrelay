@@ -12,7 +12,7 @@ import (
 	"github.com/maxp/hookrelay/internal/ingestion"
 )
 
-// AcceptLimits are the capacity and retention bounds passed to accept_v1.
+// AcceptLimits are the capacity and retention bounds passed to accept_v2.
 type AcceptLimits struct {
 	MaxQueuedMessages             int
 	MaxQueuedMessagesPerRecipient int
@@ -20,7 +20,7 @@ type AcceptLimits struct {
 	DedupRetention                time.Duration
 }
 
-// MessageAcceptor implements ingestion.MessageAcceptor with accept_v1 and
+// MessageAcceptor implements ingestion.MessageAcceptor with accept_v2 and
 // ingestion.CapacityReader for the global acceptance stop conditions.
 type MessageAcceptor struct {
 	a      *Adapter
@@ -33,7 +33,7 @@ func NewMessageAcceptor(a *Adapter, limits AcceptLimits) *MessageAcceptor {
 }
 
 // Capacity reads the global queued-message counter and the live dedup index
-// members, counted exactly as accept_v1 does.
+// members, counted exactly as accept_v2 does.
 func (m *MessageAcceptor) Capacity(ctx context.Context) (ingestion.Capacity, error) {
 	c := ingestion.Capacity{
 		MaxQueuedMessages: int64(m.limits.MaxQueuedMessages),
@@ -70,6 +70,7 @@ func (m *MessageAcceptor) Accept(ctx context.Context, req ingestion.AcceptReques
 		"hr1:blocked",
 		"hr1:q:" + rid,
 		"hr1:stats:queued_messages",
+		"hr1:mi:" + req.MessageID,
 	}
 	occurred := ""
 	if req.OccurredMs != nil {
@@ -90,7 +91,7 @@ func (m *MessageAcceptor) Accept(ctx context.Context, req ingestion.AcceptReques
 	}
 
 	unavailable := ingestion.AcceptResult{Outcome: ingestion.AcceptDependencyUnavailable}
-	res, err := m.a.RunScript(ctx, "accept_v1", keys, args)
+	res, err := m.a.RunScript(ctx, "accept_v2", keys, args)
 	if err != nil {
 		// Whether or not the script ran, the platform retries and a retry of
 		// an accepted message is proven duplicate, so an uncertain outcome

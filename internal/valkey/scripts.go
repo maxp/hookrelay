@@ -20,7 +20,7 @@ func init() {
 		"bot_endpoint_limit": 0,
 		"wrong_type":         0,
 	})
-	register("accept_v1", 1, map[string]int{
+	register("accept_v2", 2, map[string]int{
 		"accepted":           1, // accepted_ms
 		"duplicate":          1, // original message_id
 		"duplicate_conflict": 1, // original message_id
@@ -31,7 +31,7 @@ func init() {
 		"wrong_type":         0,
 		"state_inconsistent": 0,
 	})
-	register("claim_v1", 1, map[string]int{
+	register("claim_v2", 2, map[string]int{
 		// token, message_id, delivery_cycle, attempt, claimed_ms,
 		// lease_expires_ms, message_json, blocked_detected
 		"claimed":                8,
@@ -43,7 +43,7 @@ func init() {
 		"empty":                  1, // blocked_detected
 		"wrong_type":             0,
 	})
-	register("ack_v1", 1, map[string]int{
+	register("ack_v2", 2, map[string]int{
 		// message_id, acknowledged_ms, recipient_identity, delivery_cycle,
 		// attempt (the last three are empty/zero for a repeat)
 		"acknowledged":         5,
