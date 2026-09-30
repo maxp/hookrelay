@@ -513,19 +513,9 @@ func (a *Adapter) AuditEntries(ctx context.Context, count int64) ([]map[string]s
 	}
 	out := make([]map[string]string, 0, len(items))
 	for _, item := range items {
-		parts, err := item.ToArray()
-		if err != nil || len(parts) != 2 {
-			return nil, fmt.Errorf("valkey: audit entry shape")
-		}
-		pairs, err := parts[1].ToArray()
+		_, entry, err := streamEntry(item)
 		if err != nil {
-			return nil, fmt.Errorf("valkey: audit fields shape: %w", err)
-		}
-		entry := map[string]string{}
-		for i := 0; i+1 < len(pairs); i += 2 {
-			k, _ := pairs[i].ToString()
-			v, _ := pairs[i+1].ToString()
-			entry[k] = v
+			return nil, err
 		}
 		out = append(out, entry)
 	}

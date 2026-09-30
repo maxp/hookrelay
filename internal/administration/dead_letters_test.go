@@ -411,3 +411,76 @@ func TestDeleteDeadLetterContract(t *testing.T) {
 		t.Errorf("unauthenticated delete = %d", rec.Code)
 	}
 }
+
+type fakeAuditLog struct {
+	items   []AuditEntry
+	err     error
+	befores []string
+	limits  []int
+}
+
+func (f *fakeAuditLog) ListAudit(_ context.Context, limit int, before string) ([]AuditEntry, error) {
+	f.limits = append(f.limits, limit)
+	f.befores = append(f.befores, before)
+	return f.items[:min(limit, len(f.items))], f.err
+}
+
+// TestListAuditContract pins the audit route: newest-first pages with an
+// opaque stream-ID cursor, the empty list, the limit and cursor checks,
+// and a wrong-type Stream as 503.
+func TestListAuditContract(t *testing.T) {
+	log := &fakeAuditLog{items: []AuditEntry{
+		{StreamID: "3-0", EventID: "e3", TimestampMs: 3, Actor: "admin_bearer", Operation: "dead_letter_deleted", Target: "m", Outcome: "success"},
+		{StreamID: "2-0", EventID: "e2"},
+		{StreamID: "1-0", EventID: "e1"},
+	}}
+	svc, err := NewService(ServiceDeps{Repo: newFakeRepo(), AuditLog: log, Catalog: fakeCatalog{}, Audit: &fakeAudit{},
+		AdminSecret: "admin-secret-value-016", Gen: fixedGen{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Handler(svc)
+	rec := doJSON(t, h, http.MethodGet, "/admin/v1/audit?limit=2", "admin-secret-value-016", "")
+	var page struct {
+		Items []map[string]any `json:"items"`
+		Next  string           `json:"next_cursor"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &page) != nil || len(page.Items) != 2 || page.Next == "" {
+		t.Fatalf("list = %d %s", rec.Code, rec.Body.String())
+	}
+	first, _ := json.Marshal(page.Items[0])
+	if string(first) != `{"actor":"admin_bearer","event_id":"e3","operation":"dead_letter_deleted","outcome":"success","stream_id":"3-0","target":"m","timestamp_ms":3}` {
+		t.Errorf("item = %s", first)
+	}
+	if log.limits[0] != 3 || log.befores[0] != "" {
+		t.Errorf("call = %d %q", log.limits[0], log.befores[0])
+	}
+	rec = doJSON(t, h, http.MethodGet, "/admin/v1/audit?limit=2&cursor="+page.Next, "admin-secret-value-016", "")
+	if rec.Code != http.StatusOK || log.befores[1] != "2-0" {
+		t.Errorf("continuation = %d, before %q", rec.Code, log.befores[1])
+	}
+	rec = doJSON(t, h, http.MethodGet, "/admin/v1/audit", "admin-secret-value-016", "")
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "next_cursor") {
+		t.Errorf("last page = %s", rec.Body.String())
+	}
+	for name, q := range map[string]string{
+		"limit zero": "limit=0", "limit too large": "limit=201", "bad cursor": "cursor=!!",
+		"cursor without id": "cursor=" + encodeCursor(AuditCursor{ID: "x"}),
+	} {
+		if rec := doJSON(t, h, http.MethodGet, "/admin/v1/audit?"+q, "admin-secret-value-016", ""); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	log.items, log.err = nil, nil
+	if rec := doJSON(t, h, http.MethodGet, "/admin/v1/audit", "admin-secret-value-016", ""); rec.Code != http.StatusOK ||
+		rec.Body.String() != `{"items":[]}`+"\n" {
+		t.Errorf("empty = %s", rec.Body.String())
+	}
+	log.err = ErrStoredWrongType
+	if rec := doJSON(t, h, http.MethodGet, "/admin/v1/audit", "admin-secret-value-016", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("wrong type = %d", rec.Code)
+	}
+	if rec := doJSON(t, h, http.MethodGet, "/admin/v1/audit", "wrong", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated = %d", rec.Code)
+	}
+}

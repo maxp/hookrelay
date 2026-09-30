@@ -175,6 +175,7 @@ func Serve(args []string) int {
 		Messages:    valkey.NewMessageStateStore(adapter),
 		Catalog:     typeCatalog{registry: webhookTypes},
 		Audit:       valkey.NewAuditSink(adapter),
+		AuditLog:    valkey.NewAuditLog(adapter),
 		AdminSecret: adminSecret,
 		Gen:         gen.Crypto{},
 		Logger:      log,

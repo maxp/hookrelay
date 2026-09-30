@@ -177,6 +177,8 @@ type ServiceDeps struct {
 	Messages MessageStateRepository
 	Catalog  TypeCatalog
 	Audit    AuditSink
+	// AuditLog serves the audit listing; nil leaves it unregistered.
+	AuditLog AuditLog
 	// AdminSecret must already be resolved and validated by the
 	// configuration layer.
 	AdminSecret string
@@ -219,6 +221,7 @@ type Service struct {
 	messages    MessageStateRepository
 	catalog     TypeCatalog
 	audit       AuditSink
+	auditLog    AuditLog
 	ready       ReadySignal
 	// adminSecretDigest is the SHA-256 of the Admin Secret: comparing
 	// fixed-size digests keeps the check constant-time in the secret length.
@@ -249,6 +252,7 @@ func NewService(d ServiceDeps) (*Service, error) {
 		messages:          d.Messages,
 		catalog:           d.Catalog,
 		audit:             d.Audit,
+		auditLog:          d.AuditLog,
 		ready:             d.Ready,
 		adminSecretDigest: sha256.Sum256([]byte(d.AdminSecret)),
 		gen:               d.Gen,

@@ -68,6 +68,9 @@ func Handler(svc *Service) http.Handler {
 		mux.Handle("POST /admin/v1/dead-letters/{message_id}/payload", svc.auth(http.HandlerFunc(svc.handleDeadLetterPayload)))
 		mux.Handle("DELETE /admin/v1/dead-letters/{message_id}", svc.auth(http.HandlerFunc(svc.handleDeleteDeadLetter)))
 	}
+	if svc.auditLog != nil {
+		mux.Handle("GET /admin/v1/audit", svc.auth(http.HandlerFunc(svc.handleListAudit)))
+	}
 	if svc.messages != nil {
 		mux.Handle("GET /admin/v1/messages/{message_id}/delivery-state", svc.auth(http.HandlerFunc(svc.handleDeliveryState)))
 	}

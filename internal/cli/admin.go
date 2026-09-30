@@ -86,6 +86,7 @@ const adminUsage = `usage:
   hookrelay admin dlq replay --message-id <id> [--deduplication-conflict-resolution reject|keep_current]
       --yes [common flags]
   hookrelay admin message delivery-state --message-id <id> [common flags]
+  hookrelay admin audit list [--limit <n>] [--cursor <c>] [common flags]
 
 recipient: --bot-platform <p> --bot-id <id> --scope <chat|user|bot|relay> [--chat-id <id> | --user-id <id>]
 
@@ -107,6 +108,13 @@ func runAdmin(args []string, env adminIO) int {
 	}
 	if len(args) >= 1 && args[0] == "message" {
 		return runMessage(args[1:], env)
+	}
+	if len(args) >= 1 && args[0] == "audit" {
+		if len(args) < 2 || args[1] != "list" {
+			fmt.Fprint(env.Stderr, adminUsage)
+			return ExitUsage
+		}
+		return adminAuditList(args[2:], env)
 	}
 	if len(args) >= 1 && args[0] == "bot" {
 		if len(args) < 2 || args[1] != "webhooks" {
