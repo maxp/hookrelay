@@ -318,7 +318,12 @@ curl -X POST http://<public>/v1/deliveries/claim \
   marker during the claim scan and skipped; other Recipients continue.
 - `wait_ms` (0–30000, default 30000) long-polls: the claim rechecks
   atomically every 250 ms plus 0–50 ms jitter until work appears (returned
-  at once) or the deadline passes (`204`, recorded for replay). A client that
+  at once) or the deadline passes (`204`, recorded for replay). An
+  in-process notifier also wakes the oldest waiting claim for an immediate
+  recheck when this process makes work ready (acceptance, ack, dead-letter,
+  retry activation, head replay, block clear);
+  `HOOKRELAY_CLAIM_NOTIFICATIONS=false` leaves only the periodic rechecks
+  (ADR 0008). A client that
   disconnects abandons the wait; repeating the same `operation_id` recovers
   a lease that raced with the disconnect. At most
   `HOOKRELAY_MAX_WAITING_CLAIMS` (default 20) claims wait per process;

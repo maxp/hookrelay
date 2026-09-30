@@ -158,7 +158,13 @@ func Serve(args []string) int {
 		return ExitError
 	}
 
+	notifier, err := delivery.NewReadyNotifier(cfg.ClaimNotifications, registry)
+	if err != nil {
+		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
+		return ExitError
+	}
 	svc, err := administration.NewService(administration.ServiceDeps{
+		Ready:       notifier,
 		Repo:        valkey.NewEndpointStore(adapter),
 		Recipients:  valkey.NewRecipientStore(adapter, cfg.MaxQueuedMessagesPerRecipient),
 		DeadLetters: valkey.NewDeadLetterStore(adapter),
@@ -185,6 +191,7 @@ func Serve(args []string) int {
 		EvictionBatch:                 cfg.MaintenanceBatchSize,
 	})
 	webhooks, err := ingestion.NewHandler(ingestion.HandlerDeps{
+		Ready:            notifier,
 		Registry:         webhookTypes,
 		Endpoints:        valkey.NewEndpointLookup(adapter),
 		Acceptor:         acceptor,
@@ -228,6 +235,7 @@ func Serve(args []string) int {
 		JitterMax:   cfg.RetryJitterMax,
 	}
 	maintenance, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
+		Notifier:     notifier,
 		Retries:      deliveryStore,
 		Leases:       deliveryStore,
 		RetryPolicy:  retryPolicy,
@@ -260,6 +268,7 @@ func Serve(args []string) int {
 		NegativeAcknowledger: deliveryStore,
 		Extender:             deliveryStore,
 		InlineMaintenance:    maintenance,
+		Notifier:             notifier,
 		Stats:                deliveryStore,
 		RetryPolicy:          retryPolicy,
 		Attempts:             attempts,

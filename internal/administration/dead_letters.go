@@ -162,6 +162,9 @@ func (s *Service) ReplayDeadLetter(ctx context.Context, messageID string, req Re
 			}
 		}
 		observability.LogEvent(s.log, slog.LevelInfo, "delivery_replayed", "dead-letter message replayed", fields...)
+		if r.QueuePosition == "head" {
+			s.signalReady("replay")
+		}
 		return ReplayView{Status: "replayed", MessageID: messageID, DeliveryCycle: r.DeliveryCycle, QueuePosition: r.QueuePosition,
 			ReplayedMs: r.ReplayedMs, DeduplicationResolution: r.DeduplicationResolution}, nil
 	case ReplayNotFound:

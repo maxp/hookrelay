@@ -75,6 +75,12 @@ type DedupEvictor interface {
 	EvictDedup(ctx context.Context) (int, error)
 }
 
+// ReadySignal receives a hint that an accepted message may have made a
+// Recipient claimable; the delivery notifier implements it.
+type ReadySignal interface {
+	Signal(source string)
+}
+
 // MessageAcceptor atomically accepts a message or proves it duplicate. It
 // hides deduplication, queues, indexes, counters, and scripts.
 type MessageAcceptor interface {

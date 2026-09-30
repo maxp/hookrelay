@@ -47,6 +47,25 @@ var testPolicy = delivery.RetryPolicy{MaxAttempts: 4, Delays: []time.Duration{20
 
 func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *delivery.Handler, *prometheus.Registry, *valkey.DeliveryStore) {
 	t.Helper()
+	return composeStackWith(t, stackOptions{Lease: lease})
+}
+
+// stackOptions tunes the composed stack; zero values keep the defaults.
+type stackOptions struct {
+	Lease    time.Duration
+	Notifier *delivery.ReadyNotifier
+	// Recheck overrides the periodic long-poll recheck interval.
+	Recheck time.Duration
+	// NoInline leaves the claim path without the inline maintenance pass.
+	NoInline bool
+}
+
+func composeStackWith(t *testing.T, o stackOptions) (http.Handler, *delivery.Handler, *prometheus.Registry, *valkey.DeliveryStore) {
+	t.Helper()
+	lease := o.Lease
+	if lease == 0 {
+		lease = time.Minute
+	}
 	raw := os.Getenv("HOOKRELAY_TEST_VALKEY_URL")
 	if raw == "" {
 		t.Skip("HOOKRELAY_TEST_VALKEY_URL not set; start the pinned Valkey container")
@@ -79,7 +98,7 @@ func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *de
 	webhooks, err := ingestion.NewHandler(ingestion.HandlerDeps{
 		Registry: types, Endpoints: valkey.NewEndpointLookup(a),
 		Acceptor: valkey.NewMessageAcceptor(a, valkey.AcceptLimits{MaxQueuedMessages: 100, MaxQueuedMessagesPerRecipient: 10, MaxDedupRecords: 100, DedupRetention: time.Hour}),
-		Gen:      gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
+		Gen:      gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg, Ready: readySignal(o.Notifier),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,16 +109,20 @@ func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *de
 		t.Fatal(err)
 	}
 	inline, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
-		Retries: store, Leases: store, RetryPolicy: testPolicy, Attempts: attempts, Registerer: reg,
+		Retries: store, Leases: store, RetryPolicy: testPolicy, Attempts: attempts, Registerer: reg, Notifier: o.Notifier,
 		Config: delivery.MaintenanceConfig{Interval: time.Second, BatchSize: 100, MaxContinuousBatches: 5},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	var inlinePass delivery.InlineMaintainer = inline
+	if o.NoInline {
+		inlinePass = nil
+	}
 	consumer, err := delivery.NewHandler(delivery.HandlerDeps{
-		Attempts: attempts, InlineMaintenance: inline,
+		Attempts: attempts, InlineMaintenance: inlinePass,
 		Claimer: store, Acknowledger: store, NegativeAcknowledger: store, Extender: store, Stats: store, ConsumerSecret: consumerSecret, Gen: gen.Crypto{}, Clock: gen.SystemClock{}, Registerer: reg,
-		RetryPolicy: testPolicy,
+		RetryPolicy: testPolicy, Notifier: o.Notifier, RecheckInterval: o.Recheck,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -110,6 +133,14 @@ func composeStackWithLease(t *testing.T, lease time.Duration) (http.Handler, *de
 		Readiness: &app.Readiness{}, Webhooks: webhooks, ConsumerAPI: consumer,
 	})
 	return application.PublicHandler(), consumer, reg, store
+}
+
+// readySignal keeps a nil notifier a nil interface.
+func readySignal(n *delivery.ReadyNotifier) ingestion.ReadySignal {
+	if n == nil {
+		return nil
+	}
+	return n
 }
 
 func send(h http.Handler, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -403,12 +434,18 @@ func TestNackRetryOverRealValkey(t *testing.T) {
 // returns its stop function.
 func runMaintenance(t *testing.T, store *valkey.DeliveryStore) func() {
 	t.Helper()
+	return runMaintenanceWith(t, store, nil)
+}
+
+// runMaintenanceWith runs background maintenance that signals n.
+func runMaintenanceWith(t *testing.T, store *valkey.DeliveryStore, n *delivery.ReadyNotifier) func() {
+	t.Helper()
 	attempts, err := delivery.NewAttemptMetrics(prometheus.NewRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
 	m, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
-		Retries: store, Leases: store, RetryPolicy: testPolicy, Attempts: attempts,
+		Retries: store, Leases: store, RetryPolicy: testPolicy, Attempts: attempts, Notifier: n,
 		Config: delivery.MaintenanceConfig{Interval: 10 * time.Millisecond, IntervalJitter: 5 * time.Millisecond, BatchSize: 100, MaxContinuousBatches: 5},
 	})
 	if err != nil {
@@ -618,4 +655,110 @@ func TestInlinePassOverRealValkey(t *testing.T) {
 	if retried.Delivery.Attempt != 2 || retried.Delivery.DeliveryToken == first.Delivery.DeliveryToken {
 		t.Errorf("retried delivery = %+v", retried.Delivery)
 	}
+}
+
+// TestNotificationWakeUpOverRealValkey pins that waiting claims wake on
+// ready signals rather than the periodic recheck: with a 20 s recheck
+// interval, a claim returns promptly after an acceptance, after an ack
+// exposes the next head, and after background retry activation.
+func TestNotificationWakeUpOverRealValkey(t *testing.T) {
+	notifier, err := delivery.NewReadyNotifier(true, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without the inline pass only background maintenance activates the
+	// retry below, so every wake-up must come from a signal.
+	public, _, reg, store := composeStackWith(t, stackOptions{Notifier: notifier, Recheck: 20 * time.Second, NoInline: true})
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	hook := map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}
+	webhook := func(id string) {
+		t.Helper()
+		body := `{"update_id":` + id + `,"message":{"message_id":1,"date":1700000000,"chat":{"id":-7}}}`
+		if w := send(public, "/webhook/telegram/wh_d", body, hook); w.Code != http.StatusOK {
+			t.Fatalf("webhook %s = %d", id, w.Code)
+		}
+	}
+	// waitingClaim starts a claim, waits until it is parked, runs trigger,
+	// and returns the claim body once it answers promptly.
+	waitingClaim := func(op string, trigger func()) claimBody {
+		t.Helper()
+		result := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			result <- send(public, "/v1/deliveries/claim", `{"operation_id":"`+op+`","wait_ms":15000}`, auth)
+		}()
+		time.Sleep(200 * time.Millisecond) // first check and inline pass done
+		start := time.Now()
+		trigger()
+		select {
+		case w := <-result:
+			if w.Code != http.StatusOK {
+				t.Fatalf("claim %s = %d %s", op, w.Code, w.Body)
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Errorf("claim %s woke after %v", op, elapsed)
+			}
+			var b claimBody
+			if err := json.Unmarshal(w.Body.Bytes(), &b); err != nil {
+				t.Fatal(err)
+			}
+			return b
+		case <-time.After(5 * time.Second):
+			t.Fatalf("claim %s was not woken", op)
+		}
+		return claimBody{}
+	}
+
+	// Acceptance wakes the waiting claim.
+	first := waitingClaim("0195c4d8-0000-7000-8000-0000000000e1", func() { webhook("71") })
+
+	// A second message queues behind the leased head; acking the head
+	// exposes it and wakes the next waiting claim.
+	webhook("72")
+	second := waitingClaim("0195c4d8-0000-7000-8000-0000000000e2", func() {
+		if w := send(public, "/v1/deliveries/ack", `{"delivery_token":"`+first.Delivery.DeliveryToken+`"}`, auth); w.Code != http.StatusOK {
+			t.Fatalf("ack = %d", w.Code)
+		}
+	})
+	if second.Delivery.Attempt != 1 {
+		t.Fatalf("second head attempt = %d", second.Delivery.Attempt)
+	}
+
+	// A nack schedules a retry; background maintenance activates it and
+	// its signal wakes the waiting claim.
+	if w := send(public, "/v1/deliveries/nack", `{"delivery_token":"`+second.Delivery.DeliveryToken+`"}`, auth); w.Code != http.StatusOK {
+		t.Fatalf("nack = %d", w.Code)
+	}
+	var stop func()
+	retried := waitingClaim("0195c4d8-0000-7000-8000-0000000000e3", func() { stop = runMaintenanceWith(t, store, notifier) })
+	stop()
+	if retried.Delivery.Attempt != 2 {
+		t.Fatalf("retried attempt = %d, want 2", retried.Delivery.Attempt)
+	}
+	if got := gatherCounter(t, reg, "hookrelay_claim_wakeups_total", map[string]string{"trigger": "notification", "outcome": "claimed"}); got != 3 {
+		t.Errorf("notification wake-ups that claimed = %v, want 3", got)
+	}
+}
+
+// gatherCounter reads one counter series from reg (0 when absent).
+func gatherCounter(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+	metrics:
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if want, ok := labels[l.GetName()]; ok && want != l.GetValue() {
+					continue metrics
+				}
+			}
+			return m.GetCounter().GetValue()
+		}
+	}
+	return 0
 }

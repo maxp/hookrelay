@@ -51,6 +51,8 @@ func (m *AttemptMetrics) Observe(scope, outcome string, claimedMs, completedMs i
 
 type metrics struct {
 	claims             *prometheus.CounterVec
+	wakeups            *prometheus.CounterVec
+	waitDuration       *prometheus.HistogramVec
 	retriesWaiting     prometheus.Gauge
 	deadLetterMessages prometheus.Gauge
 	oldestReadyAge     prometheus.Gauge
@@ -65,6 +67,15 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 		claims: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hookrelay_delivery_claims_total",
 			Help: "Consumer claim requests by bounded outcome.",
+		}, []string{"outcome"}),
+		wakeups: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hookrelay_claim_wakeups_total",
+			Help: "Waiting-claim rechecks by trigger (notification, periodic) and outcome (claimed, empty).",
+		}, []string{"trigger", "outcome"}),
+		waitDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "hookrelay_claim_wait_duration_seconds",
+			Help:    "Waiting-claim duration (wait_ms > 0) by outcome (claimed, empty, cancelled, unavailable).",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30},
 		}, []string{"outcome"}),
 		retriesWaiting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "hookrelay_retries_waiting",
@@ -95,7 +106,7 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 			Help: "Messages queued across all Recipients.",
 		}),
 	}
-	collectors := []prometheus.Collector{m.claims, m.retriesWaiting, m.deadLetterMessages, m.oldestReadyAge, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
+	collectors := []prometheus.Collector{m.claims, m.wakeups, m.waitDuration, m.retriesWaiting, m.deadLetterMessages, m.oldestReadyAge, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "hookrelay_waiting_claims",
 			Help: "Claim requests waiting for work in this process.",

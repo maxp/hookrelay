@@ -182,6 +182,9 @@ func (s *Service) ClearBlock(ctx context.Context, req ClearBlockRequest, request
 			fields = append(fields, "user_id", req.Recipient.UserID)
 		}
 		observability.LogEvent(s.log, slog.LevelInfo, opRecipientBlockCleared, "recipient block cleared", fields...)
+		if detail == "ready" {
+			s.signalReady("block_clear")
+		}
 		return nil
 	case ClearNotFound:
 		return StatusError{Status: http.StatusNotFound, Code: "recipient_block_not_found", Msg: "the recipient is not blocked"}

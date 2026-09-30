@@ -82,6 +82,9 @@ type MaintenanceDeps struct {
 	// Sleep waits between rounds and returns ctx.Err() when cancelled
 	// (a timer wait when nil).
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Notifier is signalled when a transition may expose claimable work;
+	// nil disables the hint.
+	Notifier *ReadyNotifier
 	// Logger receives failure events; nil discards them.
 	Logger *slog.Logger
 	// Registerer receives the maintenance metrics; nil keeps them private.
@@ -317,6 +320,7 @@ func (m *Maintenance) activateRetry(ctx context.Context, kind string, e DueEntry
 	res := m.d.Retries.ActivateRetry(ctx, e.RecipientIdentity)
 	switch res.Outcome {
 	case ActivationActivated:
+		m.d.Notifier.Signal(SignalRetryActivation)
 		return resultApplied
 	case ActivationNotDue:
 		return resultStale
@@ -354,6 +358,8 @@ func (m *Maintenance) expireLease(ctx context.Context, kind string, e DueEntry) 
 			RecipientIdentity: e.RecipientIdentity, MessageID: res.MessageID, Reason: reasonExpiryExhausted,
 			DeliveryCycle: res.DeliveryCycle, Attempt: res.Attempt, ClaimedMs: res.ClaimedMs, DeadLetteredMs: res.DeadLetteredMs,
 		}, extra...)
+		// The next head, if any, is ready.
+		m.d.Notifier.Signal(SignalDeadLetter)
 		return resultApplied
 	case ExpiryNotDue:
 		return resultStale

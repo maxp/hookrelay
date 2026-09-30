@@ -100,6 +100,8 @@ type Config struct {
 	RetryJitterMax         float64
 	MaxActiveLeases        int
 	MaxWaitingClaims       int
+	// ClaimNotifications wakes waiting claims early (ADR 0008).
+	ClaimNotifications bool
 
 	// valkeyURLProvided records whether the Valkey URL was explicitly
 	// supplied (flag or environment) as opposed to the local default.
@@ -363,6 +365,14 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	}
 	if c.MaxWaitingClaims, err = getInt("HOOKRELAY_MAX_WAITING_CLAIMS", 20); err != nil {
 		return nil, err
+	}
+	switch raw := get("HOOKRELAY_CLAIM_NOTIFICATIONS"); raw {
+	case "", "true", "1":
+		c.ClaimNotifications = true
+	case "false", "0":
+		c.ClaimNotifications = false
+	default:
+		return nil, fmt.Errorf("HOOKRELAY_CLAIM_NOTIFICATIONS: must be a boolean, got %q", raw)
 	}
 	if c.MaintenanceInterval, err = getDuration("HOOKRELAY_MAINTENANCE_INTERVAL", time.Second); err != nil {
 		return nil, err

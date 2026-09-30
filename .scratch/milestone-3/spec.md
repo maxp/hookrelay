@@ -37,7 +37,7 @@ Two independent tracks: notifier (tickets 01–02) and endpoint administration (
 ### Ready-work notifier
 
 - Package `delivery` owns a `ReadyNotifier` with `Signal(source)` and a waiter registration used only by the claim handler. Waiters are kept FIFO; `Signal` wakes the **oldest** registered waiter with a non-blocking send on its 1-buffered channel and removes it. With no registered waiter the signal is dropped (a new waiter always performs its own first check, so no credit is stored).
-- A woken waiter performs one normal atomic claim check. Work found → claimed response. Empty (the work went to another claim, the signal was a false positive, or the Recipient became blocked) → it re-registers and keeps waiting within its original deadline; the periodic timer is not reset.
+- A woken waiter performs one normal atomic claim check. Work found → claimed response. Empty (the work went to another claim, the signal was a false positive, or the Recipient became blocked) → it re-registers and keeps waiting within its original deadline, with the next periodic recheck paced from that check.
 - The periodic recheck (250 ms + 0–50 ms uniform jitter) runs regardless of notifications. Cancellation, shutdown, and the `wait_ms` deadline behave exactly as today; a deregistered waiter never receives a stale wake that affects a later request.
 - Signals are hints derived from existing script results; no script changes. Sources (bounded `source` label):
   - `accept` — `accept_v3` `accepted` (the Recipient may have become ready);
@@ -48,7 +48,7 @@ Two independent tracks: notifier (tickets 01–02) and endpoint administration (
   - `block_clear` — `clear_block_v2` `cleared` with restored index `ready`.
   A `retry_scheduled` nack/expiry does not signal (the head waits). A false positive costs one extra recheck by one waiter.
 - The claim that ran the inline maintenance pass does not need its own signals; signals from the inline pass may wake another waiter, which is correct.
-- Configuration: `HOOKRELAY_CLAIM_NOTIFICATIONS` (bool, default `true`). When `false`, `Signal` is a no-op and claims rely only on periodic rechecks. Shown by `/debug/config`.
+- Configuration: `HOOKRELAY_CLAIM_NOTIFICATIONS` (bool, default `true`). When `false`, `Signal` is a no-op and claims rely only on periodic rechecks.
 - Multi-process deployment would need a cross-process channel (e.g. Valkey Pub/Sub) behind the same `Signal`/wait seam; out of scope (ADR 0008).
 
 ### Observability (M3 additions)

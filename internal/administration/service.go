@@ -82,11 +82,27 @@ type ServiceDeps struct {
 	// configuration layer.
 	AdminSecret string
 	Gen         gen.Gen
+	// Ready is signalled when a replay or block clear makes a Recipient
+	// claimable, so a waiting claim can wake early; nil disables the hint.
+	Ready ReadySignal
 	// Logger receives feature events and best-effort audit copies; nil discards them.
 	Logger *slog.Logger
 	// Registerer receives the administrative audit metrics; nil keeps them
 	// on a private registry.
 	Registerer prometheus.Registerer
+}
+
+// ReadySignal receives a hint that claimable work may exist; the delivery
+// notifier implements it.
+type ReadySignal interface {
+	Signal(source string)
+}
+
+// signalReady forwards a ready hint when a signal is wired.
+func (s *Service) signalReady(source string) {
+	if s.ready != nil {
+		s.ready.Signal(source)
+	}
 }
 
 // Service implements the administrative use cases.
@@ -97,6 +113,7 @@ type Service struct {
 	messages    MessageStateRepository
 	catalog     TypeCatalog
 	audit       AuditSink
+	ready       ReadySignal
 	// adminSecretDigest is the SHA-256 of the Admin Secret: comparing
 	// fixed-size digests keeps the check constant-time in the secret length.
 	adminSecretDigest [sha256.Size]byte
@@ -126,6 +143,7 @@ func NewService(d ServiceDeps) (*Service, error) {
 		messages:          d.Messages,
 		catalog:           d.Catalog,
 		audit:             d.Audit,
+		ready:             d.Ready,
 		adminSecretDigest: sha256.Sum256([]byte(d.AdminSecret)),
 		gen:               d.Gen,
 		log:               log,

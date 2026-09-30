@@ -174,9 +174,10 @@ HOOKRELAY_RETRY_JITTER_MIN=0.5
 HOOKRELAY_RETRY_JITTER_MAX=1.0
 HOOKRELAY_MAX_ACTIVE_LEASES=100
 HOOKRELAY_MAX_WAITING_CLAIMS=20
+HOOKRELAY_CLAIM_NOTIFICATIONS=true
 ```
 
-The active-lease limit applies across the shared Valkey-backed work pool. The waiting-claim limit is process-local because waiting HTTP requests live in one hookrelay process; the first version has one process. The retry-delay count must equal maximum attempts minus one. Jitter satisfies:
+The active-lease limit applies across the shared Valkey-backed work pool. The waiting-claim limit is process-local because waiting HTTP requests live in one hookrelay process; the first version has one process. `HOOKRELAY_CLAIM_NOTIFICATIONS` enables the in-process ready-work notifier that wakes waiting claims early ([ADR 0008](../adr/0008-in-process-ready-work-notification.md)); `false` leaves only the periodic rechecks. The retry-delay count must equal maximum attempts minus one. Jitter satisfies:
 
 ```text
 0 <= min <= max <= 1

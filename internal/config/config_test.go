@@ -61,6 +61,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.MaxActiveLeases != 100 || c.MaxWaitingClaims != 20 {
 		t.Errorf("limits defaults: %d / %d", c.MaxActiveLeases, c.MaxWaitingClaims)
 	}
+	if !c.ClaimNotifications {
+		t.Errorf("claim notifications default off")
+	}
 	if c.MaintenanceInterval != time.Second || c.MaintenanceBatchSize != 100 || c.MaintenanceMaxContinuousBatches != 5 {
 		t.Errorf("maintenance defaults wrong")
 	}
@@ -307,5 +310,19 @@ func TestValkeyMaxConnectionsMinimum(t *testing.T) {
 	}
 	if _, err := Load(nil, getenv(map[string]string{"HOOKRELAY_VALKEY_MAX_CONNECTIONS": "2", "HOOKRELAY_VALKEY_MIN_IDLE": "1"})); err != nil {
 		t.Errorf("two connections rejected: %v", err)
+	}
+}
+
+// TestClaimNotifications pins the notifier switch parsing.
+func TestClaimNotifications(t *testing.T) {
+	env := devEnv()
+	env["HOOKRELAY_CLAIM_NOTIFICATIONS"] = "false"
+	c, err := Load(nil, getenv(env))
+	if err != nil || c.ClaimNotifications {
+		t.Fatalf("false: %v, %v", c, err)
+	}
+	env["HOOKRELAY_CLAIM_NOTIFICATIONS"] = "maybe"
+	if _, err := Load(nil, getenv(env)); err == nil || !strings.Contains(err.Error(), "boolean") {
+		t.Errorf("invalid value accepted: %v", err)
 	}
 }

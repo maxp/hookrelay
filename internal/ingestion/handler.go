@@ -65,6 +65,9 @@ type HandlerDeps struct {
 	// DedupEvictor runs proactive early eviction in MaintainCapacity; nil
 	// disables it (acceptance-time eviction is in the acceptor).
 	DedupEvictor DedupEvictor
+	// Ready is signalled after each acceptance so a waiting claim can wake
+	// early; nil disables the hint.
+	Ready ReadySignal
 	// MaxInflight bounds concurrent webhook requests past route resolution
 	// (DefaultMaxInflight when zero).
 	MaxInflight int
@@ -296,6 +299,9 @@ func (h *Handler) accept(w http.ResponseWriter, ctx context.Context, req *reques
 	outcome := outcomeOf(result.Outcome)
 	switch result.Outcome {
 	case AcceptAccepted:
+		if h.d.Ready != nil {
+			h.d.Ready.Signal("accept")
+		}
 		h.metrics.accepted.WithLabelValues(string(req.def.Platform), string(msg.Recipient.Scope)).Inc()
 		if conv.RoutingIssue != "" {
 			h.metrics.routingIssues.WithLabelValues(string(req.def.Platform), conv.RoutingIssue).Inc()

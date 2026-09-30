@@ -23,7 +23,7 @@ The Consumer API is HTTP and uses long polling. Valkey is not exposed to consume
 - Cancellation before a lease is created abandons the wait. If lease creation races with disconnect, repeating the same operation recovers the lease.
 - Multiple concurrent claims under the shared Consumer Secret are allowed.
 - A configurable work-pool-wide limit applies to active leases, while a separate process-local limit applies to waiting HTTP claims. Initial defaults are 100 active leases work-pool-wide and 20 waiting claims per process.
-- The initial long-poll implementation rechecks the ready index every 250 ms plus 0–50 ms of uniform jitter. A later notification channel may wake polls earlier, but Valkey's ready index remains the source of truth, periodic atomic rechecking remains the loss-recovery path, and the HTTP contract does not change.
+- The long poll rechecks the ready index every 250 ms plus 0–50 ms of uniform jitter. The in-process ready-work notifier ([ADR 0008](../adr/0008-in-process-ready-work-notification.md)) wakes at most one waiting claim, oldest first, per transition that may expose claimable work; Valkey's ready index remains the source of truth, periodic atomic rechecking remains the loss-recovery path, and the HTTP contract does not change. `HOOKRELAY_CLAIM_NOTIFICATIONS=false` disables the notifier.
 
 A Consumer Instance may send an optional bounded `Consumer-Instance-Id` header for diagnostics. It is caller-controlled, is not an authorization identity, is not used as a Prometheus label, and may be retained in attempt history.
 

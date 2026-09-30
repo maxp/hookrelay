@@ -64,6 +64,9 @@ type HandlerDeps struct {
 	Stats                StatsReader
 	// Attempts counts completed attempts; maintenance shares the instance.
 	Attempts *AttemptMetrics
+	// Notifier wakes waiting claims when work may be ready; nil relies on
+	// periodic rechecks alone.
+	Notifier *ReadyNotifier
 	// InlineMaintenance, when set, runs once before a waiting claim waits
 	// on an empty ready index; the claim then rechecks at once.
 	InlineMaintenance InlineMaintainer
@@ -249,7 +252,15 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 	defer deadline.Stop()
 	final := wait == 0
 	inlineDone := false
+	// waiter is registered before every waiting check so a signal that
+	// arrives during the check is not missed.
+	var waiter *readyWaiter
+	defer func() { h.d.Notifier.deregister(waiter) }()
+	trigger := ""
 	for {
+		if !final && waiter == nil {
+			waiter = h.d.Notifier.register()
+		}
 		// Only the final check at the deadline records an empty outcome, so
 		// rechecks under the same operation_id never replay an early empty.
 		claimReq.RecordEmpty = final
@@ -259,9 +270,26 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 			// cancellation, not a Valkey outage. A lease the check may have
 			// created is recovered by repeating the same operation_id.
 			h.metrics.claims.WithLabelValues("cancelled").Inc()
+			h.observeWait(wait, c, "cancelled")
 			return
 		}
+		switch {
+		case trigger == "":
+		case res.Outcome == ClaimClaimed:
+			h.metrics.wakeups.WithLabelValues(trigger, "claimed").Inc()
+		case res.Outcome == ClaimEmpty:
+			h.metrics.wakeups.WithLabelValues(trigger, "empty").Inc()
+		}
+		trigger = ""
 		if res.Outcome != ClaimEmpty || final {
+			switch res.Outcome {
+			case ClaimClaimed:
+				h.observeWait(wait, c, "claimed")
+			case ClaimEmpty:
+				h.observeWait(wait, c, "empty")
+			case ClaimDependencyUnavailable:
+				h.observeWait(wait, c, "unavailable")
+			}
 			h.respondClaim(w, c, req.OperationID, res)
 			return
 		}
@@ -272,10 +300,12 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 			h.d.InlineMaintenance.InlinePass(ctx)
 			if r.Context().Err() != nil {
 				h.metrics.claims.WithLabelValues("cancelled").Inc()
+				h.observeWait(wait, c, "cancelled")
 				return
 			}
 			select {
 			case <-h.stopping:
+				h.observeWait(wait, c, "unavailable")
 				h.respondShutdown(w, c)
 				return
 			default:
@@ -284,12 +314,20 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 		}
 		pause := time.NewTimer(h.recheckDelay())
 		select {
+		case <-waiter.wake():
+			// The signal spent this registration; the next check
+			// registers again.
+			pause.Stop()
+			waiter = nil
+			trigger = "notification"
 		case <-pause.C:
+			trigger = "periodic"
 		case <-deadline.C:
 			pause.Stop()
 			final = true
 		case <-h.stopping:
 			pause.Stop()
+			h.observeWait(wait, c, "unavailable")
 			h.respondShutdown(w, c)
 			return
 		case <-r.Context().Done():
@@ -298,8 +336,16 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 			// operation_id.
 			pause.Stop()
 			h.metrics.claims.WithLabelValues("cancelled").Inc()
+			h.observeWait(wait, c, "cancelled")
 			return
 		}
+	}
+}
+
+// observeWait records how long a waiting claim (wait_ms > 0) took.
+func (h *Handler) observeWait(wait time.Duration, c call, outcome string) {
+	if wait > 0 {
+		h.metrics.waitDuration.WithLabelValues(outcome).Observe(h.d.Clock.Now().Sub(c.start).Seconds())
 	}
 }
 
@@ -486,6 +532,8 @@ func (h *Handler) handleAck(w http.ResponseWriter, r *http.Request, c call) {
 	switch res.Outcome {
 	case AckAcknowledged, AckAlreadyAcknowledged:
 		if res.Outcome == AckAcknowledged {
+			// The next head, if any, is ready.
+			h.d.Notifier.Signal(SignalAck)
 			h.logAcknowledged(c, res)
 		}
 		writeJSON(w, http.StatusOK, ackResponse{Status: "acknowledged", MessageID: res.MessageID, AcknowledgedMs: res.AcknowledgedMs})
@@ -609,6 +657,8 @@ func (h *Handler) handleNack(w http.ResponseWriter, r *http.Request, c call) {
 			RecipientIdentity: res.RecipientIdentity, MessageID: res.MessageID, Reason: reasonNackExhausted,
 			DeliveryCycle: res.DeliveryCycle, Attempt: res.Attempt, ClaimedMs: res.ClaimedMs, DeadLetteredMs: res.DeadLetteredMs,
 		}, extra...)
+		// The next head, if any, is ready.
+		h.d.Notifier.Signal(SignalDeadLetter)
 		writeNackResult(w, res)
 	case NackAlreadyNacked:
 		writeNackResult(w, res)
