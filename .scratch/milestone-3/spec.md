@@ -1,6 +1,6 @@
 # Milestone 3 — notification wake-up and Webhook Endpoint administration
 
-Status: ready-for-agent
+Status: done
 
 Specification source of truth: `CONTEXT.md`, `docs/design/*`, `docs/adr/*`, and the implemented contracts in `.scratch/milestone-1/spec.md` and `.scratch/milestone-2/spec.md`. This spec fixes the Milestone 3 notification seam, the waiting-claim behavior around it, and the storage/script contracts for the remaining Webhook Endpoint administration before any of it is coded (`docs/design/implementation-milestones.md`). Domain vocabulary follows `CONTEXT.md`.
 

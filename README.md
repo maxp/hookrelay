@@ -6,7 +6,9 @@ Webhook relay that distributes incoming events to recipients through ordered del
 
 Milestone 1 (the tracer-bullet vertical slice) is implemented; its exit criterion is a green CI pipeline including the Compose smoke. Done: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey — the Admin CLI (`hookrelay admin webhook create|get`) on top of that API, and the webhook ingestion happy path: signed Telegram updates are verified, converted into Canonical Messages, deduplicated, and atomically queued per Recipient in Valkey. The ingestion rejection matrix, process protections, and the complete Telegram classification surface (every event-to-Recipient row, routing issues, fallback deduplication) are in place, and consumers can claim and acknowledge queued messages through the Consumer API (`POST /v1/deliveries/claim`, `POST /v1/deliveries/ack`). Claims long-poll for up to 30 seconds, startup reconciliation validates and safely repairs persisted state before readiness, and an automated Compose smoke test proves the whole slice.
 
-Milestone 2 (the complete delivery failure path, the first deployable release candidate) is implemented; its exit criterion is a green CI pipeline including the extended Compose smoke. It adds negative acknowledgement, lease extension and expiry, bounded retries with jitter, the global DLQ after the fourth failed attempt, audited DLQ replay with deduplication-conflict protection, the delivery-state read, DLQ retention, cooperative background and inline maintenance, Recipient block listing, inspection, and preconditioned clearing, startup reconciliation that executes overdue expiries and retries before readiness, webhook rate limits, the Valkey memory acceptance stop, and deduplication early eviction. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/) and [`.scratch/milestone-2/`](.scratch/milestone-2/).
+Milestone 2 (the complete delivery failure path, the first deployable release candidate) is implemented; its exit criterion is a green CI pipeline including the extended Compose smoke. It adds negative acknowledgement, lease extension and expiry, bounded retries with jitter, the global DLQ after the fourth failed attempt, audited DLQ replay with deduplication-conflict protection, the delivery-state read, DLQ retention, cooperative background and inline maintenance, Recipient block listing, inspection, and preconditioned clearing, startup reconciliation that executes overdue expiries and retries before readiness, webhook rate limits, the Valkey memory acceptance stop, and deduplication early eviction. 
+
+Milestone 3 (notification wake-up and Webhook Endpoint administration) is implemented. An in-process ready-work notifier wakes waiting claims as soon as this process makes work ready, with the periodic recheck kept as the loss-recovery path (ADR 0008), and the Admin API and CLI gain the endpoint list, `PATCH` enable/disable and deletion under strong `If-Match`, and the Bot Identity endpoint listing, which together complete credential replacement. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/), [`.scratch/milestone-2/`](.scratch/milestone-2/), and [`.scratch/milestone-3/`](.scratch/milestone-3/).
 
 ## Goals
 
@@ -109,15 +111,18 @@ chmod 600 .secrets/consumer .secrets/admin
 docker compose up --build
 ```
 
-The Compose smoke test proves the Milestone 1 slice and the Milestone 2
-failure path against that stack in production mode (endpoint via the Admin
+The Compose smoke test proves the Milestone 1 slice, the Milestone 2
+failure path, and the Milestone 3 additions against that stack in production mode (endpoint via the Admin
 CLI → signed webhook and its duplicate → claim → ack and repeated ack →
 empty queue → metrics and health → three nacks with observed retries →
 fourth nack dead-letters → `admin dlq list|get|replay` → `admin message
 delivery-state` → claim in `delivery_cycle=2` → ack → a lease left claimed
 → restart keeping the Valkey volume after the lease expired → the expiry is
 processed by startup reconciliation before readiness → persisted endpoint
-and continued deduplication). It shortens retry delays to 300 ms and the
+and continued deduplication → a waiting claim woken by a new webhook →
+credential replacement: a second endpoint, `admin bot webhooks`, `admin
+webhook list`, disable and delete the old endpoint, which then answers
+`404` while the new one accepts). It shortens retry delays to 300 ms and the
 initial lease to 5 s. It uses its own Compose project, generated secrets, and free
 loopback ports, and cleans up after itself; CI runs it as the `smoke` job:
 
@@ -238,8 +243,9 @@ maintain the `hr1:mi:<message_id>` message metadata; `claim_v2` records
 `activate_retry_v1` activates retries; `replay_dlq_v1` replays a dead
 letter and `replay_dlq_v2` keeps waiting replays in replay order, and `ack_v4`, `nack_v3`, and `expire_lease_v3` restore the
 cycle/attempt that replay saves as `pending_delivery_cycle` /
-`pending_attempt` in `hr1:mi` when they expose the next head);
-see also
+`pending_attempt` in `hr1:mi` when they expose the next head), and
+[`.scratch/milestone-3/spec.md`](.scratch/milestone-3/spec.md)
+(`endpoint_set_enabled_v1` and `endpoint_delete_v1`); see also
 [`docs/design/storage.md`](docs/design/storage.md).
 
 ## Consumer API

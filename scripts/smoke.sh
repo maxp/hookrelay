@@ -11,7 +11,11 @@
 #   delivery state via CLI → claim delivery_cycle=2 → ack → leave a lease
 #   claimed → restart keeping the Valkey volume after the lease expired →
 #   verify readiness (the expiry ran in startup reconciliation), the
-#   persisted endpoint, and continued deduplication.
+#   persisted endpoint, and continued deduplication → Milestone 3: a waiting
+#   claim woken by the ready-work notifier when a webhook arrives →
+#   credential replacement through the CLI (create a second endpoint, list
+#   the bot's endpoints, disable and delete the old one, the old path 404s,
+#   the new one accepts).
 #
 # The run uses its own Compose project, generated secrets, and free loopback
 # ports, so it never touches a developer's .secrets/ or running stack.
@@ -257,5 +261,47 @@ expect "stored messages after repeat" "$(vk --scan --pattern 'hr1:m:*' | wc -l |
 metrics="$(curl_ "$admin/metrics")"
 expect "deduplicated after restart" "$(metric 'hookrelay_messages_duplicate_total\{webhook_type="telegram"\}')" 1
 expect "consistency issues" "$(grep -c '^hookrelay_consistency_issues_total' <<<"$metrics" || true)" 0
+
+step "Milestone 3: a waiting claim wakes on a new webhook"
+# Drain the stalled message's retry so the waiting claim below can only
+# receive the new webhook.
+out="$(claim 0195c4d8-0000-7000-8000-00000000c001 5000)"
+expect "stalled retry claim" "$(json "$(head -n -1 <<<"$out")" 'd["message"]["message_id"], d["delivery"]["attempt"]')" "('${stalled_id}', 2)"
+token="$(json "$(head -n -1 <<<"$out")" 'd["delivery"]["delivery_token"]')"
+expect "stalled retry ack" "$(tail -n1 <<<"$(ack)")" 200
+claim 0195c4d8-0000-7000-8000-00000000c002 10000 >"$work/waiting.out" &
+waiter=$!
+sleep 1
+fixture4='{"update_id":780,"message":{"message_id":4,"date":1700000000,"chat":{"id":-100555,"type":"group"},"text":"wake"}}'
+expect "wake-up webhook" "$(send_fixture "$fixture4")" 200
+wait "$waiter"
+out="$(cat "$work/waiting.out")"
+expect "woken claim status" "$(tail -n1 <<<"$out")" 200
+expect "woken claim message" "$(json "$(head -n -1 <<<"$out")" 'd["message"]["recipient"]["chat_id"]')" -100555
+token="$(json "$(head -n -1 <<<"$out")" 'd["delivery"]["delivery_token"]')"
+expect "woken claim ack" "$(tail -n1 <<<"$(ack)")" 200
+metrics="$(curl_ "$admin/metrics")"
+# The acceptance signal found the registered waiting claim.
+expect "accept signal delivered" "$(python3 -c 'import sys; print(float(sys.argv[1] or 0) >= 1)' "$(metric 'hookrelay_ready_signals_total\{result="delivered",source="accept"\}')")" True
+
+step "Milestone 3: credential replacement through the Admin CLI"
+credential2="smoke-telegram-secret-02"
+compose exec -T -e HOOKRELAY_WEBHOOK_CREDENTIAL="$credential2" hookrelay \
+  /hookrelay admin webhook create --type telegram --bot-id 424242 --identifier wh_smoke2 --output json >/dev/null
+expect "bot endpoints" "$(json "$(admin_cli bot webhooks --platform telegram --bot-id 424242)" 'sorted(i["webhook_identifier"] for i in d["items"])')" \
+  "['wh_smoke', 'wh_smoke2']"
+expect "endpoint list" "$(json "$(admin_cli webhook list --limit 1)" 'len(d["items"]), "next_cursor" in d')" "(1, True)"
+disabled="$(admin_cli webhook disable --type telegram --identifier wh_smoke --yes)"
+expect "disabled endpoint" "$(json "$disabled" 'd["enabled"], d["config_version"]')" "(False, 2)"
+expect "webhook to the disabled endpoint" "$(send_webhook)" 404
+expect "delete" "$(json "$(admin_cli webhook delete --type telegram --identifier wh_smoke --yes)" 'd["outcome"]')" deleted
+expect "bot endpoints after delete" "$(json "$(admin_cli bot webhooks --platform telegram --bot-id 424242)" '[i["webhook_identifier"] for i in d["items"]]')" "['wh_smoke2']"
+expect "webhook to the deleted endpoint" "$(send_webhook)" 404
+expect "webhook to the new endpoint" "$(curl_ -o /dev/null -w '%{http_code}' -X POST "$public/webhook/telegram/wh_smoke2" \
+  -H 'Content-Type: application/json' -H "X-Telegram-Bot-Api-Secret-Token: $credential2" \
+  -d '{"update_id":781,"message":{"message_id":5,"date":1700000000,"chat":{"id":-100556,"type":"group"},"text":"new"}}')" 200
+metrics="$(curl_ "$admin/metrics")"
+expect "disable audit" "$(metric 'hookrelay_audit_events_total\{operation="webhook_endpoint_disabled",outcome="success"\}')" 1
+expect "delete audit" "$(metric 'hookrelay_audit_events_total\{operation="webhook_endpoint_deleted",outcome="success"\}')" 1
 
 printf '\nSMOKE PASSED\n'

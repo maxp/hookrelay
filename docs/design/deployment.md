@@ -96,7 +96,7 @@ Required jobs are:
 6. `govulncheck`;
 7. `linux/amd64` binary build;
 8. production container build;
-9. Docker Compose smoke test covering readiness, Webhook Endpoint creation, fixture webhook ingestion, claim, acknowledgement, metrics, and health, plus (from Milestone 2) the failure path: retries, dead-lettering, CLI replay and delivery-state, and startup expiry of a lease left claimed across a restart.
+9. Docker Compose smoke test covering readiness, Webhook Endpoint creation, fixture webhook ingestion, claim, acknowledgement, metrics, and health, plus (from Milestone 2) the failure path: retries, dead-lettering, CLI replay and delivery-state, and startup expiry of a lease left claimed across a restart; and (from Milestone 3) a notification-woken waiting claim and credential replacement through the CLI (second endpoint, Bot Identity listing, disable, delete).
 
 `golangci-lint` is not selected before the first implementation milestone. After real packages exist, the project may add a small stable rule set if it provides value beyond `gofmt`, `go vet`, tests, race detection, and vulnerability scanning.
 

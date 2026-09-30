@@ -83,7 +83,7 @@ This milestone completes the core ordering and recovery semantics and is the fir
 
 ## Later milestones
 
-3. Notification-based long-poll wake-up, waiting-claim tuning, and remaining Admin CRUD/CLI; the compliant periodic long-poll contract already exists from Milestone 1.
+3. Notification-based long-poll wake-up, waiting-claim tuning, and remaining Admin CRUD/CLI; the compliant periodic long-poll contract already exists from Milestone 1. *Implemented:* an in-process ready-work notifier ([ADR 0008](../adr/0008-in-process-ready-work-notification.md)) wakes the oldest waiting claim per ready-making transition while the 250 ms recheck stays unchanged; tuning is limited to wake-up and wait-duration metrics so any later recheck change is data-driven. The Admin API and CLI add the endpoint list, `PATCH` enable/disable, deletion, and the Bot Identity listing ([spec](../../.scratch/milestone-3/spec.md)).
 4. Administrative browser sessions, operational UI, audit views, and the remaining DLQ inspection and permanent-deletion operations; replay already exists from Milestone 2.
 5. Cross-slice reconciliation hardening and recovery tests for the complete first-version storage model; evaluate periodic consistency checking separately after implementation experience. Each earlier milestone extends startup checks as it introduces new persisted state.
 
