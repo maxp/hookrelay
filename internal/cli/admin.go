@@ -87,6 +87,7 @@ const adminUsage = `usage:
       --yes [common flags]
   hookrelay admin message delivery-state --message-id <id> [common flags]
   hookrelay admin audit list [--limit <n>] [--cursor <c>] [common flags]
+  hookrelay admin operations summary [common flags]
 
 recipient: --bot-platform <p> --bot-id <id> --scope <chat|user|bot|relay> [--chat-id <id> | --user-id <id>]
 
@@ -108,6 +109,13 @@ func runAdmin(args []string, env adminIO) int {
 	}
 	if len(args) >= 1 && args[0] == "message" {
 		return runMessage(args[1:], env)
+	}
+	if len(args) >= 1 && args[0] == "operations" {
+		if len(args) < 2 || args[1] != "summary" {
+			fmt.Fprint(env.Stderr, adminUsage)
+			return ExitUsage
+		}
+		return adminOperationsSummary(args[2:], env)
 	}
 	if len(args) >= 1 && args[0] == "audit" {
 		if len(args) < 2 || args[1] != "list" {

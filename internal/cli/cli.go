@@ -167,6 +167,7 @@ func Serve(args []string) int {
 		log.Error("delivery wiring failed", "event", "startup_failed", "error_code", "internal_error")
 		return ExitError
 	}
+	readiness := &app.Readiness{}
 	svc, err := administration.NewService(administration.ServiceDeps{
 		Ready:       notifier,
 		Repo:        valkey.NewEndpointStore(adapter),
@@ -176,6 +177,9 @@ func Serve(args []string) int {
 		Catalog:     typeCatalog{registry: webhookTypes},
 		Audit:       valkey.NewAuditSink(adapter),
 		AuditLog:    valkey.NewAuditLog(adapter),
+		Operations:  valkey.NewOperationsStore(adapter),
+		Readiness:   readiness,
+		GrafanaURL:  cfg.UIGrafanaURL,
 		AdminSecret: adminSecret,
 		Gen:         gen.Crypto{},
 		Logger:      log,
@@ -186,7 +190,6 @@ func Serve(args []string) int {
 		return ExitError
 	}
 
-	readiness := &app.Readiness{}
 	acceptor := valkey.NewMessageAcceptor(adapter, valkey.AcceptLimits{
 		MaxQueuedMessages:             cfg.MaxQueuedMessages,
 		MaxQueuedMessagesPerRecipient: cfg.MaxQueuedMessagesPerRecipient,

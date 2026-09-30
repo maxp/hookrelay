@@ -326,3 +326,28 @@ func TestClaimNotifications(t *testing.T) {
 		t.Errorf("invalid value accepted: %v", err)
 	}
 }
+
+func TestUIGrafanaURL(t *testing.T) {
+	env := devEnv()
+	c, err := Load(nil, getenv(env))
+	if err != nil || c.UIGrafanaURL != "" {
+		t.Fatalf("default: %q, %v", c.UIGrafanaURL, err)
+	}
+	env["HOOKRELAY_UI_GRAFANA_URL"] = "https://grafana.example/d/hookrelay"
+	if c, err := Load(nil, getenv(env)); err != nil || c.UIGrafanaURL != "https://grafana.example/d/hookrelay" {
+		t.Errorf("env: %v, %v", c, err)
+	}
+	if c, err := Load([]string{"--ui-grafana-url", "http://g:3000/x"}, getenv(env)); err != nil || c.UIGrafanaURL != "http://g:3000/x" {
+		t.Errorf("flag: %v, %v", c, err)
+	}
+	for _, bad := range []string{"grafana.example", "javascript:alert(1)", "ftp://g/x", "https://user:pw@g/x", "/relative"} {
+		env["HOOKRELAY_UI_GRAFANA_URL"] = bad
+		_, err := Load(nil, getenv(env))
+		if err == nil || !strings.Contains(err.Error(), "HOOKRELAY_UI_GRAFANA_URL") {
+			t.Errorf("%q accepted: %v", bad, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "pw") {
+			t.Errorf("error echoes the value: %v", err)
+		}
+	}
+}

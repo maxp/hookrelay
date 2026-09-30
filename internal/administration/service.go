@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -179,6 +180,13 @@ type ServiceDeps struct {
 	Audit    AuditSink
 	// AuditLog serves the audit listing; nil leaves it unregistered.
 	AuditLog AuditLog
+	// Operations serves the operations summary; nil leaves it
+	// unregistered. Readiness and GrafanaURL complete that summary.
+	Operations OperationsReader
+	Readiness  ReadinessView
+	GrafanaURL string
+	// Now is the clock for generated timestamps; nil uses time.Now.
+	Now func() time.Time
 	// AdminSecret must already be resolved and validated by the
 	// configuration layer.
 	AdminSecret string
@@ -222,6 +230,10 @@ type Service struct {
 	catalog     TypeCatalog
 	audit       AuditSink
 	auditLog    AuditLog
+	operations  OperationsReader
+	readiness   ReadinessView
+	grafanaURL  string
+	now         func() time.Time
 	ready       ReadySignal
 	// adminSecretDigest is the SHA-256 of the Admin Secret: comparing
 	// fixed-size digests keeps the check constant-time in the secret length.
@@ -241,6 +253,10 @@ func NewService(d ServiceDeps) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	now := d.Now
+	if now == nil {
+		now = time.Now
+	}
 	log := d.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -253,6 +269,10 @@ func NewService(d ServiceDeps) (*Service, error) {
 		catalog:           d.Catalog,
 		audit:             d.Audit,
 		auditLog:          d.AuditLog,
+		operations:        d.Operations,
+		readiness:         d.Readiness,
+		grafanaURL:        d.GrafanaURL,
+		now:               now,
 		ready:             d.Ready,
 		adminSecretDigest: sha256.Sum256([]byte(d.AdminSecret)),
 		gen:               d.Gen,

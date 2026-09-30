@@ -57,6 +57,10 @@ type Config struct {
 	AdminOrigin       *url.URL
 	AdminCookieSecure bool
 
+	// UIGrafanaURL is the optional dashboard link shown by the operations
+	// summary and the operational UI; empty shows none.
+	UIGrafanaURL string
+
 	// PprofEnabled is validated in Milestone 1; the profiling handlers
 	// arrive with a later slice.
 	PprofEnabled bool
@@ -136,6 +140,7 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	logLevel := set("log-level")
 	environment := set("environment")
 	adminOrigin := set("admin-origin")
+	grafanaURL := set("ui-grafana-url")
 
 	fs := newFlagSet("hookrelay serve")
 	fs.StringVar(publicAddress, "public-address", "", "public listener address (env HOOKRELAY_PUBLIC_ADDRESS)")
@@ -144,6 +149,7 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	fs.StringVar(logLevel, "log-level", "", "log level: debug, info, warn, error (env HOOKRELAY_LOG_LEVEL)")
 	fs.StringVar(environment, "environment", "", "deployment environment: development, production (env HOOKRELAY_ENVIRONMENT)")
 	fs.StringVar(adminOrigin, "admin-origin", "", "administrative origin URL (env HOOKRELAY_ADMIN_ORIGIN)")
+	fs.StringVar(grafanaURL, "ui-grafana-url", "", "optional Grafana dashboard URL shown by the operational UI (env HOOKRELAY_UI_GRAFANA_URL)")
 	if err := fs.Parse(args); err != nil {
 		return nil, fmt.Errorf("parse flags: %w", err)
 	}
@@ -255,6 +261,14 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("HOOKRELAY_ADMIN_ORIGIN: must be an absolute URL, got %q", originRaw)
 	}
 	c.AdminOrigin = origin
+
+	if raw := envOr("ui-grafana-url", "HOOKRELAY_UI_GRAFANA_URL", ""); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+			return nil, fmt.Errorf("HOOKRELAY_UI_GRAFANA_URL: must be an absolute http or https URL without userinfo")
+		}
+		c.UIGrafanaURL = raw
+	}
 
 	// The session cookie is Secure by default only in production.
 	if c.AdminCookieSecure, err = getBool("HOOKRELAY_ADMIN_COOKIE_SECURE", c.Production()); err != nil {

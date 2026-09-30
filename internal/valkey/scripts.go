@@ -180,6 +180,14 @@ func init() {
 		"recipient_blocked":     0,
 		"wrong_type":            0,
 	})
+	register("operations_summary_v1", 1, map[string]int{
+		// queued_messages, ready, leased, retry_wait, blocked,
+		// earliest_lease_expires_ms, earliest_retry_at_ms, dead_letters,
+		// oldest_dead_lettered_ms, newest_dead_lettered_ms,
+		// webhook_endpoints, admin_sessions, audit_length
+		"snapshot":   13,
+		"wrong_type": 0,
+	})
 	register("evict_dedup_v1", 1, map[string]int{
 		// count, oldest_accepted_ms, live_records, stop
 		"evicted":    4,
