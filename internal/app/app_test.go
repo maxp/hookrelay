@@ -256,6 +256,7 @@ func TestRunHoldsReadinessUntilPublicListenerOpens(t *testing.T) {
 // public paths stay on the mux.
 func TestWebhookRoutesBypassMuxCleaning(t *testing.T) {
 	deps := testDeps(t)
+	deps.Readiness.MarkReady()
 	var seen []string
 	deps.Webhooks = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.URL.EscapedPath())

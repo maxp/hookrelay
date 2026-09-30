@@ -13,6 +13,12 @@ This procedure clears a protective block only after the authoritative queue, hea
 - Have a second operator review any incident-specific mutation of authoritative state.
 - Backup and restore policy remains deferred; this runbook does not imply that an ad hoc data export is an approved backup.
 
+## Complete-model checks and recovery admission
+
+Checks run at startup and after Valkey loss, not as a periodic full scan. To investigate suspected whole-model/index drift, coordinate a process restart and observe readiness, `hookrelay_reconciliation_in_progress`, bounded consistency metrics, and safe reconciliation logs. Do not run a live full scan or edit indexes by hand. The [consistency policy](../design/consistency-checking.md) records detection limits and the five-minute pass deadline.
+
+During recovery the process drains admitted API requests and background maintenance before discovery. Public work is refused while unready; storage-backed `/admin/v1/` diagnosis can temporarily receive `503` with `Retry-After: 1` during a pass, reopening between held/failed passes. Health/metrics remain available. A `503` that may have followed an already-admitted mutation still requires the uncertain-outcome procedure below; it is not proof that no mutation occurred.
+
 ## 1. Identify the blocked Recipient
 
 List blocked Recipients:
@@ -59,6 +65,8 @@ The general invariants include:
 - only the queue head has active delivery state;
 - every queued non-head message with attempt history carries a complete saved replay pair (`pending_delivery_cycle`, `pending_attempt`) in its message metadata; `queued_delivery_state_missing` or `queued_delivery_state_invalid` means that pair must be reconstructed from the audit and attempt history, never reset to cycle 1, attempt 1;
 - status and deadline fields agree;
+- `active_attempt_inconsistent` requires review of leased-head/token/claim-operation identity and TTL evidence, without reconstructing a token or replaying an uncertain claim;
+- `message_lifecycle_inconsistent` requires review of blob/metadata/history and lifecycle exclusivity; a narrow head inspection/clear is not proof that every lifecycle record was checked, so follow incident correction with a coordinated complete-model restart;
 - no active Delivery Token is invented, copied, or replaced;
 - a Dead-letter Message is not simultaneously present as a normal queued position except during the defined atomic replay transition;
 - the Recipient belongs to no ready, lease, or retry index while blocked.

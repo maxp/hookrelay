@@ -155,7 +155,11 @@ local operation = redis.call('HMGET', operationKey, 'kind', 'state', 'delivery_t
   'recipient_identity', 'delivery_cycle', 'attempt', 'claimed_ms', 'lease_expires_ms', 'args_digest')
 if operation[1] ~= 'claim' or operation[2] ~= 'active' or operation[3] ~= state[8]
     or operation[4] ~= state[2] or operation[5] ~= rid or operation[6] ~= state[3]
-    or operation[7] ~= state[4] or operation[8] ~= state[5] or operation[9] ~= state[7]
+    or operation[7] ~= state[4] or operation[8] ~= state[5]
+    -- The idempotent claim response retains its original deadline after an
+    -- extension; only head state and token record track the current deadline.
+    or not valid_positive(operation[9]) or tonumber(operation[9]) <= tonumber(state[5])
+    or tonumber(operation[9]) > tonumber(state[7])
     or not operation[10] or operation[10] == '' then
   return block('claim_operation_mismatch')
 end

@@ -248,13 +248,14 @@ func Serve(args []string) int {
 		JitterMax:   cfg.RetryJitterMax,
 	}
 	maintenance, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
-		Notifier:     notifier,
-		Retries:      deliveryStore,
-		Leases:       deliveryStore,
-		RetryPolicy:  retryPolicy,
-		Attempts:     attempts,
-		DeadLetters:  deliveryStore,
-		DLQRetention: cfg.DLQRetention,
+		RunRoundGuard: readiness.RunMaintenanceRound,
+		Notifier:      notifier,
+		Retries:       deliveryStore,
+		Leases:        deliveryStore,
+		RetryPolicy:   retryPolicy,
+		Attempts:      attempts,
+		DeadLetters:   deliveryStore,
+		DLQRetention:  cfg.DLQRetention,
 		RoundHooks: []func(context.Context) error{
 			adapter.SampleServer,
 			func(ctx context.Context) error { webhooks.MaintainCapacity(ctx); return nil },

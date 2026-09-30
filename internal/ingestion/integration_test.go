@@ -113,9 +113,11 @@ func composeLimits(t *testing.T, limits valkey.AcceptLimits, acceptor func(*valk
 	if err != nil {
 		t.Fatal(err)
 	}
+	readiness := &app.Readiness{}
+	readiness.MarkReady() // This harness bypasses App.Run after validating storage.
 	application := app.New(app.Deps{
 		Config: cfg, Logger: observability.NewTestLogger("error", &strings.Builder{}), Registry: reg,
-		Readiness: &app.Readiness{}, Webhooks: h,
+		Readiness: readiness, Webhooks: h,
 	})
 	return &env{t: t, adapter: a, raw: raw, registry: reg, public: application.PublicHandler(), handler: h}
 }

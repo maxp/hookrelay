@@ -479,3 +479,24 @@ func TestMaintenanceInlinePassFailures(t *testing.T) {
 		t.Errorf("transition failure not logged under the inline kind:\n%s", logs)
 	}
 }
+
+// TestMaintenanceRecoveryAdmission skips an entire background round while the
+// application barrier is closed, but keeps the loop alive for later recovery.
+func TestMaintenanceRecoveryAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake := &fakeActivator{nowMs: 10000, pending: dueEntries(1, 7500)}
+	mh := newMaintenanceHarness(t, fake, nil)
+	admissions := 0
+	mh.m.d.RunRoundGuard = func(ctx context.Context, round func(context.Context)) {
+		admissions++
+		if admissions == 2 {
+			round(ctx)
+			cancel()
+		}
+	}
+	mh.m.Run(ctx)
+	if admissions != 2 || len(fake.pending) != 0 || len(fake.reads) != 1 {
+		t.Fatalf("admissions=%d pending=%d due_calls=%d", admissions, len(fake.pending), len(fake.reads))
+	}
+}

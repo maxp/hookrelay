@@ -180,7 +180,8 @@ if bt ~= 'none' and bt ~= 'set' then
   return {'wrong_type', 'bot_index_type'}
 end
 local inBot = redis.call('SISMEMBER', botKey, member)
-if inBot == 0 and redis.call('SCARD', botKey) >= 100 then
+local botCount = redis.call('SCARD', botKey)
+if botCount > 100 or (inBot == 0 and botCount >= 100) then
   return {'invalid', 'bot_endpoint_limit'}
 end
 

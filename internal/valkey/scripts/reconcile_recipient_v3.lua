@@ -144,8 +144,15 @@ if mt ~= 'none' then
   if mt ~= 'hash' then
     return {'unhandled', 0, queueLen, 'marker_type'}
   end
-  local detected = tonumber(redis.call('HGET', markerKey, 'detected_ms')) or now_ms
-  local reason = redis.call('HGET', markerKey, 'reason_code') or ''
+  local detected = redis.call('HGET', markerKey, 'detected_ms')
+  local reason = redis.call('HGET', markerKey, 'reason_code')
+  local reasonOK = reason == 'queue_head_mismatch' or reason == 'head_message_missing' or reason == 'head_state_missing'
+    or reason == 'unsupported_key_type' or reason == 'queued_delivery_state_missing'
+    or reason == 'queued_delivery_state_invalid' or reason == 'active_attempt_inconsistent'
+    or reason == 'message_lifecycle_inconsistent'
+  if not valid_ms(detected) or not reasonOK then
+    return {'unhandled', 0, queueLen, 'marker_invalid'}
+  end
   return {'already_blocked', align_blocked(detected), queueLen, reason}
 end
 

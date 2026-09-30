@@ -90,7 +90,7 @@ func TestReplayIntoEmptyQueue(t *testing.T) {
 	if h := lrange(t, a, "hr1:a:m1"); len(h) != 1 {
 		t.Errorf("history = %v, want the cycle-1 attempt kept", h)
 	}
-	if !exists(t, a, "hr1:m:m1") || hget(t, a, "hr1:mi:m1", "dedup_identity_digest") != "d-m1" {
+	if !exists(t, a, "hr1:m:m1") || hget(t, a, "hr1:mi:m1", "dedup_identity_digest") != messageDedupDigest("m1") {
 		t.Error("blob or metadata not kept")
 	}
 	assertPending(t, a, "m1", "", "")
@@ -154,7 +154,7 @@ func TestReplayBehindLeasedHead(t *testing.T) {
 	ackOK(t, s, "dlv_2")
 	assertHead(t, a, ridA, "m1", "ready", "2", "1")
 	assertPending(t, a, "m1", "", "")
-	if hget(t, a, "hr1:mi:m1", "dedup_identity_digest") != "d-m1" {
+	if hget(t, a, "hr1:mi:m1", "dedup_identity_digest") != messageDedupDigest("m1") {
 		t.Error("restoring the pending pair dropped the dedup digest")
 	}
 	if d := claimNext(t, s, "op-3", "dlv_3"); d.MessageID != "m1" || d.DeliveryCycle != 2 || d.Attempt != 1 {
@@ -401,7 +401,7 @@ func TestReplayDeduplicationResolution(t *testing.T) {
 	a, s := claimSetup(t)
 	enqueue(t, a, "m1", ridA)
 	deadLetterOne(t, s, "op-1", "dlv_1")
-	a.testDo(t, "HSET", "hr1:d:d-m1", "message_id", "m9")
+	a.testDo(t, "HSET", "hr1:d:"+messageDedupDigest("m1"), "message_id", "m9")
 
 	before := snapshot(t, a)
 	if r := replay(a, "m1", "reject"); r.Result != administration.ReplayDeduplicationConflict {
@@ -413,7 +413,7 @@ func TestReplayDeduplicationResolution(t *testing.T) {
 	if r.Result != administration.ReplayReplayed || r.DeduplicationResolution != "kept_current" {
 		t.Fatalf("keep_current = %+v", r)
 	}
-	if got := hget(t, a, "hr1:d:d-m1", "message_id"); got != "m9" {
+	if got := hget(t, a, "hr1:d:"+messageDedupDigest("m1"), "message_id"); got != "m9" {
 		t.Errorf("dedup mapping = %s, want the newer m9 kept", got)
 	}
 
@@ -427,7 +427,7 @@ func TestReplayDeduplicationResolution(t *testing.T) {
 	if got := hget(t, a, "hr1:dl:m2", "dedup_identity_digest"); got != "" {
 		t.Fatalf("legacy dedup digest = %q", got)
 	}
-	a.testDo(t, "HSET", "hr1:d:d-m2", "message_id", "m9")
+	a.testDo(t, "HSET", "hr1:d:"+messageDedupDigest("m2"), "message_id", "m9")
 	if r := replay(a, "m2", "reject"); r.Result != administration.ReplayReplayed || r.DeduplicationResolution != "not_conflicting" {
 		t.Errorf("legacy replay = %+v", r)
 	}
@@ -446,8 +446,8 @@ func TestReplayRefusals(t *testing.T) {
 		"record without cycle": {func(t *testing.T, a *Adapter) { a.testDo(t, "HDEL", "hr1:dl:m1", "delivery_cycle") }, administration.ReplayWrongType},
 		"blob not a string":    {func(t *testing.T, a *Adapter) { a.testDo(t, "DEL", "hr1:m:m1"); a.testDo(t, "RPUSH", "hr1:m:m1", "x") }, administration.ReplayWrongType},
 		"dedup record not a hash": {func(t *testing.T, a *Adapter) {
-			a.testDo(t, "DEL", "hr1:d:d-m1")
-			a.testDo(t, "SET", "hr1:d:d-m1", "x")
+			a.testDo(t, "DEL", "hr1:d:"+messageDedupDigest("m1"))
+			a.testDo(t, "SET", "hr1:d:"+messageDedupDigest("m1"), "x")
 		}, administration.ReplayWrongType},
 		"audit not a stream":       {func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:audit", "x") }, administration.ReplayWrongType},
 		"counter malformed":        {func(t *testing.T, a *Adapter) { a.testDo(t, "SET", "hr1:stats:queued_messages", "x") }, administration.ReplayWrongType},
@@ -648,7 +648,7 @@ func TestReconcileQueuedDeliveryState(t *testing.T) {
 			if rep.BlockReasons[reason] != 1 {
 				t.Fatalf("reconcile = %+v", rep.BlockReasons)
 			}
-			if m := hgetall(t, a, "hr1:mi:m1"); m["dedup_identity_digest"] != "d-m1" {
+			if m := hgetall(t, a, "hr1:mi:m1"); m["dedup_identity_digest"] != messageDedupDigest("m1") {
 				t.Errorf("reconciliation rewrote metadata: %v", m)
 			}
 			store := testRecipientStore(a)
@@ -742,7 +742,7 @@ func TestDeadLetterRoutesOverRealValkey(t *testing.T) {
 		t.Errorf("get = %d %s", w.Code, w.Body.String())
 	}
 
-	a.testDo(t, "HSET", "hr1:d:d-"+id, "message_id", "other")
+	a.testDo(t, "HSET", "hr1:d:"+messageDedupDigest(id), "message_id", "other")
 	if w := call(http.MethodPost, "/admin/v1/dead-letters/"+id+"/replay", ""); w.Code != http.StatusConflict ||
 		!strings.Contains(w.Body.String(), "deduplication_conflict") {
 		t.Errorf("conflicting replay = %d %s", w.Code, w.Body.String())

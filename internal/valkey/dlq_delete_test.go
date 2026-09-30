@@ -32,7 +32,7 @@ func TestDLQDeleteDeletesEverything(t *testing.T) {
 	enqueueJSON(t, a, "m1", ridA)
 	enqueueJSON(t, a, "m2", ridA)
 	deadLetterOne(t, s, "op-1", "dlv_1")
-	dedup := hgetall(t, a, "hr1:d:d-m1")
+	dedup := hgetall(t, a, "hr1:d:"+messageDedupDigest("m1"))
 
 	d := deleteDLQ(a, "m1", dlqVersion(t, a, "m1"))
 	if d.Result != administration.DeleteDLQDeleted || d.RecipientIdentity != ridA || d.Reason != "nack_exhausted" || d.DeletedMs <= 0 {
@@ -46,7 +46,7 @@ func TestDLQDeleteDeletesEverything(t *testing.T) {
 	if _, ok := score(t, a, "hr1:dlq", "m1"); ok {
 		t.Error("dlq member kept")
 	}
-	if got := hgetall(t, a, "hr1:d:d-m1"); len(got) == 0 || got["message_id"] != dedup["message_id"] {
+	if got := hgetall(t, a, "hr1:d:"+messageDedupDigest("m1")); len(got) == 0 || got["message_id"] != dedup["message_id"] {
 		t.Errorf("dedup record = %v, want %v", got, dedup)
 	}
 	if !exists(t, a, "hr1:m:m2") || lrange(t, a, "hr1:r:"+ridA+":q")[0] != "m2" {

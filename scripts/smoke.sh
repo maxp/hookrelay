@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compose smoke test: the Milestone 1 vertical slice, the Milestone 2
-# failure path, and the Milestone 3 and 4 additions end to end against the
+# failure path, and the Milestone 3–5 additions end to end against the
 # pinned Compose stack, in production mode (AOF + noeviction gate).
 #
 #   start stack → create Telegram endpoint (CLI) → send signed fixture →
@@ -351,6 +351,33 @@ cookie="$(sed -E 's/^[^:]*: (hookrelay_admin=[^;]*).*/\1/' <<<"$set_cookie")"
 session="$(curl_ "$admin/admin/v1/session" -H "Cookie: $cookie")"
 csrf="$(json "$session" 'd["csrf_token"]')"
 expect "session read" "$(json "$session" 'd["authenticated"], len(d["csrf_token"])')" "(True, 22)"
+metrics="$(curl_ "$admin/metrics")"
+expect "login success" "$(metric 'hookrelay_admin_login_attempts_total\{outcome="success"\}')" 1
+
+step "Milestone 5: recover endpoint indexes beside persisted DLQ and session state"
+# Stop the writer before injecting derived-only damage. Keep the authoritative
+# Hash and the persisted volume, including two dead letters and a live session.
+compose stop hookrelay
+vk SREM hr1:bot:telegram:424242:webhooks telegram:wh_smoke2 >/dev/null
+vk ZREM hr1:webhooks telegram:wh_smoke2 >/dev/null
+expect "missing Bot Identity membership" "$(vk SISMEMBER hr1:bot:telegram:424242:webhooks telegram:wh_smoke2)" 0
+expect "missing endpoint listing" "$(vk ZCARD hr1:webhooks)" 0
+compose down
+compose up -d --wait
+wait_ready
+expect "recovered endpoint list" "$(json "$(admin_cli webhook list)" '[i["webhook_identifier"] for i in d["items"]]')" "['wh_smoke2']"
+expect "recovered Bot Identity list" "$(json "$(admin_cli bot webhooks --platform telegram --bot-id 424242)" '[i["webhook_identifier"] for i in d["items"]]')" "['wh_smoke2']"
+expect "listing score from authoritative endpoint" "$(vk ZSCORE hr1:webhooks telegram:wh_smoke2)" "$(vk HGET hr1:wh:telegram:wh_smoke2 created_ms)"
+expect "DLQ and sessions survived recovery" "$(json "$(admin_cli operations summary)" 'd["dead_letters"]["count"], d["admin_sessions"]["indexed"], d["readiness"]["ready"]')" "(2, 1, True)"
+session="$(curl_ "$admin/admin/v1/session" -H "Cookie: $cookie")"
+expect "persisted browser session" "$(json "$session" 'd["authenticated"], d["csrf_token"] == "'"$csrf"'"')" "(True, True)"
+expect "persisted acknowledged delivery" "$(json "$(admin_cli message delivery-state --message-id "$failed_id")" 'd["state"], d["delivery_cycle"]')" "('acknowledged', 2)"
+expect "recovery liveness" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/health/live")" 200
+metrics="$(curl_ "$admin/metrics")"
+expect "reconciliation idle" "$(metric 'hookrelay_reconciliation_in_progress')" 0
+expect "Bot Identity index restored" "$(metric 'hookrelay_consistency_issues_total\{kind="endpoint_bot_index_missing",resolution="restored"\}')" 1
+expect "listing index restored" "$(metric 'hookrelay_consistency_issues_total\{kind="endpoint_listing_missing",resolution="restored"\}')" 1
+expect "bounded recovery findings" "$(grep -c '^hookrelay_consistency_issues_total{' <<<"$metrics")" 2
 cookie_call() { # cookie_call <method> <path> [extra curl args...]
   local method="$1" path="$2"
   shift 2
@@ -362,15 +389,15 @@ expect "replay with CSRF" "$(tail -n1 <<<"$out")" 200
 expect "cookie replay" "$(json "$(head -n -1 <<<"$out")" 'd["status"], d["delivery_cycle"]')" "('replayed', 2)"
 out="$(cookie_call POST "/admin/v1/dead-letters/$dl_delete/payload" -H "X-CSRF-Token: $csrf")"
 expect "payload status" "$(tail -n1 <<<"$out")" 200
-expect "payload text" "$(json "$(head -n -1 <<<"$out")" 'd["message"]["payload"]["message"]["text"]')" '<img src=x onerror=alert(1)>'
+expect "payload content preserved" "$(json "$(head -n -1 <<<"$out")" 'd["message"]["payload"]["message"]["text"] == "<img src=x onerror=alert(1)>"')" True
 etag="$(curl_ -D - -o /dev/null "$admin/admin/v1/dead-letters/$dl_delete" -H "Cookie: $cookie" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)"
 expect "delete without If-Match" "$(tail -n1 <<<"$(cookie_call DELETE "/admin/v1/dead-letters/$dl_delete" -H "X-CSRF-Token: $csrf")")" 428
 expect "delete with If-Match" "$(tail -n1 <<<"$(cookie_call DELETE "/admin/v1/dead-letters/$dl_delete" -H "X-CSRF-Token: $csrf" -H "If-Match: $etag")")" 204
 expect "deleted message gone" "$(vk EXISTS "hr1:m:$dl_delete" "hr1:dl:$dl_delete")" 0
 summary="$(curl_ "$admin/admin/v1/operations/summary" -H "Cookie: $cookie")"
 expect "summary via cookie" "$(json "$summary" 'd["dead_letters"]["count"], d["admin_sessions"]["indexed"]')" "(0, 1)"
-audit="$(admin_cli audit list --limit 5)"
-expect "audit trail" "$(json "$audit" '[(i["operation"], i["actor"]) for i in d["items"][:4]]')" \
+audit="$(admin_cli audit list --limit 10)"
+expect "audit trail" "$(json "$audit" '[(i["operation"], i["actor"]) for i in d["items"] if i["actor"] == "admin_session"][:4]')" \
   "[('dead_letter_deleted', 'admin_session'), ('dead_letter_payload_viewed', 'admin_session'), ('dead_letter_replayed', 'admin_session'), ('admin_login', 'admin_session')]"
 expect "logout" "$(tail -n1 <<<"$(cookie_call DELETE /admin/v1/session -H "X-CSRF-Token: $csrf")")" 204
 expect "session after logout" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/admin/v1/session" -H "Cookie: $cookie")" 401
@@ -381,9 +408,31 @@ expect "UI status" "$(head -n1 <<<"$ui_headers" | awk '{print $2}')" 200
 expect "UI CSP" "$(grep -ci "^content-security-policy: default-src 'none'; script-src 'self'" <<<"$ui_headers")" 1
 expect "root redirect" "$(curl_ -o /dev/null -w '%{http_code} %{redirect_url}' "$admin/")" "302 $admin/ui/"
 metrics="$(curl_ "$admin/metrics")"
-expect "login success" "$(metric 'hookrelay_admin_login_attempts_total\{outcome="success"\}')" 1
 expect "CSRF rejection" "$(metric 'hookrelay_admin_csrf_rejections_total\{reason="token"\}')" 1
 expect "payload views" "$(metric 'hookrelay_dlq_payload_inspections_total\{outcome="disclosed"\}')" 1
 expect "deletions" "$(metric 'hookrelay_dead_letter_deletions_total\{outcome="deleted"\}')" 1
+
+step "Milestone 5: safe recovery diagnostics"
+compose logs --no-color hookrelay >"$work/app.log"
+vk XRANGE hr1:audit - + >"$work/audit.txt"
+# Check values without printing the secret that would cause a failure. Also
+# reject token/payload field names in diagnostic output, never payload reads.
+python3 - "$work/app.log" "$work/audit.txt" "$work/secrets/admin" "$work/secrets/consumer" "$work/login.headers" <<'PY' || fail "sensitive recovery diagnostics"
+import pathlib, re, sys
+logs, audit, admin_file, consumer_file, cookie_file = map(pathlib.Path, sys.argv[1:])
+text = logs.read_text() + audit.read_text()
+secrets = [admin_file.read_text().strip(), consumer_file.read_text().strip(),
+           "smoke-telegram-secret-01", "smoke-telegram-secret-02", "<img src=x onerror=alert(1)>"]
+match = re.search(r"hookrelay_admin=([^;\s]+)", cookie_file.read_text())
+if match:
+    secrets.append(match.group(1))
+assert all(value and value not in text for value in secrets), "secret/payload value leaked"
+assert 'dlv_' not in text and '"csrf_token"' not in text and '"payload"' not in text, "secret/payload field leaked"
+allowed = {"endpoint_bot_restored", "endpoint_listing_restored", "dedup_expired_removed", "dedup_restored", "dedup_orphans_removed", "dedup_skipped", "unhandled", "event", "full", "timestamp_ms", "level", "service", "version", "message"}
+import json
+completed = [json.loads(line[line.index('{'):]) for line in logs.read_text().splitlines() if '"event":"reconciliation_completed"' in line]
+assert completed and set(completed[-1]) <= allowed, "unexpected recovery findings"
+assert completed[-1].get("endpoint_bot_restored") == 1 and completed[-1].get("endpoint_listing_restored") == 1
+PY
 
 printf '\nSMOKE PASSED\n'

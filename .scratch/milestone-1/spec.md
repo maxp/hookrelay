@@ -1,12 +1,12 @@
 # Milestone 1 — happy-path vertical slice
 
-Status: ready-for-agent
+Status: done
 
 Specification source of truth: `CONTEXT.md`, `docs/design/*`, `docs/adr/*`. This spec fixes the Milestone 1 storage encodings, Lua script contracts, startup reconciliation contract, and the M1 subsets of the HTTP APIs, per the storage contract boundary and implementation milestones. Domain vocabulary follows `CONTEXT.md`.
 
 ## Problem Statement
 
-An operator running a Telegram bot has no way to receive Telegram webhooks, turn them into durable, deduplicated, per-recipient ordered messages, and hand them to their processing program through a stable API. Every bot integration today must reimplement webhook verification, duplicate suppression, queueing, ordering, and failure handling. There is no hookrelay implementation at all: the design is complete, the code does not exist.
+An operator running a Telegram bot has no way to receive Telegram webhooks, turn them into durable, deduplicated, per-recipient ordered messages, and hand them to their processing program through a stable API. Every bot integration today must reimplement webhook verification, duplicate suppression, queueing, ordering, and failure handling. At the start of this milestone, the design was complete but no hookrelay implementation existed. The vertical slice described below is now implemented; all 12 Milestone 1 tickets are done.
 
 ## Solution
 

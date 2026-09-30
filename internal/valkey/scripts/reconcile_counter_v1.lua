@@ -1,7 +1,8 @@
 -- reconcile_counter_v1: set hr1:stats:queued_messages to a verified scanned
 -- total, only if it still holds the value observed before the scan
--- (compare-and-set), so concurrent accept/ack transitions are never
--- overwritten.
+-- (compare-and-set). The caller must quiesce writers for the entire scan;
+-- numeric equality cannot detect accept/ack ABA changes. CAS is an extra
+-- precondition, not a serving-time snapshot fence.
 --
 -- KEYS[1] queued counter hr1:stats:queued_messages
 --

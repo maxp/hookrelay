@@ -1,6 +1,6 @@
 # Milestone 5 — complete-model reconciliation hardening and recovery proof
 
-Status: in progress
+Status: done
 
 Specification source of truth: `CONTEXT.md`, `docs/design/*`, `docs/adr/*`, and the implemented contracts in `.scratch/milestone-1/spec.md` through `.scratch/milestone-4/spec.md`. This milestone hardens the shared startup/recovery gate for the complete first-version `hr1:` storage model. Domain vocabulary follows `CONTEXT.md`.
 
@@ -31,7 +31,7 @@ The design also leaves periodic consistency checking intentionally unresolved. A
 
 ### Scope and sequence
 
-Ticket 01 implements the already-deferred endpoint-index reconciliation. Ticket 02 publishes the complete key-family and transition-boundary gap matrix before any additional hardening scripts are coded. Tickets 03 and 04 implement the evidence-backed delivery-record and message-lifecycle amendments fixed by that matrix and update this spec with their exact contracts first. Ticket 05 composes the recovery fault matrix. Ticket 06 evaluates periodic checking. Ticket 07 extends the smoke and closes the milestone.
+Ticket 01 implements the already-deferred endpoint-index reconciliation. Ticket 02 publishes the complete key-family and transition-boundary gap matrix before any additional hardening scripts are coded. Tickets 03 and 04 implement the evidence-backed delivery-record and message-lifecycle amendments fixed by that matrix and update this spec with their exact contracts first. Ticket 05 composes the recovery fault matrix. Ticket 06 evaluates periodic checking and exposed the recovery quiescence gap. Added ticket 08 specifies and implements that barrier before ticket 07 extends the smoke and closes the milestone.
 
 This sequencing is deliberate: Milestone 5 is hardening, not permission to invent repairs. Every repair must be derived from authoritative state; every ambiguity that cannot be isolated or reconstructed safely continues to hold readiness or create the accepted Recipient block marker.
 
@@ -65,7 +65,7 @@ Modes:
 
 1. `bot_member`: the caller found `member` in the scanned Bot Identity Set. A malformed member or absent endpoint Hash is removed from that Set. If the endpoint is valid but names another Bot Identity, the member is removed from the scanned Set. A matching membership is unchanged. A wrong-typed or malformed authoritative endpoint is not removed and returns `invalid`/`wrong_type`.
 2. `listing_member`: the caller found `member` in `hr1:webhooks`. A malformed member or absent endpoint Hash is removed from the listing. A valid endpoint with a missing or wrong score is set to `created_ms`. A wrong-typed or malformed authoritative endpoint is unchanged and returns `invalid`/`wrong_type`.
-3. `endpoint`: the caller found the endpoint Hash. A valid endpoint restores its correct Bot Identity Set member and its listing member/score. Before adding a missing Bot membership, `SCARD` must be below 100; 100 existing members is `invalid` with reason `bot_endpoint_limit`. An invalid endpoint is unchanged.
+3. `endpoint`: the caller found the endpoint Hash. A valid endpoint restores its correct Bot Identity Set member and its listing member/score. After reverse cleanup, `SCARD > 100` is `invalid` with reason `bot_endpoint_limit` even when the membership already exists. Before adding a missing Bot membership, `SCARD` must be below 100; 100 existing members is also `invalid`. An invalid endpoint is unchanged.
 
 Returns:
 
@@ -122,7 +122,7 @@ Order and results:
 4. A leased state must have a queue head equal to `head_message_id`; positive `delivery_cycle`, `attempt`, `claimed_ms`, `attempt_started_ms` (or the accepted pre-v2 fallback to `claimed_ms`), `lease_expires_ms`; plaintext `delivery_token`; and a 64-lowercase-hex `delivery_token_digest`. A pre-v3 leased state without the digest returns `{"legacy"}` and keeps the accepted TTL-only recovery behavior. Any other malformed field creates the block and returns `blocked`.
 5. `SHA-256(delivery_token)` cannot be computed in Lua. Before calling the script, Go reads the leased state's plaintext token and digest without logging either, computes SHA-256, and refuses to call the script if they differ; it creates the same block through a dedicated `mode=block` call carrying no token. For `mode=verify`, ARGV additionally carries the expected token digest; the script compares it with the current state digest to fence a concurrent transition. A changed state returns `{"changed"}` and Go rereads once.
 6. The digest selects a Hash token record whose `state=active`, `recipient_identity`, `message_id`, `operation_id`, `claimed_ms`, and `lease_expires_ms` equal the leased head. Absence, wrong type, or mismatch creates the marker and returns `blocked`.
-7. The claim operation Hash must have `kind=claim`, `state=active`, the same plaintext token, message, Recipient, cycle, attempt, claimed/deadline values, and a nonempty `args_digest`. Absence, wrong type, or mismatch creates the marker and returns `blocked`.
+7. The claim operation Hash must have `kind=claim`, `state=active`, the same plaintext token, message, Recipient, cycle, attempt, and claimed time, and a nonempty `args_digest`. Its recorded original `lease_expires_ms` must be a positive integer strictly after `claimed_ms` and no later than the current head/token deadline. Lease extension changes head/token deadlines but preserves the recorded claim response, as required by Milestone 2. Absence, wrong type, or mismatch creates the marker and returns `blocked`.
 8. Token and operation records must both have positive TTLs. The operation TTL must not exceed the configured claim-operation TTL; the token TTL must cover the remaining lease and no more than that remainder plus the claim-operation TTL. A missing/nonpositive/out-of-bound TTL creates the marker and returns `blocked`.
 9. The lease index is derived: a missing/wrong score is repaired to `lease_expires_ms` and returns `{"repaired"}`; otherwise `{"consistent"}`.
 
@@ -153,15 +153,15 @@ Ticket 04 adds `reconcile_message_v1`, applied to every message ID discovered fr
 
 Validation and classification:
 
-1. Key types are checked first. The script returns no payload, credential, CSRF value, or Delivery Token.
-2. A String blob must decode as a Canonical Message object with matching `message_id`, positive integer `received_ms`, a valid structured Recipient whose serialization equals `recipient_identity` when supplied, nonempty `platform_event_type`, and a present JSON `payload` value. Invalid JSON/shape/identity → `message_invalid`.
-3. Live lifecycle states are mutually exclusive: queued, dead-lettered, and acknowledged compact success may not overlap. A blob not queued and not dead-lettered is `message_orphan`; a success record plus blob/metadata/history is `success_overlap`; a DLQ record plus queue position is `dead_letter_overlap`.
+1. Global index and marker types and the queue locator are checked before writes. Wrong-typed message-lifecycle records with a valid queue locator are isolated like other queue-local corruption; unlocated type errors hold readiness. The script returns no payload, credential, CSRF value, or Delivery Token.
+2. A String blob must decode as a Canonical Message object with matching `message_id`, positive integer `received_ms`, a valid structured Recipient whose serialization equals `recipient_identity` when supplied, nonempty `platform_event_type`, and a present JSON `payload` value (including `null` or `false`; nested keys do not affect envelope-member presence). Invalid JSON/shape/identity → `message_invalid`.
+3. Live lifecycle states are mutually exclusive: queued, dead-lettered, and acknowledged compact success may not overlap. A blob not queued and not dead-lettered is `message_orphan`, except a valid blob whose Recipient, authoritative head ID, and valid block marker agree while its queue is absent/wrong-typed remains the already isolated queue incident; unrelated blobs, including other IDs for that blocked Recipient, still hold readiness; a success record plus blob/metadata/history is `success_overlap`; a DLQ record plus queue position is `dead_letter_overlap`.
 4. Queued messages require a valid blob. The head is governed by Recipient reconciliation. A non-head message with history requires a complete positive pending cycle/attempt pair; partial/malformed metadata is invalid. Metadata may be absent only for an accepted pre-M2 message with no history/pending state.
 5. Dead-lettered messages require a valid blob; the Dead-letter Hash and blob Recipient/message identity must agree; metadata, if present, must be a Hash; history must be a valid List.
 6. Attempt history entries must decode as the accepted `attempt` or leading `archived_cycles_summary` shapes. Attempt cycles/attempts/times are positive integers, `completed_ms >= claimed_ms`, `lease_expires_ms >= claimed_ms`, outcome is `nack|expired`, optional reason/consumer fields satisfy their bounds, entries are ordered by nondecreasing `(delivery_cycle, attempt)`, and at most the latest 10 explicit cycles remain after an optional summary. Reconciliation never changes history.
 7. Metadata fields are allowlisted: optional nonempty 64-hex `dedup_identity_digest`, and either both positive pending fields or neither. When a digest and live dedup record both exist, the record must be a Hash; if it points to this message its `accepted_ms`/`expires_ms`/TTL must be valid, while a mapping to another message is permitted after replay. An absent dedup record is permitted and never restored.
 8. A success Hash must contain the accepted compact fields and a positive remaining TTL no greater than 24 hours; it must have no blob, metadata, history, queue, or DLQ record. Invalid success evidence holds readiness; it is never reconstructed.
-9. Block markers discovered with a Recipient must be Hashes containing positive `detected_ms` and one accepted bounded reason. Invalid marker fields return `marker_invalid`; reconciliation does not overwrite them.
+9. Every discovered Recipient block marker is validated before isolated-Recipient exclusions, even when no queue/message remains. It must be a Hash containing positive integer `detected_ms` and one accepted bounded reason. `reconcile_recipient_v3` returns `unhandled` with `marker_invalid` for malformed fields before any index alignment; message validation also reports `marker_invalid`. Reconciliation does not overwrite malformed markers.
 10. For a queued inconsistency with a valid Recipient locator, `inspect` atomically creates/keeps marker reason `message_lifecycle_inconsistent`, removes ready/lease/retry membership, restores the blocked member, and returns `blocked` with the detailed reason. Unlocatable, DLQ, success, and lone-blob inconsistencies return `inconsistent` and do not mutate.
 11. Provably orphaned metadata/history (no blob, queue, DLQ, or success state) returns `orphan_records`; `mode=delete_orphans` rechecks the same absence atomically, deletes only metadata/history, and returns `removed_orphans`. A lone blob is not deleted automatically because it may be evidence of a partial acceptance.
 
@@ -199,6 +199,10 @@ The composed tests must cover at least:
 - an interrupted or uncertain representative critical transition whose persisted state is reconciled without a blind mutation retry;
 - unchanged payload/credential/token redaction in logs and audit.
 
+### Recovery quiescence barrier (ticket 08)
+
+The complete-model pass requires quiescent message/queue discovery. Withdrawing readiness alone is not a barrier: after first startup the listeners remain open and maintenance has already started. Before every startup/recovery scan, an in-process exclusive work barrier closes admission to storage-backed `/admin/v1/` requests, public webhook/Consumer requests, and background maintenance rounds; it drains admitted work before invoking reconciliation. Public requests and new maintenance rounds are also refused/skipped whenever readiness is false. Registered due transitions run inside the exclusive phase, not as admitted maintenance rounds. Existing requests finish with their ordinary bounded deadlines; the five-minute reconciliation deadline includes drain time. A cancelled drain does not start a scan. The barrier reopens after the pass, including failed/held passes; public work and maintenance still require readiness, while administrative diagnosis remains available between passes. Health, metrics, static UI, and authenticated profiling remain available during scanning. No new API is introduced; refusals are retryable `503`, with `Retry-After: 1`, safe request correlation, and no secret/payload content. This protects this single process only; it is not multi-process coordination.
+
 ### Periodic consistency checking
 
 Periodic checking is not part of tickets 01–05. Ticket 06 measures a production-like complete pass, documents races with live transitions, and decides one of:
@@ -207,7 +211,7 @@ Periodic checking is not part of tickets 01–05. Ticket 06 measures a productio
 - a bounded incremental checker with a separately specified cursor, interval, work budget, metrics, and readiness/error policy;
 - an operator-triggered check with a separately specified API/CLI contract.
 
-No serving-time full scan is introduced without that decision and, if needed, an ADR.
+Accepted decision: retain startup/recovery-only complete-model checking; no periodic checker or online operator-triggered check API. [`docs/design/consistency-checking.md`](../../docs/design/consistency-checking.md) records four production-like synthetic profiles, three measured passes per profile, official Valkey source constraints, serving-time races, detection limits, budgets, readiness/alert policy, and prerequisites for reconsideration. Ticket 08 makes recovery discovery quiescent. No new hard-to-reverse checker mechanism is selected, so no ADR is added.
 
 ## Testing Decisions
 
@@ -222,8 +226,14 @@ No serving-time full scan is introduced without that decision and, if needed, an
 - Backup/restore policy, `hr2` migration, multi-process coordination, and Valkey Cluster key declaration.
 - Automatic repair of authoritative queue, endpoint, dead-letter, audit, or message data.
 - A generic operator repair API or UI.
-- Periodic consistency checking until ticket 06 records an accepted decision.
+- Periodic or online operator-triggered consistency checking (ticket 06 selected startup/recovery-only).
 - New product API features unrelated to recovery.
+
+## Completion evidence
+
+All tickets 01–08 are done. Final validation on 2026-09-30: gofmt; `go test ./...` and `go test -race ./...` with real Valkey 9.1.2; `go vet ./...`; `git diff --check`; `bash -n scripts/smoke.sh`; and two consecutive green full production-mode Compose smoke runs with persisted-volume endpoint-index fault recovery beside DLQ/session/delivery state. The synthetic measurement harness is opt-in; ordinary tests validate its small fixture and skip the large profiles.
+
+Review follow-up: all eight confirmed findings are covered by `internal/valkey/reconcile_regression_test.go`. The regressions were red before the fixes and green afterward; shared delivery fixtures now use production-shaped 64-hex dedup digests. Validation after these fixes: `go test -count=1 ./...`, `go test -race -count=1 ./...` against a dedicated Valkey 9.1.2, `go vet ./...`, gofmt, `git diff --check`, `bash -n scripts/smoke.sh`, and the full production-mode Compose smoke all passed.
 
 ## Further Notes
 

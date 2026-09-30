@@ -386,7 +386,7 @@ func TestExpireLeaseDeadLettersTheLastAttempt(t *testing.T) {
 	assertHash(t, a, "hr1:dl:m1", map[string]string{
 		"bot_platform": "telegram", "bot_id": "42", "recipient_scope": "chat", "chat_id": "-1", "recipient_identity": ridA,
 		"dead_lettered_ms": itoa64(res.DeadLetteredMs), "dead_letter_reason": "expiry_exhausted", "delivery_cycle": "1",
-		"dedup_identity_digest": "d-m1",
+		"dedup_identity_digest": messageDedupDigest("m1"),
 	})
 	if sc, ok := score(t, a, "hr1:dlq", "m1"); !ok || sc != res.DeadLetteredMs {
 		t.Errorf("dlq score = %d %v", sc, ok)
@@ -436,7 +436,7 @@ func TestExpireLeaseDeadLetterDrainsQueue(t *testing.T) {
 	assertHash(t, a, "hr1:dl:m1", map[string]string{
 		"bot_platform": "telegram", "bot_id": "42", "recipient_scope": "user", "user_id": "7", "recipient_identity": rid,
 		"dead_lettered_ms": itoa64(res.DeadLetteredMs), "dead_letter_reason": "expiry_exhausted", "delivery_cycle": "1",
-		"dedup_identity_digest": "d-m1",
+		"dedup_identity_digest": messageDedupDigest("m1"),
 	})
 	for _, k := range []string{"hr1:r:" + rid + ":q", "hr1:r:" + rid + ":s", "hr1:ready", "hr1:leases", "hr1:retries"} {
 		if exists(t, a, k) {

@@ -129,9 +129,11 @@ func composeStackWith(t *testing.T, o stackOptions) (http.Handler, *delivery.Han
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(nil, func(string) string { return "" })
+	readiness := &app.Readiness{}
+	readiness.MarkReady() // This harness bypasses App.Run after validating storage.
 	application := app.New(app.Deps{
 		Config: cfg, Logger: observability.NewTestLogger("error", &strings.Builder{}), Registry: reg,
-		Readiness: &app.Readiness{}, Webhooks: webhooks, ConsumerAPI: consumer,
+		Readiness: readiness, Webhooks: webhooks, ConsumerAPI: consumer,
 	})
 	return application.PublicHandler(), consumer, reg, store
 }

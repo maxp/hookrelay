@@ -12,6 +12,8 @@ Milestone 3 (notification wake-up and Webhook Endpoint administration) is implem
 
 Milestone 4 (browser sessions, operational UI, audit views, and the remaining DLQ operations) is implemented. Operators log in to an embedded operational panel at `/ui/` on the administrative listener with the Admin Secret (HttpOnly `SameSite=Strict` session cookie, CSRF token and exact `Origin` for every state-changing request, 1 h idle / 12 h absolute expiry, at most 100 sessions, all revoked when the Admin Secret changes), and the Admin API and CLI gain audited DLQ payload inspection, permanent deletion under `If-Match`, the operations summary, and the audit listing (ADR 0009). Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/) through [`.scratch/milestone-4/`](.scratch/milestone-4/).
 
+Milestone 5 (complete-model reconciliation hardening and recovery proof) adds symmetric Webhook Endpoint index repair, active-attempt and message-lifecycle validation, mixed-state recovery tests, and a recovery admission/drain barrier. Complete-model checking remains startup/recovery-only, not a periodic serving scan; the [decision and measured costs](docs/design/consistency-checking.md) document detection limits and operational budgets. The Compose smoke proves endpoint-index repair across a persisted-volume restart beside delivery, DLQ, and browser sessions. Work is tracked under [`.scratch/milestone-5/`](.scratch/milestone-5/).
+
 ## Goals
 
 - accept multiple webhook types selected by a route prefix;
@@ -65,6 +67,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - [`docs/design/implementation-milestones.md`](docs/design/implementation-milestones.md) defines the tracer-bullet implementation sequence.
 - [`docs/design/telegram-adapter.md`](docs/design/telegram-adapter.md) defines Telegram verification, update identity, and recipient extraction policy.
 - [`docs/design/storage.md`](docs/design/storage.md) defines the accepted internal Valkey data structures and key namespace.
+- [`docs/design/consistency-checking.md`](docs/design/consistency-checking.md) records complete-model checking policy, measured costs, races, budgets, and alerts.
 - [`docs/design/open-questions.md`](docs/design/open-questions.md) lists decisions that remain open.
 - [`docs/runbooks/recipient-block-recovery.md`](docs/runbooks/recipient-block-recovery.md) defines safe diagnosis and clearing of an ambiguous Recipient block with `hookrelay admin recipients inspect-block`/`clear-block`.
 
@@ -80,7 +83,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/ingestion` — webhook pipeline and the Telegram adapter;
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v3`, `claim_v3`, `ack_v4`, `nack_v3`, `expire_lease_v3`, `activate_retry_v1`, `extend_v1`, `replay_dlq_v2`, `delivery_state_v1`, `expire_dlq_v1`, `evict_dedup_v1`, `inspect_block_v2`, `clear_block_v2`, `reconcile_recipient_v3`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`), readiness gate, endpoint, Recipient, DLQ, and delivery-state stores, message acceptance;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v3`, `claim_v3`, `ack_v4`, `nack_v3`, `expire_lease_v3`, `activate_retry_v1`, `extend_v1`, `replay_dlq_v2`, `delivery_state_v1`, `expire_dlq_v1`, `evict_dedup_v1`, `inspect_block_v2`, `clear_block_v2`, `reconcile_recipient_v3`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`, `reconcile_endpoint_v1`, `reconcile_attempt_v1`, `reconcile_message_v1`), readiness gate, endpoint, Recipient, DLQ, and delivery-state stores, message acceptance;
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -114,7 +117,7 @@ docker compose up --build
 ```
 
 The Compose smoke test proves the Milestone 1 slice, the Milestone 2
-failure path, and the Milestone 3 and 4 additions against that stack in production mode (endpoint via the Admin
+failure path, and the Milestone 3–5 additions against that stack in production mode (endpoint via the Admin
 CLI → signed webhook and its duplicate → claim → ack and repeated ack →
 empty queue → metrics and health → three nacks with observed retries →
 fourth nack dead-letters → `admin dlq list|get|replay` → `admin message
@@ -127,7 +130,7 @@ webhook list`, disable and delete the old endpoint, which then answers
 `404` while the new one accepts → two new dead letters → `admin operations
 summary` → browser login with the production cookie attributes → a
 cookie-authenticated replay refused without the CSRF token and accepted with
-it → audited payload view → permanent deletion refused without and accepted
+it (after a persisted-volume restart repairs missing endpoint Bot Identity/listing indexes and preserves the live session and DLQ) → audited payload view → permanent deletion refused without and accepted
 with `If-Match` → `admin audit list` shows the session actions → logout →
 the `/ui/` panel served with its Content Security Policy). It shortens retry delays to 300 ms and the
 initial lease to 5 s. It uses its own Compose project, generated secrets, and free
@@ -146,8 +149,8 @@ The gate re-runs every second; losing Valkey withdraws readiness until the
 full gate passes again.
 
 Before readiness (and again after Valkey recovers) hookrelay reconciles
-persisted state in bounded `SCAN`/`ZSCAN` batches: it validates Webhook
-Endpoints, Bot Identity sets, and global index types, holds readiness on
+persisted state with `SCAN`/`SSCAN`/`ZSCAN` and bounded script collections (`COUNT` is a work hint, not a hard page bound): it validates Webhook
+Endpoints and global index types, rebuilds missing Bot Identity memberships and listing members/scores from valid endpoint Hashes, removes orphan derived members, holds readiness on
 malformed live deduplication records, repairs derived ready, lease, retry,
 blocked, DLQ, and deduplication indexes and (at startup) the queued-message
 counter, and isolates any Recipient whose queue or head state is ambiguous
@@ -168,6 +171,10 @@ reviewed incident correction followed by a restart. Progress is
 exported as `hookrelay_reconciliation_in_progress` and
 `hookrelay_consistency_issues_total{kind,resolution}`; each block, hold, and
 repair is logged, and repairs and blocks are audited best effort.
+
+Reconciliation accepts healthy extended leases without changing the original claim response, and preserves arbitrary valid Canonical Payload values, including `null` and nested `payload` fields. It validates every discovered block marker and the 100-endpoint Bot Identity limit even when indexes are intact. A local block never suppresses independent global corruption; wrong-typed queue-local metadata is isolated without stopping unrelated Recipients.
+
+Recovery closes storage-work admission and drains already-started API requests and background maintenance rounds before scanning. Public webhook/Consumer requests receive retryable `503` while unready; `/admin/v1/` calls also receive `503` during drain/reconciliation, while health, metrics, static UI, and authenticated profiling stay reachable. Administrative diagnosis reopens between failed/held passes. No periodic complete-model checker or online check API is enabled; untouched runtime corruption has no fixed detection deadline, and suspected whole-model drift requires a coordinated restart. The five-minute pass deadline includes drain time; timeout/error holds readiness, never fails open. See the [consistency policy](docs/design/consistency-checking.md) for costs and alerts.
 
 A blocked Recipient stays blocked until an operator follows the
 [Recipient block recovery runbook](docs/runbooks/recipient-block-recovery.md):

@@ -29,7 +29,7 @@ func claimReq(op, args, token string) delivery.ClaimRequest {
 // enqueue accepts one message for a recipient through accept_v3.
 func enqueue(t *testing.T, a *Adapter, messageID, rid string) {
 	t.Helper()
-	r := acceptReq(messageID, "d-"+messageID, "b-"+messageID)
+	r := acceptReq(messageID, messageDedupDigest(messageID), "b-"+messageID)
 	r.RecipientIdentity = rid
 	r.MessageJSON = []byte(`{"message_id":"` + messageID + `"}`)
 	if res := NewMessageAcceptor(a, testLimits()).Accept(context.Background(), r); res.Outcome != ingestion.AcceptAccepted {

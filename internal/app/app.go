@@ -42,6 +42,7 @@ type Readiness struct {
 	// shown in the readiness body: pending, in_progress, held, failed,
 	// complete.
 	reconciliation atomic.Value
+	work           workBarrier
 }
 
 // ReconciliationState reports the bounded reconciliation state.
@@ -219,13 +220,13 @@ func New(deps Deps) *App {
 	}
 
 	a.adminServer = &http.Server{
-		Handler:           adminMux,
+		Handler:           a.guardStorageRequests(adminMux, false),
 		MaxHeaderBytes:    32 << 10,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	a.publicServer = &http.Server{
-		Handler:           publicHandler,
+		Handler:           a.guardStorageRequests(publicHandler, true),
 		MaxHeaderBytes:    32 << 10,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -461,6 +462,14 @@ func (a *App) reconcile(ctx context.Context, full bool) bool {
 
 	rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
+	// Close admission and drain already-started requests/background rounds.
+	// Readiness withdrawal alone cannot make message discovery quiescent.
+	defer a.deps.Readiness.resumeWork()
+	if err := a.deps.Readiness.pauseWork(rctx); err != nil {
+		a.deps.Readiness.setReconciliation("failed")
+		log.Error("reconciliation drain cancelled", "event", "reconciliation_failed", "error_code", "dependency_unavailable")
+		return false
+	}
 	res, err := a.deps.Reconcile(rctx, full)
 	for _, issue := range res.Issues {
 		if issue.Count > 0 && a.findings != nil {

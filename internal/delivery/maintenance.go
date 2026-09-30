@@ -72,7 +72,11 @@ type MaintenanceDeps struct {
 	// its own deadline (the Valkey server sample and the ingestion capacity
 	// maintenance); a failure is logged and never stops the round.
 	RoundHooks []func(context.Context) error
-	Config     MaintenanceConfig
+	// RunRoundGuard, when set, admits and drains a whole background round
+	// through the application's recovery barrier. Inline and reconciliation
+	// due work already run inside their caller's admitted/exclusive phase.
+	RunRoundGuard func(context.Context, func(context.Context))
+	Config        MaintenanceConfig
 	// Uniform draws the interval and retry-delay jitter in [0, 1)
 	// (rand.Float64 when nil).
 	Uniform func() float64
@@ -170,7 +174,11 @@ func NewMaintenance(d MaintenanceDeps) (*Maintenance, error) {
 // jitter between rounds.
 func (m *Maintenance) Run(ctx context.Context) {
 	for ctx.Err() == nil {
-		m.RunRound(ctx)
+		if m.d.RunRoundGuard != nil {
+			m.d.RunRoundGuard(ctx, m.RunRound)
+		} else {
+			m.RunRound(ctx)
+		}
 		pause := m.d.Config.Interval + time.Duration(float64(m.d.Config.IntervalJitter)*m.d.Uniform())
 		if m.d.Sleep(ctx, pause) != nil {
 			return

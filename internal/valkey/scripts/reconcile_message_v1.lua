@@ -50,6 +50,9 @@ local function valid_int(v)
   return v and string.match(v, '^[1-9]%d*$') and #v <= 19
     and (#v < 19 or v <= '9223372036854775807')
 end
+local function valid_number(v)
+  return type(v) == 'number' and v > 0 and v == math.floor(v)
+end
 local function valid_digest(v)
   return v and #v == 64 and string.match(v, '^[0-9a-f]+$')
 end
@@ -70,11 +73,6 @@ for _, key in ipairs({readyKey, leasesKey, retriesKey, blockedKey}) do
   end
 end
 local bt, mt, ht, dt, st = type_of(blobKey), type_of(metaKey), type_of(historyKey), type_of(dlKey), type_of(successKey)
-if bt ~= 'none' and bt ~= 'string' then return {'wrong_type', 'message_invalid'} end
-if mt ~= 'none' and mt ~= 'hash' then return {'wrong_type', 'metadata_invalid'} end
-if ht ~= 'none' and ht ~= 'list' then return {'wrong_type', 'history_invalid'} end
-if dt ~= 'none' and dt ~= 'hash' then return {'wrong_type', 'dead_letter_invalid'} end
-if st ~= 'none' and st ~= 'hash' then return {'wrong_type', 'success_invalid'} end
 if rid ~= '' then
   local qt, markerType = type_of(queueKey), type_of(markerKey)
   if qt ~= 'none' and qt ~= 'list' then return {'wrong_type', 'lifecycle_ambiguous'} end
@@ -117,22 +115,34 @@ if queued then
   end
 end
 
--- Canonical Message validation. Lua tables cannot distinguish JSON null from
--- absent payload, so the raw object is also checked for a payload member.
-local decoded = nil
+-- Queue-local type corruption can be isolated only after the global indexes,
+-- marker type, and queue locator have been checked. Unlocated corruption holds.
+for _, record in ipairs({
+  {bt, 'string', 'message_invalid'}, {mt, 'hash', 'metadata_invalid'},
+  {ht, 'list', 'history_invalid'}, {dt, 'hash', 'dead_letter_invalid'},
+  {st, 'hash', 'success_invalid'}
+}) do
+  if record[1] ~= 'none' and record[1] ~= record[2] then
+    return queued and isolate(record[3]) or {'wrong_type', record[3]}
+  end
+end
+
+-- cjson.null is a present JSON value; nil alone means the envelope member is
+-- absent. Nested fields and the payload's shape do not change this check.
+local decoded, serialized = nil, nil
 if bt == 'string' then
   local raw = redis.call('GET', blobKey)
   local ok
   ok, decoded = pcall(cjson.decode, raw)
   local recipient = ok and type(decoded) == 'table' and decoded['recipient'] or nil
-  local payloadPresent = string.find(raw, '"payload"%s*:') ~= nil and not string.find(raw, '"payload"%s*:%s*null')
+  local payloadPresent = ok and type(decoded) == 'table' and decoded['payload'] ~= nil
   if not ok or type(decoded) ~= 'table' or decoded['message_id'] ~= id
       or type(decoded['received_ms']) ~= 'number' or decoded['received_ms'] <= 0 or decoded['received_ms'] ~= math.floor(decoded['received_ms'])
       or type(recipient) ~= 'table' or not recipient['scope'] or not recipient['bot_platform'] or not recipient['bot_id']
       or type(decoded['platform_event_type']) ~= 'string' or decoded['platform_event_type'] == '' or not payloadPresent then
     return queued and isolate('message_invalid') or {'inconsistent', 'message_invalid'}
   end
-  local serialized = recipient['bot_platform'] .. ':' .. recipient['bot_id'] .. ':' .. recipient['scope']
+  serialized = recipient['bot_platform'] .. ':' .. recipient['bot_id'] .. ':' .. recipient['scope']
   if recipient['scope'] == 'chat' then
     if not recipient['chat_id'] or recipient['user_id'] then return queued and isolate('message_invalid') or {'inconsistent', 'message_invalid'} end
     serialized = serialized .. ':' .. recipient['chat_id']
@@ -153,6 +163,20 @@ if st == 'hash' and (bt ~= 'none' or mt ~= 'none' or ht ~= 'none' or dt ~= 'none
 end
 if dt == 'hash' and queued then return isolate('dead_letter_overlap') end
 if bt == 'string' and not queued and dt == 'none' and st == 'none' then
+  -- A missing/wrong-typed queue can lose its head's discovery locator. Keep
+  -- that incident local only when the valid blob, authoritative head state,
+  -- and valid protective marker all agree on its owner. Other lone blobs
+  -- (including unrelated blobs beside any block) remain readiness holds.
+  local ownerMarker = prefix .. ':q:' .. serialized
+  local ownerState = prefix .. ':r:' .. serialized .. ':s'
+  local ownerQueue = prefix .. ':r:' .. serialized .. ':q'
+  if type_of(ownerMarker) == 'hash' and type_of(ownerState) == 'hash' and type_of(ownerQueue) ~= 'list' then
+    local marker = redis.call('HMGET', ownerMarker, 'detected_ms', 'reason_code')
+    if valid_int(marker[1]) and accepted_marker_reason(marker[2])
+        and redis.call('HGET', ownerState, 'head_message_id') == id then
+      return {'already_blocked', 'queued'}
+    end
+  end
   return {'inconsistent', 'message_orphan'}
 end
 if (queued or dt == 'hash') and bt == 'none' then
@@ -168,7 +192,7 @@ if mt == 'hash' then
     if not allowed[all[i]] then return queued and isolate('metadata_invalid') or {'inconsistent', 'metadata_invalid'} end
   end
   local meta = redis.call('HMGET', metaKey, 'dedup_identity_digest', 'pending_delivery_cycle', 'pending_attempt')
-  if meta[1] and (meta[1] == '' or #meta[1] > 128 or not string.match(meta[1], '^[%w_.:%-]+$')) then
+  if meta[1] and not valid_digest(meta[1]) then
     return queued and isolate('metadata_invalid') or {'inconsistent', 'metadata_invalid'}
   end
   if (meta[2] and not meta[3]) or (meta[3] and not meta[2]) or (meta[2] and (not valid_int(meta[2]) or not valid_int(meta[3]))) then
@@ -205,18 +229,16 @@ if ht == 'list' then
     local ok, entry = pcall(cjson.decode, raw)
     if not ok or type(entry) ~= 'table' then return queued and isolate('history_invalid') or {'inconsistent', 'history_invalid'} end
     if entry['kind'] == 'archived_cycles_summary' and i == 1 then
-      if type(entry['archived_cycles']) ~= 'number' or entry['archived_cycles'] <= 0 or entry['archived_cycles'] ~= math.floor(entry['archived_cycles'])
-          or type(entry['archived_attempts']) ~= 'number' or entry['archived_attempts'] <= 0 or entry['archived_attempts'] ~= math.floor(entry['archived_attempts'])
-          or type(entry['first_archived_ms']) ~= 'number' or entry['first_archived_ms'] <= 0
-          or type(entry['last_archived_ms']) ~= 'number' or entry['last_archived_ms'] < entry['first_archived_ms'] then
+      if not valid_number(entry['archived_cycles']) or not valid_number(entry['archived_attempts'])
+          or not valid_number(entry['first_archived_ms']) or not valid_number(entry['last_archived_ms'])
+          or entry['last_archived_ms'] < entry['first_archived_ms'] then
         return queued and isolate('history_invalid') or {'inconsistent', 'history_invalid'}
       end
     elseif entry['kind'] == 'attempt' then
       local c, a = entry['delivery_cycle'], entry['attempt']
-      if type(c) ~= 'number' or c <= 0 or c ~= math.floor(c) or type(a) ~= 'number' or a <= 0 or a ~= math.floor(a)
-          or type(entry['claimed_ms']) ~= 'number' or entry['claimed_ms'] <= 0
-          or type(entry['lease_expires_ms']) ~= 'number' or entry['lease_expires_ms'] < entry['claimed_ms']
-          or type(entry['completed_ms']) ~= 'number' or entry['completed_ms'] < entry['claimed_ms']
+      if not valid_number(c) or not valid_number(a) or not valid_number(entry['claimed_ms'])
+          or not valid_number(entry['lease_expires_ms']) or entry['lease_expires_ms'] < entry['claimed_ms']
+          or not valid_number(entry['completed_ms']) or entry['completed_ms'] < entry['claimed_ms']
           or (entry['outcome'] ~= 'nack' and entry['outcome'] ~= 'expired')
           or (entry['reason_code'] and not bounded(entry['reason_code'], 64))
           or (entry['consumer_instance_id'] and not bounded(entry['consumer_instance_id'], 64))

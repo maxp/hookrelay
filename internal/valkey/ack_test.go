@@ -26,8 +26,13 @@ func exists(t *testing.T, a *Adapter, key string) bool {
 	return n == 1
 }
 
-// enqueueJSON accepts a message with a realistic blob so ack can read
-// received_ms.
+func messageDedupDigest(messageID string) string {
+	sum := sha256.Sum256([]byte("d-" + messageID))
+	return hex.EncodeToString(sum[:])
+}
+
+// enqueueJSON accepts a message with a realistic blob and digest so ack and
+// complete-model reconciliation exercise the production encodings.
 func enqueueJSON(t *testing.T, a *Adapter, messageID, rid string) {
 	t.Helper()
 	recipient, err := model.ParseIdentity(rid)
@@ -41,7 +46,7 @@ func enqueueJSON(t *testing.T, a *Adapter, messageID, rid string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := acceptReq(messageID, "d-"+messageID, "b-"+messageID)
+	r := acceptReq(messageID, messageDedupDigest(messageID), "b-"+messageID)
 	r.RecipientIdentity, r.MessageJSON = rid, blob
 	NewMessageAcceptor(a, testLimits()).Accept(context.Background(), r)
 }
@@ -79,7 +84,7 @@ func TestAckWithNextHead(t *testing.T) {
 	if exists(t, a, "hr1:m:m1") || exists(t, a, "hr1:mi:m1") || exists(t, a, "hr1:a:m1") {
 		t.Error("acknowledged blob, metadata, or history kept")
 	}
-	if got := hget(t, a, "hr1:mi:m2", "dedup_identity_digest"); got != "d-m2" {
+	if got := hget(t, a, "hr1:mi:m2", "dedup_identity_digest"); got != messageDedupDigest("m2") {
 		t.Errorf("next head metadata dedup_identity_digest = %q, want kept", got)
 	}
 	queue, _ := a.client.Do(ctx, a.client.B().Lrange().Key("hr1:r:"+ridA+":q").Start(0).Stop(-1).Build()).AsStrSlice()

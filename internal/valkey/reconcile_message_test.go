@@ -72,8 +72,8 @@ func TestReconcileMessageBlocksQueueLocalCorruption(t *testing.T) {
 			a.testDo(t, "RPUSH", "hr1:a:m1", `{"kind":"attempt","delivery_cycle":1,"attempt":1,"claimed_ms":3,"lease_expires_ms":2,"completed_ms":4,"outcome":"nack"}`)
 		}, "history_invalid"},
 		{"dedup invalid", func(t *testing.T, a *Adapter) {
-			a.testDo(t, "DEL", "hr1:d:d-m1")
-			a.testDo(t, "SET", "hr1:d:d-m1", "poison")
+			a.testDo(t, "DEL", "hr1:d:"+messageDedupDigest("m1"))
+			a.testDo(t, "SET", "hr1:d:"+messageDedupDigest("m1"), "poison")
 		}, "dedup_record_invalid"},
 		{"success overlap", func(t *testing.T, a *Adapter) {
 			a.testDo(t, "HSET", "hr1:success:m1", "recipient_scope", "chat", "bot_platform", "telegram", "received_ms", "1", "acknowledged_ms", "2", "delivery_cycle", "1", "attempt_count", "1")
@@ -138,7 +138,7 @@ func TestReconcileMessageHoldsGlobalCorruptionWithoutMutation(t *testing.T) {
 
 func TestReconcileMessageRemovesOnlyOrphanMetadataAndHistory(t *testing.T) {
 	a, _ := claimSetup(t)
-	a.testDo(t, "HSET", "hr1:mi:orphan", "dedup_identity_digest", "d-orphan")
+	a.testDo(t, "HSET", "hr1:mi:orphan", "dedup_identity_digest", messageDedupDigest("orphan"))
 	a.testDo(t, "RPUSH", "hr1:a:orphan", `{"kind":"attempt","delivery_cycle":1,"attempt":1,"claimed_ms":1,"lease_expires_ms":2,"completed_ms":2,"outcome":"nack"}`)
 	res := runMessage(t, a, "inspect", "orphan", "", "none")
 	if res.Status != "orphan_records" {
@@ -187,7 +187,7 @@ func TestReconcileScansMessageFamiliesInBatchesAndIsIdempotent(t *testing.T) {
 	a, _ := claimSetup(t)
 	for i := 0; i < 20; i++ {
 		id := "orphan-" + itoa(i)
-		a.testDo(t, "HSET", "hr1:mi:"+id, "dedup_identity_digest", "d-"+id)
+		a.testDo(t, "HSET", "hr1:mi:"+id, "dedup_identity_digest", messageDedupDigest(id))
 	}
 	rep, err := a.Reconcile(context.Background(), ReconcileOptions{BatchSize: 3, MessageCheckBound: 10})
 	if err != nil || rep.Findings["message_orphans_removed"] != 20 || rep.Hold() != "" {

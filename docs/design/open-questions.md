@@ -2,10 +2,6 @@
 
 The following questions remain intentionally unresolved. The Milestone 1 choices for Admin CLI recovery, PATCH-only HTTP enable/disable, Markdown API contracts, Lua result encoding and registry, mixed Valkey records, first-slice audit, incremental startup reconciliation, version pinning at scaffold, and a pre-scaffold client spike are accepted in their respective design documents. Exact first-slice fields, script tuples, and startup validation/repair procedures are specification work before coding, not invitations to choose different policies.
 
-## Queue maintenance and recovery
-
-- Whether a periodic consistency checker is needed after experience with startup reconciliation.
-
 ## API and authorization
 
 - Exact OpenAPI representation for the accepted Consumer and Admin API contracts after DTOs stabilize, and whether later versions need generated clients; neither blocks Milestone 1.
@@ -30,6 +26,10 @@ The following questions remain intentionally unresolved. The Milestone 1 choices
 
 - **Routing-issue precedence (Telegram):** a Canonical Message carries one `routing_issue`, and the first detected issue wins. An invalid or missing `update_id` is detected first, so `invalid_source_event_id` takes precedence over an event-structure or identifier issue in the same Update; the message is relay-scoped either way and keeps its `platform_event_type`.
 - **Timestamp extraction failures:** measured by `hookrelay_event_time_issues_total{bot_platform,reason}` (`missing`, `invalid_type`, `invalid_value`) with the `event_time_invalid` structured warning.
+
+## Resolved during Milestone 5
+
+- **Periodic consistency checking:** retain startup/recovery-only complete-model checks, with a quiescence barrier for recovery; no periodic checker or online operator-triggered check API. The [accepted policy](consistency-checking.md) records production-like synthetic costs, serving-time races, detection limits, budgets, alerts, and criteria for reconsideration.
 
 ## Resolved during Milestone 4
 

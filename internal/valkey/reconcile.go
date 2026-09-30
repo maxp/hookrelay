@@ -167,8 +167,6 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 			isolatedRecipients[rid] = true
 			// The Recipient scan may be reached again from another derived
 			// source after creating a marker; keep the original incident state.
-		} else if _, blocked := isolatedRecipients[rid]; blocked {
-			isolatedRecipients[rid] = true
 		}
 		if (status == "consistent" || status == "repaired") && a.recipientHasNonDueLease(ctx, rid) {
 			if err := a.reconcileAttempt(ctx, opts.Gen, opts.Logger, rid, &rep); err != nil {
@@ -587,25 +585,6 @@ func (a *Adapter) reconcileMessages(ctx context.Context, opts ReconcileOptions, 
 	for id, loc := range ids {
 		if dlReported[id] || isolatedRecipients[loc.rid] {
 			continue
-		}
-		if loc.rid == "" && rep.Findings["blocked"] > 0 {
-			// A blob may have lost its queue locator because recipient
-			// reconciliation just isolated a wrong-typed/missing queue. Do not
-			// turn that same queue-local incident into a global orphan hold.
-			continue
-		}
-		// A valid marker already isolates queue-local residue; recipient
-		// reconciliation owns that incident. Malformed markers still flow into
-		// reconcile_message_v1 and hold readiness as marker_invalid.
-		if loc.rid != "" {
-			markerKey := "hr1:q:" + loc.rid
-			if t, _ := a.keyType(ctx, markerKey); t == "hash" {
-				detected, e1 := a.client.Do(ctx, a.client.B().Hget().Key(markerKey).Field("detected_ms").Build()).AsInt64()
-				reason, e2 := a.client.Do(ctx, a.client.B().Hget().Key(markerKey).Field("reason_code").Build()).ToString()
-				if e1 == nil && detected > 0 && e2 == nil && reason != "" {
-					continue
-				}
-			}
 		}
 		res, err := a.RunScript(ctx, "reconcile_message_v1",
 			[]string{"hr1:ready", "hr1:leases", "hr1:retries", "hr1:blocked"},
