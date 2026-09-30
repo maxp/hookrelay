@@ -25,6 +25,8 @@ func runDLQ(args []string, env adminIO) int {
 		return adminDLQReplay(args[1:], env)
 	case "payload":
 		return adminDLQPayload(args[1:], env)
+	case "delete":
+		return adminDLQDelete(args[1:], env)
 	default:
 		fmt.Fprintf(env.Stderr, "hookrelay admin: unknown dlq command %q\n", args[0])
 		fmt.Fprint(env.Stderr, adminUsage)
@@ -126,6 +128,22 @@ func adminDLQList(args []string, env adminIO) int {
 		return ExitError
 	}
 	return ExitOK
+}
+
+// getDeadLetterTagged is getDeadLetter that also returns the entity ETag.
+func (c *adminClient) getDeadLetterTagged(messageID string) (*deadLetter, string, error) {
+	code, headers, data, err := c.doHeaders(http.MethodGet, "/admin/v1/dead-letters/"+url.PathEscape(messageID), nil, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if code != http.StatusOK {
+		return nil, "", decodeAPIError(code, data)
+	}
+	var d deadLetter
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, "", fmt.Errorf("unreadable dead-letter response: %w", err)
+	}
+	return &d, headers.Get("ETag"), nil
 }
 
 // getDeadLetter reads one dead letter. It returns an apiError 404 for a
@@ -242,6 +260,101 @@ func adminDLQPayload(args []string, env adminIO) int {
 		return ExitError
 	}
 	return ExitOK
+}
+
+// dlqDeleteResult is the stdout result of a deletion: confirmed, or the
+// reconciliation observation when the outcome is unknown.
+type dlqDeleteResult struct {
+	Outcome    string      `json:"outcome"`
+	MessageID  string      `json:"message_id"`
+	DeadLetter *deadLetter `json:"dead_letter,omitempty"`
+}
+
+// adminDLQDelete reads the dead letter and its ETag, then permanently
+// deletes exactly that entry under If-Match. A missing entry is an error
+// here (a typo is not reported as success) although the API answers 204.
+func adminDLQDelete(args []string, env adminIO) int {
+	const name = "hookrelay admin dlq delete"
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(env.Stderr)
+	var common commonFlags
+	common.register(fs)
+	messageID := fs.String("message-id", "", "Message Identifier (required)")
+	yes := fs.Bool("yes", false, "confirm the audited permanent deletion (required)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	var err error
+	switch {
+	case *messageID == "":
+		err = errors.New("--message-id is required")
+	case !*yes:
+		err = errors.New("--yes is required: permanent deletion is an audited mutation")
+	case fs.NArg() > 0:
+		err = errors.New("unexpected arguments")
+	}
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitUsage
+	}
+	client, err := common.resolve(env)
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitUsage
+	}
+	_, etag, err := client.getDeadLetterTagged(*messageID)
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitError
+	}
+	status, _, data, err := client.doHeaders(http.MethodDelete, "/admin/v1/dead-letters/"+url.PathEscape(*messageID), nil, map[string]string{"If-Match": etag})
+	switch {
+	case err != nil:
+		return client.reconcileDLQDelete(*messageID, fmt.Sprintf("the request failed: %v", err))
+	case status == http.StatusNoContent:
+		if writeJSONResult(env.Stdout, dlqDeleteResult{Outcome: outcomeDeleted, MessageID: *messageID}) != nil {
+			return ExitError
+		}
+		return ExitOK
+	case status >= 500:
+		return client.reconcileDLQDelete(*messageID, fmt.Sprintf("the server reported %v", decodeAPIError(status, data)))
+	case status == http.StatusPreconditionFailed:
+		fmt.Fprintf(env.Stderr, "%s: %v; the dead letter changed since it was read (replayed or dead-lettered again) — not retrying, read it again\n",
+			name, decodeAPIError(status, data))
+		return ExitError
+	default:
+		apiErr := decodeAPIError(status, data)
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, apiErr)
+		if apiErr.Code == "recipient_blocked" {
+			fmt.Fprintf(env.Stderr, "%s: the Recipient is blocked; follow the Recipient block recovery runbook before deleting its dead letters\n", name)
+		}
+		return ExitError
+	}
+}
+
+// reconcileDLQDelete handles a deletion whose outcome is unknown. It never
+// retries: observed absence does not prove that this request deleted the
+// dead letter or that its mandatory audit event was written.
+func (c *adminClient) reconcileDLQDelete(messageID, cause string) int {
+	const name = "hookrelay admin dlq delete"
+	fmt.Fprintf(c.env.Stderr, "%s: outcome uncertain for %s: %s\n", name, messageID, cause)
+	fmt.Fprintf(c.env.Stderr, "%s: not retrying; reading the dead letter to reconcile\n", name)
+	result := dlqDeleteResult{Outcome: outcomeUncertain, MessageID: messageID}
+	d, err := c.getDeadLetter(messageID)
+	var ae *apiError
+	switch {
+	case errors.As(err, &ae) && ae.Status == http.StatusNotFound:
+		result.Outcome = outcomeDesiredStateObserved
+		fmt.Fprintf(c.env.Stderr, "WARNING: %s is no longer dead-lettered, but this does NOT confirm that this request deleted it (it may have been "+
+			"replayed or expired) or that the mandatory audit event was written. Check the audit before any further mutation.\n", messageID)
+	case err == nil:
+		result.DeadLetter = d
+		fmt.Fprintf(c.env.Stderr, "WARNING: %s is still dead-lettered; operator reconciliation is required. Do not retry blindly.\n", messageID)
+	default:
+		fmt.Fprintf(c.env.Stderr, "WARNING: %s could not be read (%v); operator reconciliation is required. Do not retry blindly.\n", messageID, err)
+	}
+	_ = writeJSONResult(c.env.Stdout, result)
+	return ExitError
 }
 
 // replayResult is the stdout result of a replay: the API response on

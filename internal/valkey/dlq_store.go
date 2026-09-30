@@ -185,3 +185,42 @@ func (s *deadLetterStore) ViewPayload(ctx context.Context, messageID, actor, eve
 	return administration.Payload{Result: administration.PayloadDisclosed, Message: json.RawMessage(blob),
 		DeliveryCycle: cycle, DeadLetteredMs: dead, RecipientIdentity: rid}
 }
+
+// DeleteDeadLetter runs dlq_delete_v1.
+func (s *deadLetterStore) DeleteDeadLetter(ctx context.Context, messageID string, expected *administration.DeadLetterVersion,
+	actor, eventID, requestID string) administration.DeleteDLQ {
+	cycle, dead := "", ""
+	if expected != nil {
+		cycle, dead = strconv.FormatInt(expected.DeliveryCycle, 10), strconv.FormatInt(expected.DeadLetteredMs, 10)
+	}
+	res, err := s.a.RunScript(ctx, "dlq_delete_v1", []string{"hr1:dlq", auditKey},
+		[]string{messageID, cycle, dead, actor, eventID, requestID, "hr1"})
+	if err != nil {
+		if errors.Is(err, ErrNotDispatched) {
+			return administration.DeleteDLQ{Result: administration.DeleteDLQUnavailable}
+		}
+		// The deletion may have run: never report success or failure.
+		return administration.DeleteDLQ{Result: administration.DeleteDLQUncertain}
+	}
+	f := res.Fields
+	switch res.Status {
+	case "deleted":
+		deleted, err1 := f[0].AsInt64()
+		rid, err2 := f[1].ToString()
+		reason, err3 := f[2].ToString()
+		if errors.Join(err1, err2, err3) != nil {
+			return administration.DeleteDLQ{Result: administration.DeleteDLQUncertain}
+		}
+		return administration.DeleteDLQ{Result: administration.DeleteDLQDeleted, DeletedMs: deleted, RecipientIdentity: rid, Reason: reason}
+	case "precondition_failed":
+		c, err1 := f[0].AsInt64()
+		d, err2 := f[1].AsInt64()
+		if errors.Join(err1, err2) != nil {
+			return administration.DeleteDLQ{Result: administration.DeleteDLQWrongType}
+		}
+		return administration.DeleteDLQ{Result: administration.DeleteDLQPreconditionFailed,
+			Current: administration.DeadLetterVersion{DeliveryCycle: c, DeadLetteredMs: d}}
+	default:
+		return administration.DeleteDLQ{Result: administration.DeleteDLQResult(res.Status)}
+	}
+}

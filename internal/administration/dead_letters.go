@@ -3,9 +3,13 @@ package administration
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/maxp/hookrelay/internal/observability"
 )
@@ -140,15 +144,7 @@ func (s *Service) ReplayDeadLetter(ctx context.Context, messageID string, req Re
 		s.logAudit(eventID, opDeadLetterReplayed, messageID, requestID, outcomeSuccess)
 		fields := []any{"request_id", requestID, "message_id", messageID, "delivery_cycle", r.DeliveryCycle,
 			"queue_position", r.QueuePosition, "deduplication_resolution", r.DeduplicationResolution}
-		if rcpt, ok := recipientOf(r.RecipientIdentity); ok {
-			fields = append(fields, "recipient_scope", rcpt.Scope, "bot_platform", rcpt.BotPlatform, "bot_id", rcpt.BotID)
-			if rcpt.ChatID != "" {
-				fields = append(fields, "chat_id", rcpt.ChatID)
-			}
-			if rcpt.UserID != "" {
-				fields = append(fields, "user_id", rcpt.UserID)
-			}
-		}
+		fields = append(fields, recipientLogFields(r.RecipientIdentity)...)
 		observability.LogEvent(s.log, slog.LevelInfo, "delivery_replayed", "dead-letter message replayed", fields...)
 		if r.QueuePosition == "head" {
 			s.signalReady(readySourceReplay)
@@ -178,6 +174,23 @@ func (s *Service) ReplayDeadLetter(ctx context.Context, messageID string, req Re
 	}
 }
 
+// recipientLogFields are the structured Recipient fields of a feature
+// event; none for an unparseable identity.
+func recipientLogFields(identity string) []any {
+	rcpt, ok := recipientOf(identity)
+	if !ok {
+		return nil
+	}
+	fields := []any{"recipient_scope", rcpt.Scope, "bot_platform", rcpt.BotPlatform, "bot_id", rcpt.BotID}
+	if rcpt.ChatID != "" {
+		fields = append(fields, "chat_id", rcpt.ChatID)
+	}
+	if rcpt.UserID != "" {
+		fields = append(fields, "user_id", rcpt.UserID)
+	}
+	return fields
+}
+
 func (s *Service) logReplayFailure(requestID, messageID, reason string) {
 	observability.LogEvent(s.log, slog.LevelError, "dead_letter_replay_failed", "dead-letter replay not confirmed",
 		"request_id", requestID, "message_id", messageID, "error_code", "dependency_unavailable", "reason_code", reason)
@@ -201,7 +214,106 @@ func (s *Service) handleGetDeadLetter(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, err, requestID)
 		return
 	}
+	w.Header().Set("ETag", deadLetterTag(DeadLetterVersion{DeliveryCycle: v.DeliveryCycle, DeadLetteredMs: v.DeadLetteredMs}))
 	writeJSON(w, http.StatusOK, v)
+}
+
+// deadLetterTag is the strong ETag "<delivery_cycle>:<dead_lettered_ms>".
+func deadLetterTag(v DeadLetterVersion) string {
+	return fmt.Sprintf(`"%d:%d"`, v.DeliveryCycle, v.DeadLetteredMs)
+}
+
+// deadLetterTagPattern is one strong dead-letter entity tag.
+var deadLetterTagPattern = regexp.MustCompile(`^"([1-9][0-9]{0,14}):([1-9][0-9]{0,14})"$`)
+
+// parseDeadLetterIfMatch reads the optional If-Match precondition. Absent
+// → nil; present but not exactly one strong tag → 400.
+func parseDeadLetterIfMatch(r *http.Request) (*DeadLetterVersion, error) {
+	values := r.Header.Values("If-Match")
+	if len(values) == 0 {
+		return nil, nil
+	}
+	m := deadLetterTagPattern.FindStringSubmatch(strings.TrimSpace(values[0]))
+	if len(values) != 1 || m == nil {
+		return nil, BadRequestError{msg: `If-Match must be one strong entity tag "<delivery_cycle>:<dead_lettered_ms>"`}
+	}
+	cycle, _ := strconv.ParseInt(m[1], 10, 64)
+	dead, _ := strconv.ParseInt(m[2], 10, 64)
+	return &DeadLetterVersion{DeliveryCycle: cycle, DeadLetteredMs: dead}, nil
+}
+
+// DeleteDeadLetter permanently deletes the reviewed dead-letter entry with
+// its mandatory audit. An absent entry is success without audit. An
+// uncertain outcome is reported as such: the caller reconciles instead of
+// retrying.
+func (s *Service) DeleteDeadLetter(ctx context.Context, messageID string, expected *DeadLetterVersion, requestID string) error {
+	if !messageIDPattern.MatchString(messageID) {
+		// A shape that cannot name a dead letter names an absent one.
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionAbsent).Inc()
+		return nil
+	}
+	actor := actorFrom(ctx)
+	eventID := s.gen.UUIDv7()
+	d := s.deadLetters.DeleteDeadLetter(ctx, messageID, expected, actor, eventID, requestID)
+	switch d.Result {
+	case DeleteDLQDeleted:
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionDeleted).Inc()
+		s.metrics.auditEvents.WithLabelValues(opDeadLetterDeleted, outcomeSuccess).Inc()
+		s.logAudit(eventID, opDeadLetterDeleted, messageID, requestID, outcomeSuccess)
+		fields := []any{"request_id", requestID, "message_id", messageID, "actor", actor, "dead_letter_reason", d.Reason}
+		fields = append(fields, recipientLogFields(d.RecipientIdentity)...)
+		observability.LogEvent(s.log, slog.LevelInfo, opDeadLetterDeleted, "dead-letter message permanently deleted", fields...)
+		return nil
+	case DeleteDLQAbsent:
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionAbsent).Inc()
+		return nil
+	case DeleteDLQPreconditionRequired:
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionRefused).Inc()
+		return StatusError{Status: http.StatusPreconditionRequired, Code: "precondition_required",
+			Msg: "If-Match with the current ETag is required: read the dead letter first"}
+	case DeleteDLQPreconditionFailed:
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionRefused).Inc()
+		return StatusError{Status: http.StatusPreconditionFailed, Code: "precondition_failed",
+			Msg: "the dead letter changed: read it again for the current ETag"}
+	case DeleteDLQRecipientBlocked:
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionRefused).Inc()
+		return StatusError{Status: http.StatusConflict, Code: "recipient_blocked",
+			Msg: "the recipient is blocked: recover the block before deleting its dead letters"}
+	default:
+		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionUnavailable).Inc()
+		reason, detail := "dependency_unavailable", ""
+		switch d.Result {
+		case DeleteDLQUncertain:
+			reason, detail = "outcome_uncertain", "deletion outcome is uncertain: read the dead letter and the audit before any retry"
+		case DeleteDLQWrongType:
+			reason, detail = "wrong_type", "stored structure has an unexpected type"
+		}
+		observability.LogEvent(s.log, slog.LevelError, "dead_letter_delete_failed", "dead-letter deletion not confirmed",
+			"request_id", requestID, "message_id", messageID, "error_code", "dependency_unavailable", "reason_code", reason)
+		return DependencyError{detail: detail}
+	}
+}
+
+func (s *Service) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFrom(r.Context())
+	messageID := r.PathValue("message_id")
+	expected, err := parseDeadLetterIfMatch(r)
+	if err != nil && messageIDPattern.MatchString(messageID) {
+		// A malformed tag is 400 only for an existing entry: deleting an
+		// absent entry answers 204 with or without If-Match, so the
+		// deletion below runs without a tag and reports the absence.
+		var se StatusError
+		if _, getErr := s.GetDeadLetter(r.Context(), messageID); !errors.As(getErr, &se) || se.Code != "dead_letter_not_found" {
+			writeAPIError(w, err, requestID)
+			return
+		}
+		expected = nil
+	}
+	if err := s.DeleteDeadLetter(r.Context(), messageID, expected, requestID); err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Service) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request) {

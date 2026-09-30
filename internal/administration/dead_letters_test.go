@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -28,6 +29,15 @@ type fakeDeadLetters struct {
 	replays   []replayCall
 	payload   Payload
 	views     []replayCall // messageID, actor (as resolution), eventID, requestID
+	deletion  DeleteDLQ
+	deletes   []deleteCall
+}
+
+type deleteCall struct {
+	messageID string
+	expected  *DeadLetterVersion
+	actor     string
+	eventID   string
 }
 
 func (f *fakeDeadLetters) ListDeadLetters(_ context.Context, limit int, after *DeadLetterCursor) ([]DeadLetter, error) {
@@ -51,6 +61,11 @@ func (f *fakeDeadLetters) ReplayDeadLetter(_ context.Context, messageID, resolut
 func (f *fakeDeadLetters) ViewPayload(_ context.Context, messageID, actor, eventID, requestID string) Payload {
 	f.views = append(f.views, replayCall{messageID, actor, eventID, requestID})
 	return f.payload
+}
+
+func (f *fakeDeadLetters) DeleteDeadLetter(_ context.Context, messageID string, expected *DeadLetterVersion, actor, eventID, _ string) DeleteDLQ {
+	f.deletes = append(f.deletes, deleteCall{messageID, expected, actor, eventID})
+	return f.deletion
 }
 
 func deadLetterService(t *testing.T, f *fakeDeadLetters) (http.Handler, *bytes.Buffer, *prometheus.Registry) {
@@ -286,5 +301,113 @@ func TestDeadLetterPayloadContract(t *testing.T) {
 	}
 	if rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "wrong-secret", ""); rec.Code != http.StatusUnauthorized || len(f.views) != 0 {
 		t.Errorf("unauthenticated payload = %d", rec.Code)
+	}
+}
+
+func doDLQDelete(t *testing.T, h http.Handler, path string, ifMatch ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	req.Header.Set("Authorization", "Bearer admin-secret-value-016")
+	for _, v := range ifMatch {
+		req.Header.Add("If-Match", v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestDeleteDeadLetterContract pins the ETag on the dead-letter read, the
+// strong If-Match passed to the audited store deletion, the audit and
+// feature events, the deletion metric, 204 for absence without audit, and
+// the error mapping.
+func TestDeleteDeadLetterContract(t *testing.T) {
+	record := &DeadLetter{MessageID: dlqID, RecipientIdentity: "telegram:42:chat:-100", DeadLetteredMs: 1740000000000, Reason: "nack_exhausted", DeliveryCycle: 2}
+	f := &fakeDeadLetters{record: record, deletion: DeleteDLQ{Result: DeleteDLQDeleted, DeletedMs: 1740000000001,
+		RecipientIdentity: "telegram:42:chat:-100", Reason: "nack_exhausted"}}
+	h, logs, reg := deadLetterService(t, f)
+	rec := doJSON(t, h, http.MethodGet, "/admin/v1/dead-letters/"+dlqID, "admin-secret-value-016", "")
+	tag := rec.Header().Get("ETag")
+	if tag != `"2:1740000000000"` {
+		t.Fatalf("ETag = %q", tag)
+	}
+	rec = doDLQDelete(t, h, "/admin/v1/dead-letters/"+dlqID, tag)
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("delete = %d %s", rec.Code, rec.Body.String())
+	}
+	if c := f.deletes[0]; c.messageID != dlqID || c.expected == nil || *c.expected != (DeadLetterVersion{2, 1740000000000}) ||
+		c.actor != "admin_bearer" || c.eventID == "" {
+		t.Errorf("delete call = %+v", c)
+	}
+	if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "dead_letter_deleted", "outcome": "success"}); got != 1 {
+		t.Errorf("audit events = %v", got)
+	}
+	if got := counterValue(t, reg, "hookrelay_dead_letter_deletions_total", map[string]string{"outcome": "deleted"}); got != 1 {
+		t.Errorf("deletions = %v", got)
+	}
+	if !strings.Contains(logs.String(), `"event":"dead_letter_deleted"`) || !strings.Contains(logs.String(), `"chat_id":"-100"`) {
+		t.Errorf("logs = %s", logs.String())
+	}
+
+	// The store decides absence and the missing precondition.
+	for result, want := range map[DeleteDLQResult]struct {
+		status  int
+		code    string
+		outcome string
+	}{
+		DeleteDLQAbsent:               {204, "", "absent"},
+		DeleteDLQPreconditionRequired: {428, "precondition_required", "refused"},
+		DeleteDLQPreconditionFailed:   {412, "precondition_failed", "refused"},
+		DeleteDLQRecipientBlocked:     {409, "recipient_blocked", "refused"},
+		DeleteDLQWrongType:            {503, "dependency_unavailable", "unavailable"},
+		DeleteDLQUnavailable:          {503, "dependency_unavailable", "unavailable"},
+		DeleteDLQUncertain:            {503, "dependency_unavailable", "unavailable"},
+	} {
+		f := &fakeDeadLetters{deletion: DeleteDLQ{Result: result}}
+		h, _, reg := deadLetterService(t, f)
+		rec := doDLQDelete(t, h, "/admin/v1/dead-letters/"+dlqID)
+		if rec.Code != want.status || (want.code != "" && !strings.Contains(rec.Body.String(), `"code":"`+want.code+`"`)) {
+			t.Errorf("%s: %d %s", result, rec.Code, rec.Body.String())
+		}
+		if len(f.deletes) != 1 || f.deletes[0].expected != nil {
+			t.Errorf("%s: calls %+v", result, f.deletes)
+		}
+		if got := counterValue(t, reg, "hookrelay_dead_letter_deletions_total", map[string]string{"outcome": want.outcome}); got != 1 {
+			t.Errorf("%s: deletions{outcome=%s} = %v", result, want.outcome, got)
+		}
+		if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "dead_letter_deleted", "outcome": "success"}); got != 0 {
+			t.Errorf("%s: audit counted", result)
+		}
+		if result == DeleteDLQUncertain && !strings.Contains(rec.Body.String(), "uncertain") {
+			t.Errorf("uncertain deletion not reported as uncertain: %s", rec.Body.String())
+		}
+	}
+
+	// A malformed tag is 400 for an existing entry and 204 for an absent
+	// one; an identifier that cannot name a dead letter is absent.
+	for _, bad := range [][]string{{`W/"2:1740000000000"`}, {"*"}, {`"2:1740000000000", "3:1"`}, {`"2:x"`}, {`"2:1"`, `"2:1"`}} {
+		f := &fakeDeadLetters{record: record}
+		h, _, _ := deadLetterService(t, f)
+		if rec := doDLQDelete(t, h, "/admin/v1/dead-letters/"+dlqID, bad...); rec.Code != http.StatusBadRequest || len(f.deletes) != 0 {
+			t.Errorf("If-Match %q on an existing entry = %d, calls %d", bad, rec.Code, len(f.deletes))
+		}
+		f = &fakeDeadLetters{deletion: DeleteDLQ{Result: DeleteDLQAbsent}}
+		h, _, _ = deadLetterService(t, f)
+		if rec := doDLQDelete(t, h, "/admin/v1/dead-letters/"+dlqID, bad...); rec.Code != http.StatusNoContent || len(f.deletes) != 1 || f.deletes[0].expected != nil {
+			t.Errorf("If-Match %q on an absent entry = %d, calls %+v", bad, rec.Code, f.deletes)
+		}
+	}
+	f = &fakeDeadLetters{}
+	h, _, reg = deadLetterService(t, f)
+	if rec := doDLQDelete(t, h, "/admin/v1/dead-letters/not-a-uuid", "*"); rec.Code != http.StatusNoContent || len(f.deletes) != 0 {
+		t.Errorf("malformed id = %d, calls %d", rec.Code, len(f.deletes))
+	}
+	if got := counterValue(t, reg, "hookrelay_dead_letter_deletions_total", map[string]string{"outcome": "absent"}); got != 1 {
+		t.Errorf("malformed id deletions = %v", got)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/admin/v1/dead-letters/"+dlqID, nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || len(f.deletes) != 0 {
+		t.Errorf("unauthenticated delete = %d", rec.Code)
 	}
 }

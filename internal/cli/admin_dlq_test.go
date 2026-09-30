@@ -257,3 +257,125 @@ func TestAdminDLQPayload(t *testing.T) {
 		t.Errorf("payload without --message-id = %d, want usage", code)
 	}
 }
+
+// taggedDeadLetter answers the dead-letter read with its ETag.
+func taggedDeadLetter(tag string, status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if tag != "" {
+			w.Header().Set("ETag", tag)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		fmt.Fprint(w, body)
+	}
+}
+
+// TestAdminDLQDelete pins the confirmed deletion: --yes required, the
+// dead letter read first with its ETag sent as If-Match, a missing entry
+// reported as an error, and definite refusals failing without retry.
+func TestAdminDLQDelete(t *testing.T) {
+	const tag = `"1:1740000000000"`
+	api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+		"GET " + dlqGetPath:    taggedDeadLetter(tag, http.StatusOK, deadLetterBody(1)),
+		"DELETE " + dlqGetPath: respond(http.StatusNoContent, ""),
+	}}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	r := newTestRun(srv.URL)
+	if code := r.run("dlq", "delete", "--message-id", dlqMessageID, "--yes"); code != ExitOK {
+		t.Fatalf("exit = %d: %s", code, r.stderr.String())
+	}
+	if calls := api.calls(http.MethodDelete, dlqGetPath); len(calls) != 1 || calls[0].IfMatch != tag {
+		t.Errorf("delete calls = %+v", calls)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(r.stdout.Bytes(), &out); err != nil || out["outcome"] != "deleted" || out["message_id"] != dlqMessageID {
+		t.Errorf("stdout = %s", r.stdout.String())
+	}
+	r.assertNoSecrets(t)
+	for name, args := range map[string][]string{
+		"no --yes":      {"dlq", "delete", "--message-id", dlqMessageID},
+		"no message id": {"dlq", "delete", "--yes"},
+	} {
+		if code := newTestRun(srv.URL).run(args...); code != ExitUsage {
+			t.Errorf("%s: exit = %d, want usage", name, code)
+		}
+	}
+
+	for status, want := range map[int]string{
+		http.StatusPreconditionFailed: "changed since it was read",
+		http.StatusConflict:           "runbook",
+	} {
+		code := map[int]string{412: "precondition_failed", 409: "recipient_blocked"}[status]
+		api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+			"GET " + dlqGetPath:    taggedDeadLetter(tag, http.StatusOK, deadLetterBody(1)),
+			"DELETE " + dlqGetPath: respond(status, apiErrorBody(code, "refused")),
+		}}
+		srv := httptest.NewServer(api)
+		r := newTestRun(srv.URL)
+		if exit := r.run("dlq", "delete", "--message-id", dlqMessageID, "--yes"); exit != ExitError || !strings.Contains(r.stderr.String(), want) ||
+			len(api.calls(http.MethodDelete, dlqGetPath)) != 1 || len(api.calls(http.MethodGet, dlqGetPath)) != 1 {
+			t.Errorf("%d: exit %d, stderr %s", status, exit, r.stderr.String())
+		}
+		srv.Close()
+	}
+
+	// A message that is not dead-lettered is an error, not a deletion.
+	api = &routedAdminAPI{routes: map[string]http.HandlerFunc{"GET " + dlqGetPath: respond(http.StatusNotFound, apiErrorBody("dead_letter_not_found", "x"))}}
+	srv2 := httptest.NewServer(api)
+	defer srv2.Close()
+	if exit := newTestRun(srv2.URL).run("dlq", "delete", "--message-id", dlqMessageID, "--yes"); exit != ExitError ||
+		len(api.calls(http.MethodDelete, dlqGetPath)) != 0 {
+		t.Errorf("delete of an absent dead letter: exit %d", exit)
+	}
+}
+
+// TestAdminDLQDeleteUncertain pins the uncertain-outcome discipline: no
+// retry, one reconciling read, absence reported as desired state with the
+// audit caveat, and a failing exit in every case.
+func TestAdminDLQDeleteUncertain(t *testing.T) {
+	const tag = `"1:1740000000000"`
+	for name, tc := range map[string]struct {
+		reread  http.HandlerFunc
+		outcome string
+		warning string
+	}{
+		"absent after":  {respond(http.StatusNotFound, apiErrorBody("dead_letter_not_found", "x")), "desired_state_observed", "does NOT confirm"},
+		"still present": {taggedDeadLetter(tag, http.StatusOK, deadLetterBody(1)), "uncertain", "still dead-lettered"},
+		"unreadable":    {respond(http.StatusServiceUnavailable, apiErrorBody("dependency_unavailable", "x")), "uncertain", "could not be read"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var gets int
+			api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+				"GET " + dlqGetPath: func(w http.ResponseWriter, r *http.Request) {
+					gets++
+					if gets == 1 {
+						taggedDeadLetter(tag, http.StatusOK, deadLetterBody(1))(w, r)
+						return
+					}
+					tc.reread(w, r)
+				},
+				"DELETE " + dlqGetPath: respond(http.StatusServiceUnavailable, apiErrorBody("dependency_unavailable", "outcome is uncertain")),
+			}}
+			srv := httptest.NewServer(api)
+			defer srv.Close()
+			r := newTestRun(srv.URL)
+			if exit := r.run("dlq", "delete", "--message-id", dlqMessageID, "--yes"); exit != ExitError {
+				t.Errorf("exit = %d", exit)
+			}
+			var out map[string]any
+			if err := json.Unmarshal(r.stdout.Bytes(), &out); err != nil || out["outcome"] != tc.outcome {
+				t.Errorf("stdout = %s", r.stdout.String())
+			}
+			if !strings.Contains(r.stderr.String(), tc.warning) || !strings.Contains(r.stderr.String(), "not retrying") {
+				t.Errorf("stderr = %s", r.stderr.String())
+			}
+			if n := len(api.calls(http.MethodDelete, dlqGetPath)); n != 1 {
+				t.Errorf("deletes = %d, want 1", n)
+			}
+			if gets != 2 {
+				t.Errorf("reads = %d, want 2", gets)
+			}
+		})
+	}
+}

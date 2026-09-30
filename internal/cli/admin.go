@@ -82,6 +82,7 @@ const adminUsage = `usage:
   hookrelay admin dlq list [--limit <n>] [--cursor <c>] [common flags]
   hookrelay admin dlq get --message-id <id> [common flags]
   hookrelay admin dlq payload --message-id <id> [common flags]
+  hookrelay admin dlq delete --message-id <id> --yes [common flags]
   hookrelay admin dlq replay --message-id <id> [--deduplication-conflict-resolution reject|keep_current]
       --yes [common flags]
   hookrelay admin message delivery-state --message-id <id> [common flags]

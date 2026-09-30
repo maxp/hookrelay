@@ -104,6 +104,41 @@ type Payload struct {
 	RecipientIdentity string
 }
 
+// DeadLetterVersion names one dead-letter entry: every dead-lettering
+// writes a new time and every replay a new cycle. It is the entity tag
+// "<delivery_cycle>:<dead_lettered_ms>".
+type DeadLetterVersion struct {
+	DeliveryCycle  int64
+	DeadLetteredMs int64
+}
+
+// DeleteDLQResult is the bounded outcome of the audited permanent deletion.
+type DeleteDLQResult string
+
+const (
+	DeleteDLQDeleted              DeleteDLQResult = "deleted"
+	DeleteDLQAbsent               DeleteDLQResult = "absent"
+	DeleteDLQPreconditionRequired DeleteDLQResult = "precondition_required"
+	DeleteDLQPreconditionFailed   DeleteDLQResult = "precondition_failed"
+	DeleteDLQRecipientBlocked     DeleteDLQResult = "recipient_blocked"
+	DeleteDLQWrongType            DeleteDLQResult = "wrong_type"
+	DeleteDLQUnavailable          DeleteDLQResult = "dependency_unavailable"
+	// DeleteDLQUncertain: the deletion may have run; neither success nor
+	// failure may be reported.
+	DeleteDLQUncertain DeleteDLQResult = "uncertain"
+)
+
+// DeleteDLQ is the deletion result; DeletedMs, RecipientIdentity, and
+// Reason are set for DeleteDLQDeleted, Current for
+// DeleteDLQPreconditionFailed.
+type DeleteDLQ struct {
+	Result            DeleteDLQResult
+	DeletedMs         int64
+	RecipientIdentity string
+	Reason            string
+	Current           DeadLetterVersion
+}
+
 // DeadLetterRepository is the DLQ storage the Valkey adapter implements.
 type DeadLetterRepository interface {
 	// ListDeadLetters returns at most limit DLQ members newest first after
@@ -117,4 +152,7 @@ type DeadLetterRepository interface {
 	// ViewPayload appends the access audit for actor and returns the
 	// Canonical Message in the same operation.
 	ViewPayload(ctx context.Context, messageID, actor, eventID, requestID string) Payload
+	// DeleteDeadLetter runs the audited permanent deletion of the entry
+	// named by expected (nil when no If-Match was sent).
+	DeleteDeadLetter(ctx context.Context, messageID string, expected *DeadLetterVersion, actor, eventID, requestID string) DeleteDLQ
 }
