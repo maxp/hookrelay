@@ -72,10 +72,52 @@ export function bytes(n) {
 // recipientText renders a structured Recipient as one line.
 export function recipientText(r) {
   if (!r) return "—";
-  const parts = [r.bot_platform, r.bot_id, r.scope];
+  const parts = [`${r.bot_platform} bot ${r.bot_id}`];
   if (r.chat_id) parts.push(`chat ${r.chat_id}`);
-  if (r.user_id) parts.push(`user ${r.user_id}`);
+  else if (r.user_id) parts.push(`user ${r.user_id}`);
+  else parts.push(`${r.scope} scope`);
   return parts.join(" · ");
+}
+
+// prettyJSON indents JSON text without parsing it, so numbers beyond the
+// JavaScript safe-integer range are shown exactly as stored.
+export function prettyJSON(raw) {
+  let out = "";
+  let depth = 0;
+  let inString = false;
+  const newline = () => "\n" + "  ".repeat(depth);
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inString) {
+      out += c;
+      if (c === "\\") out += raw[++i] ?? "";
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+    } else if (c === "{" || c === "[") {
+      const close = c === "{" ? "}" : "]";
+      if (raw[i + 1] === close) {
+        out += c + close;
+        i++;
+      } else {
+        depth++;
+        out += c + newline();
+      }
+    } else if (c === "}" || c === "]") {
+      depth--;
+      out += newline() + c;
+    } else if (c === ",") {
+      out += c + newline();
+    } else if (c === ":") {
+      out += ": ";
+    } else if (!/\s/.test(c)) {
+      out += c;
+    }
+  }
+  return out;
 }
 
 // notice renders a status line; kind is "", "warn", or "bad".

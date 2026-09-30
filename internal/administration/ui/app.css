@@ -91,3 +91,4 @@ button:disabled { opacity: 0.5; cursor: default; }
 dl.fields { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; }
 dl.fields dt { color: var(--muted); }
 dl.fields dd { margin: 0; }
+h1.mono { font-size: 1.1rem; }

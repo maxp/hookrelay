@@ -32,7 +32,8 @@ export class ApiError extends Error {
   }
 }
 
-// request sends one API request and returns { status, body, headers }.
+// request sends one API request and returns { status, body, text,
+// headers }; text is the raw response for exact display.
 // Non-2xx responses throw ApiError; a 401 also triggers the login view.
 export async function request(method, path, body, headers = {}) {
   const init = { method, credentials: "same-origin", cache: "no-store", headers: { Accept: "application/json", ...headers } };
@@ -65,7 +66,7 @@ export async function request(method, path, body, headers = {}) {
     }
     throw new ApiError(response.status, e.code, e.message, e.request_id);
   }
-  return { status: response.status, body: data, headers: response.headers };
+  return { status: response.status, body: data, text, headers: response.headers };
 }
 
 export const get = (path) => request("GET", path);

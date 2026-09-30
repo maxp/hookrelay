@@ -3,14 +3,22 @@
 
 import { ApiError, get, request, setCSRFToken, setUnauthenticatedHandler } from "./api.js";
 import { el, notice, replace, time } from "./dom.js";
+import * as audit from "./views/audit.js";
+import * as deadLetters from "./views/deadletters.js";
+import * as message from "./views/message.js";
 import * as overview from "./views/overview.js";
+import * as recipients from "./views/recipients.js";
 
 // routes maps the first hash segment to its view module. A view exports
 // title, render(main, ctx, ...args), and optionally pollMs.
 const routes = {
   overview,
+  recipients,
+  "dead-letters": deadLetters,
+  message,
+  audit,
 };
-const navOrder = ["overview"];
+const navOrder = ["overview", "recipients", "dead-letters", "message", "audit"];
 
 const main = document.getElementById("main");
 const top = document.getElementById("top");
