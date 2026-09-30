@@ -317,3 +317,38 @@ func TestDeleteWebhookContract(t *testing.T) {
 		}
 	}
 }
+
+// TestBotWebhooksContract pins the Bot Identity listing: every safe item
+// in storage order without a cursor, orphans skipped, an empty list for a
+// bot without endpoints, and 400 for an unknown platform or bad bot_id.
+func TestBotWebhooksContract(t *testing.T) {
+	repo := newFakeRepo()
+	repo.botListings = []EndpointListing{listing("wh_new", 200), {Member: "telegram:wh_gone", Orphan: OrphanMissing}, listing("wh_old", 100)}
+	h, logs := webhookService(t, repo)
+	rec := doJSON(t, h, http.MethodGet, "/admin/v1/bots/telegram/42/webhooks", adminSecret, "")
+	var page listPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("list = %d %s", rec.Code, rec.Body)
+	}
+	if len(page.Items) != 2 || page.Items[0].WebhookIdentifier != "wh_new" || page.Items[1].WebhookIdentifier != "wh_old" || page.NextCursor != nil {
+		t.Errorf("items = %s", rec.Body)
+	}
+	if repo.botCalls[0] != "telegram:42" || strings.Contains(rec.Body.String(), "super-secret") {
+		t.Errorf("calls = %v body %s", repo.botCalls, rec.Body)
+	}
+	if !strings.Contains(logs.String(), `"index":"bot_webhooks"`) {
+		t.Errorf("orphan event = %s", logs)
+	}
+	repo.botListings = nil
+	if rec := doJSON(t, h, http.MethodGet, "/admin/v1/bots/telegram/43/webhooks", adminSecret, ""); rec.Code != http.StatusOK || rec.Body.String() != `{"items":[]}`+"\n" {
+		t.Errorf("empty = %d %s", rec.Code, rec.Body)
+	}
+	for _, p := range []string{"/admin/v1/bots/maxbot/42/webhooks", "/admin/v1/bots/telegram/042/webhooks", "/admin/v1/bots/telegram/x/webhooks"} {
+		if rec := doJSON(t, h, http.MethodGet, p, adminSecret, ""); rec.Code != http.StatusBadRequest || errCode(rec) != "invalid_request" {
+			t.Errorf("%s = %d %s", p, rec.Code, rec.Body)
+		}
+	}
+	if len(repo.botCalls) != 2 {
+		t.Errorf("invalid requests reached storage: %v", repo.botCalls)
+	}
+}

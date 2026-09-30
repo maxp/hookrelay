@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -282,4 +283,38 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// BotWebhooks is the unpaginated endpoint collection of one Bot Identity.
+type BotWebhooks struct {
+	Items []endpointResponse `json:"items"`
+}
+
+// ListBotWebhooks returns every endpoint of one Bot Identity, newest first,
+// for the credential-replacement flow.
+func (s *Service) ListBotWebhooks(ctx context.Context, botPlatform, botID, requestID string) (BotWebhooks, error) {
+	if !s.catalog.KnownPlatform(botPlatform) {
+		return BotWebhooks{}, BadRequestError{msg: "unknown bot platform"}
+	}
+	if !botIDPattern.MatchString(botID) {
+		return BotWebhooks{}, BadRequestError{msg: "bot_id must be a canonical decimal identifier"}
+	}
+	items, err := s.repo.ListBotEndpoints(ctx, botPlatform, botID)
+	if err != nil {
+		if errors.Is(err, ErrStoredWrongType) {
+			return BotWebhooks{}, DependencyError{detail: ErrStoredWrongType.Error()}
+		}
+		return BotWebhooks{}, DependencyError{}
+	}
+	return BotWebhooks{Items: s.endpointViews(items, "bot_webhooks", requestID)}, nil
+}
+
+func (s *Service) handleBotWebhooks(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFrom(r.Context())
+	list, err := s.ListBotWebhooks(r.Context(), r.PathValue("bot_platform"), r.PathValue("bot_id"), requestID)
+	if err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -412,6 +413,41 @@ func (s *endpointStore) ListEndpoints(ctx context.Context, limit int, after *adm
 		offset += int64(len(page))
 	}
 	return out, s.readListings(ctx, out)
+}
+
+// ListBotEndpoints reads the Bot Identity Set and each member's Hash. A
+// member without a usable record carries its orphan reason; CreatedMs of
+// such a member is 0, so it sorts last.
+func (s *endpointStore) ListBotEndpoints(ctx context.Context, botPlatform, botID string) (_ []administration.EndpointListing, err error) {
+	start := time.Now()
+	defer func() { s.a.metrics.observe("endpoint_read", start, err) }()
+	c := s.a.client
+	members, err := c.Do(ctx, c.B().Smembers().Key("hr1:bot:"+botPlatform+":"+botID+":webhooks").Build()).AsStrSlice()
+	if err != nil {
+		if isWrongType(err) {
+			return nil, administration.ErrStoredWrongType
+		}
+		return nil, err
+	}
+	out := make([]administration.EndpointListing, len(members))
+	for i, m := range members {
+		out[i].Member = m
+	}
+	if err := s.readListings(ctx, out); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if out[i].Endpoint != nil {
+			out[i].CreatedMs = out[i].Endpoint.CreatedMs
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedMs != out[j].CreatedMs {
+			return out[i].CreatedMs > out[j].CreatedMs
+		}
+		return out[i].Member > out[j].Member
+	})
+	return out, nil
 }
 
 // readListings fills each listing with its endpoint record or an orphan

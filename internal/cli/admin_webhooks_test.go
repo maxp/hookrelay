@@ -216,3 +216,27 @@ func TestAdminWebhookDelete(t *testing.T) {
 	}
 	r.assertNoSecrets(t)
 }
+
+// TestAdminBotWebhooks pins the Bot Identity listing command.
+func TestAdminBotWebhooks(t *testing.T) {
+	const path = "/admin/v1/bots/telegram/42/webhooks"
+	api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+		"GET " + path: respond(http.StatusOK, `{"items":[`+endpointVersionJSON("wh_new", true, 1)+`,`+endpointVersionJSON("wh_old", false, 2)+`]}`),
+	}}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	r := newTestRun(srv.URL)
+	r.tty = true
+	if code := r.run("bot", "webhooks", "--platform", "telegram", "--bot-id", "42"); code != ExitOK {
+		t.Fatalf("exit = %d %s", code, r.stderr.String())
+	}
+	if !strings.Contains(r.stdout.String(), "wh_new") || !strings.Contains(r.stdout.String(), "wh_old") || strings.Contains(r.stdout.String(), "next_cursor") {
+		t.Errorf("table = %s", r.stdout.String())
+	}
+	for _, args := range [][]string{{"bot", "webhooks", "--platform", "telegram"}, {"bot"}, {"bot", "list"}} {
+		if code := newTestRun(srv.URL).run(args...); code != ExitUsage {
+			t.Errorf("%v = %d, want usage", args, code)
+		}
+	}
+	r.assertNoSecrets(t)
+}

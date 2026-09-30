@@ -231,3 +231,28 @@ func TestWebhookDeleteOverRealValkey(t *testing.T) {
 		t.Errorf("delete recreated = %d", code)
 	}
 }
+
+// TestBotWebhooksOverRealValkey lists one bot's endpoints through the
+// composed stack: only that bot's, newest first, disabled ones included.
+func TestBotWebhooksOverRealValkey(t *testing.T) {
+	a := testAdapter(t, false)
+	flushAll(t, a)
+	h := composedHandler(t, a)
+	createWebhook(t, h, "wh_first", "123456789", true)
+	time.Sleep(2 * time.Millisecond)
+	createWebhook(t, h, "wh_second", "123456789", false)
+	createWebhook(t, h, "wh_other_bot", "987654321", true)
+	rec := doJSON(t, h, http.MethodGet, "/admin/v1/bots/telegram/123456789/webhooks", "admin-secret-value-016", "")
+	var page struct {
+		Items []struct {
+			WebhookIdentifier string `json:"webhook_identifier"`
+			Enabled           bool   `json:"enabled"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("list = %d %s", rec.Code, rec.Body)
+	}
+	if len(page.Items) != 2 || page.Items[0].WebhookIdentifier != "wh_second" || page.Items[0].Enabled || page.Items[1].WebhookIdentifier != "wh_first" {
+		t.Errorf("items = %s", rec.Body)
+	}
+}

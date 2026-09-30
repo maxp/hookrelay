@@ -24,6 +24,9 @@ type fakeRepo struct {
 	mutations []mutationCall
 	// setEnabledResult forces the SetEndpointEnabled outcome when set.
 	setEnabledResult SetEnabledResult
+	// botListings back ListBotEndpoints, already sorted.
+	botListings []EndpointListing
+	botCalls    []string
 	// deleteResult forces the DeleteEndpoint outcome when set.
 	deleteResult  DeleteResult
 	endpoints     map[string]*Endpoint
@@ -119,6 +122,11 @@ func (f *fakeRepo) DeleteEndpoint(_ context.Context, webhookType, identifier, bo
 		GenerationID: e.GenerationID, ConfigVersion: e.ConfigVersion, UpdatedMs: 1}, DeleteDeleted
 }
 
+func (f *fakeRepo) ListBotEndpoints(_ context.Context, botPlatform, botID string) ([]EndpointListing, error) {
+	f.botCalls = append(f.botCalls, botPlatform+":"+botID)
+	return f.botListings, nil
+}
+
 type mutationCall struct {
 	target             string
 	expected           *EntityVersion
@@ -145,6 +153,8 @@ func (f *fakeRepo) ListEndpoints(_ context.Context, limit int, after *EndpointCu
 }
 
 type fakeCatalog struct{}
+
+func (fakeCatalog) KnownPlatform(p string) bool { return p == "telegram" }
 
 func (fakeCatalog) Lookup(webhookType string) (string, []string, bool) {
 	if webhookType == "telegram" {

@@ -248,3 +248,27 @@ func (c *adminClient) reconcileDelete(name, webhookType, identifier, cause strin
 	_ = c.printUncertain(result)
 	return ExitError
 }
+
+// adminBotWebhooks lists every endpoint of one Bot Identity.
+func adminBotWebhooks(args []string, env adminIO) int {
+	const name = "hookrelay admin bot webhooks"
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(env.Stderr)
+	var common commonFlags
+	common.register(fs)
+	platform := fs.String("platform", "", "Bot Platform (required)")
+	botID := fs.String("bot-id", "", "Bot Identifier (required)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if *platform == "" || *botID == "" || fs.NArg() > 0 {
+		fmt.Fprintf(env.Stderr, "%s: --platform and --bot-id are required\n", name)
+		return ExitUsage
+	}
+	client, err := common.resolve(env)
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitUsage
+	}
+	return client.printWebhookPage(name, "/admin/v1/bots/"+url.PathEscape(*platform)+"/"+url.PathEscape(*botID)+"/webhooks")
+}

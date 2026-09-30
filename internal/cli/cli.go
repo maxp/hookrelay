@@ -50,6 +50,10 @@ func (c typeCatalog) Lookup(webhookType string) (string, []string, bool) {
 	return string(d.Platform), d.CredentialKinds, true
 }
 
+func (c typeCatalog) KnownPlatform(p string) bool {
+	return c.registry.HasPlatform(ingestion.BotPlatform(p))
+}
+
 // Exit codes per the lifecycle contract: controlled clean shutdown 0,
 // runtime/internal failure 1, configuration or CLI usage failure 2.
 const (

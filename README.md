@@ -394,6 +394,11 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   returns `204` without another audit event (which does not prove that an
   earlier uncertain deletion was audited). Recreating the identifier starts
   a new generation, so earlier ETags are refused with `412`.
+- `GET /admin/v1/bots/{bot_platform}/{bot_id}/webhooks` — every endpoint of
+  one Bot Identity (at most 100, unpaginated), newest first; `400` for an
+  unknown platform or invalid `bot_id`. With create, disable, and delete it
+  completes credential replacement: create the new endpoint, switch the
+  platform webhook to it, then disable and delete the old one.
 - `GET /admin/v1/recipient-states?status=ready|leased|retry_wait|blocked&limit&cursor`
   — Recipients in one state as structured Recipient fields with the state's
   time (`ready_sequence`, `lease_expires_ms`, `retry_at_ms`, or `detected_ms`
@@ -462,6 +467,7 @@ hookrelay admin webhook list [--limit 50] [--cursor <next_cursor>]
 hookrelay admin webhook disable --type telegram --identifier wh_... --yes
 hookrelay admin webhook enable --type telegram --identifier wh_... --yes
 hookrelay admin webhook delete --type telegram --identifier wh_... --yes
+hookrelay admin bot webhooks --platform telegram --bot-id 123456
 hookrelay admin recipients list --status blocked
 hookrelay admin recipients inspect-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100
 hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100 \

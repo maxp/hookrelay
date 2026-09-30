@@ -25,6 +25,9 @@ type EndpointRepository interface {
 	// DeleteEndpoint runs the audited delete of a disabled endpoint under
 	// the expected entity version (nil when no If-Match was sent).
 	DeleteEndpoint(ctx context.Context, webhookType, identifier, botPlatform string, expected *EntityVersion, eventID, requestID string) (*Endpoint, DeleteResult)
+	// ListBotEndpoints reads every endpoint of one Bot Identity (at most
+	// 100), newest first (descending created_ms, then member).
+	ListBotEndpoints(ctx context.Context, botPlatform, botID string) ([]EndpointListing, error)
 	// ListEndpoints pages the global listing newest first (descending
 	// created_ms, then descending member), strictly after the cursor.
 	ListEndpoints(ctx context.Context, limit int, after *EndpointCursor) ([]EndpointListing, error)
@@ -128,6 +131,9 @@ var ErrStoredWrongType = errors.New("administration: stored structure has an une
 // credential-kind allowlist per Webhook Type.
 type TypeCatalog interface {
 	Lookup(webhookType string) (platform string, credentialKinds []string, ok bool)
+	// KnownPlatform reports whether a registered type belongs to the Bot
+	// Platform.
+	KnownPlatform(botPlatform string) bool
 }
 
 // AuditSink records best-effort audit events outside Lua transitions. The

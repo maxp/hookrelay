@@ -241,7 +241,7 @@ For an existing endpoint, missing `If-Match` returns `428`, a stale value return
 GET /admin/v1/bots/{bot_platform}/{bot_id}/webhooks
 ```
 
-This endpoint reads the Bot Identity membership Set and returns safe metadata for every associated Webhook Endpoint. It supports the create-new-endpoint credential replacement flow. The first version does not paginate this normally small collection but enforces a hard maximum of 100 endpoints per Bot Identity.
+This endpoint reads the Bot Identity membership Set and returns `{"items": [...]}` with safe metadata for every associated Webhook Endpoint, newest first. An unknown Bot Platform or an invalid Bot Identifier returns `400 invalid_request`; a Bot Identity without endpoints returns an empty list. A listing member whose endpoint record is missing or unusable is skipped and logged as `webhook_index_orphan`, as in the global list. It supports the create-new-endpoint credential replacement flow. The first version does not paginate this normally small collection but enforces a hard maximum of 100 endpoints per Bot Identity.
 
 ## Operational and DLQ API surface
 

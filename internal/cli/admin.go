@@ -74,6 +74,7 @@ const adminUsage = `usage:
   hookrelay admin webhook get --type <webhook_type> --identifier <id> [common flags]
   hookrelay admin webhook list [--limit <n>] [--cursor <c>] [common flags]
   hookrelay admin webhook enable|disable|delete --type <webhook_type> --identifier <id> --yes [common flags]
+  hookrelay admin bot webhooks --platform <bot_platform> --bot-id <bot_id> [common flags]
   hookrelay admin recipients list --status <ready|leased|retry_wait|blocked> [--limit <n>] [--cursor <c>] [common flags]
   hookrelay admin recipients inspect-block <recipient> [common flags]
   hookrelay admin recipients clear-block <recipient> --expected-detected-ms <ms>
@@ -104,6 +105,13 @@ func runAdmin(args []string, env adminIO) int {
 	}
 	if len(args) >= 1 && args[0] == "message" {
 		return runMessage(args[1:], env)
+	}
+	if len(args) >= 1 && args[0] == "bot" {
+		if len(args) < 2 || args[1] != "webhooks" {
+			fmt.Fprint(env.Stderr, adminUsage)
+			return ExitUsage
+		}
+		return adminBotWebhooks(args[2:], env)
 	}
 	if len(args) < 2 || args[0] != "webhook" {
 		fmt.Fprint(env.Stderr, adminUsage)

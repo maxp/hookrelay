@@ -71,6 +71,16 @@ func (r *Registry) Lookup(t WebhookType) (Definition, bool) {
 	return d, ok
 }
 
+// HasPlatform reports whether any registered type belongs to the platform.
+func (r *Registry) HasPlatform(p BotPlatform) bool {
+	for _, d := range r.byType {
+		if d.Platform == p {
+			return true
+		}
+	}
+	return false
+}
+
 // BuiltinOptions carries operator configuration for the built-in adapters.
 type BuiltinOptions struct {
 	// TelegramSourceCIDRs is the optional Telegram source allowlist.

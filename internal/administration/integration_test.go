@@ -212,6 +212,8 @@ func composedHandler(t *testing.T, a *valkey.Adapter) http.Handler {
 // shape, mirroring the application composition.
 type builtinCatalog struct{}
 
+func (builtinCatalog) KnownPlatform(p string) bool { return p == "telegram" }
+
 func (builtinCatalog) Lookup(webhookType string) (string, []string, bool) {
 	r, err := ingestion.Builtin(ingestion.BuiltinOptions{})
 	if err != nil {

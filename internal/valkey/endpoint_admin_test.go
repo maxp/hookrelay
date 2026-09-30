@@ -313,3 +313,28 @@ func TestDeleteEndpointArgumentsAndReload(t *testing.T) {
 		t.Errorf("after SCRIPT FLUSH = %s", r)
 	}
 }
+
+// TestListBotEndpoints pins the Bot Identity read: every member with its
+// record newest first, orphans reported and sorted last, an absent Set as
+// an empty list, and a wrong-typed Set as the stored-type error.
+func TestListBotEndpoints(t *testing.T) {
+	a, store := adminSetup(t)
+	ctx := context.Background()
+	createAt(t, a, "wh_newer", "9999999999999")
+	a.testDo(t, "SADD", "hr1:bot:telegram:123456789:webhooks", "telegram:wh_gone")
+	items, err := store.ListBotEndpoints(ctx, "telegram", "123456789")
+	if err != nil || len(items) != 3 {
+		t.Fatalf("items = %+v, %v", items, err)
+	}
+	if items[0].Member != "telegram:wh_newer" || items[1].Member != "telegram:wh_test1" || items[1].Endpoint.BotID != "123456789" ||
+		items[2].Member != "telegram:wh_gone" || items[2].Orphan != administration.OrphanMissing {
+		t.Errorf("order = %+v", items)
+	}
+	if items, err := store.ListBotEndpoints(ctx, "telegram", "1"); err != nil || len(items) != 0 {
+		t.Errorf("absent bot = %+v, %v", items, err)
+	}
+	a.testDo(t, "SET", "hr1:bot:telegram:2:webhooks", "x")
+	if _, err := store.ListBotEndpoints(ctx, "telegram", "2"); !errors.Is(err, administration.ErrStoredWrongType) {
+		t.Errorf("wrong type = %v", err)
+	}
+}

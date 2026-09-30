@@ -36,6 +36,7 @@ func Handler(svc *Service) http.Handler {
 	mux.Handle("GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handleGet)))
 	mux.Handle("PATCH /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handlePatch)))
 	mux.Handle("DELETE /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handleDelete)))
+	mux.Handle("GET /admin/v1/bots/{bot_platform}/{bot_id}/webhooks", svc.auth(http.HandlerFunc(svc.handleBotWebhooks)))
 	if svc.recipients != nil {
 		mux.Handle("GET /admin/v1/recipient-states", svc.auth(http.HandlerFunc(svc.handleListRecipientStates)))
 		mux.Handle("POST /admin/v1/recipient-blocks/inspect", svc.auth(http.HandlerFunc(svc.handleInspectBlock)))
