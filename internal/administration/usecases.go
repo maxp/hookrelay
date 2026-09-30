@@ -185,11 +185,13 @@ func viewOf(e *Endpoint) EndpointView {
 		BotID:          e.BotID,
 		Enabled:        e.Enabled,
 		CredentialKind: e.CredentialKind,
-		CredentialSet:  e.CredentialValue != "",
-		GenerationID:   e.GenerationID,
-		ConfigVersion:  e.ConfigVersion,
-		CreatedMs:      e.CreatedMs,
-		UpdatedMs:      e.UpdatedMs,
+		// Every endpoint has exactly one credential, fixed at creation;
+		// transition results carry only its kind.
+		CredentialSet: e.CredentialKind != "",
+		GenerationID:  e.GenerationID,
+		ConfigVersion: e.ConfigVersion,
+		CreatedMs:     e.CreatedMs,
+		UpdatedMs:     e.UpdatedMs,
 	}
 }
 

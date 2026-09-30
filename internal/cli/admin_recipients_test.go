@@ -21,7 +21,7 @@ type routedAdminAPI struct {
 
 func (f *routedAdminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	data, _ := io.ReadAll(r.Body)
-	rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Authorization: r.Header.Get("Authorization"), ContentType: r.Header.Get("Content-Type")}
+	rec := recordedRequest{Method: r.Method, Path: r.URL.Path, Authorization: r.Header.Get("Authorization"), ContentType: r.Header.Get("Content-Type"), IfMatch: r.Header.Get("If-Match")}
 	_ = json.Unmarshal(data, &rec.Body)
 	f.mu.Lock()
 	f.requests = append(f.requests, rec)

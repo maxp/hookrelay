@@ -222,7 +222,7 @@ The first version permits changing only the enabled flag:
 
 The same shape with `"enabled": true` re-enables a disabled endpoint. This `PATCH` route is the only public HTTP enable/disable mutation; the CLI's semantic `enable` and `disable` commands use it and do not introduce separate HTTP routes.
 
-The mutation changes `enabled`, increments `config_version`, updates `updated_ms`, and appends the required audit event in the same Lua operation. Success returns `200`, a new `ETag`, and the complete current safe endpoint representation. Disabled endpoints retain their configuration and credential but externally behave like unknown endpoints and return the same `404`.
+The mutation changes `enabled`, increments `config_version`, updates `updated_ms`, and appends the required audit event in the same Lua operation. Success returns `200`, a new `ETag`, and the complete current safe endpoint representation. Requesting the current value with a current `ETag` is a no-op: `200` with the unchanged `ETag` and representation, no version increment, and no audit event, so a reconciled retry cannot inflate the version. `If-Match` must be exactly one strong tag; weak tags, `*`, lists, and malformed values return `400 invalid_request`. The precondition is evaluated only for an existing endpoint, so a missing endpoint returns `404` with or without `If-Match`. Disabled endpoints retain their configuration and credential but externally behave like unknown endpoints and return the same `404`.
 
 ## Delete
 

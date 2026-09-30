@@ -73,6 +73,7 @@ const adminUsage = `usage:
       [--credential-kind <kind>] [--credential-file <path>] [--disabled] [common flags]
   hookrelay admin webhook get --type <webhook_type> --identifier <id> [common flags]
   hookrelay admin webhook list [--limit <n>] [--cursor <c>] [common flags]
+  hookrelay admin webhook enable|disable --type <webhook_type> --identifier <id> --yes [common flags]
   hookrelay admin recipients list --status <ready|leased|retry_wait|blocked> [--limit <n>] [--cursor <c>] [common flags]
   hookrelay admin recipients inspect-block <recipient> [common flags]
   hookrelay admin recipients clear-block <recipient> --expected-detected-ms <ms>
@@ -115,6 +116,10 @@ func runAdmin(args []string, env adminIO) int {
 		return adminWebhookGet(args[2:], env)
 	case "list":
 		return adminWebhookList(args[2:], env)
+	case "enable":
+		return adminWebhookSetEnabled(args[2:], env, true)
+	case "disable":
+		return adminWebhookSetEnabled(args[2:], env, false)
 	default:
 		fmt.Fprintf(env.Stderr, "hookrelay admin: unknown webhook command %q\n", args[1])
 		fmt.Fprint(env.Stderr, adminUsage)
@@ -246,11 +251,18 @@ func (e *apiError) Error() string {
 // do sends one request and returns the status and body. A returned error is
 // transport-level: the request may or may not have reached the server.
 func (c *adminClient) do(method, path string, body any) (int, []byte, error) {
+	status, _, data, err := c.doHeaders(method, path, body, nil)
+	return status, data, err
+}
+
+// doHeaders is do with extra request headers, also returning the response
+// headers.
+func (c *adminClient) doHeaders(method, path string, body any, headers map[string]string) (int, http.Header, []byte, error) {
 	var rd io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		rd = bytes.NewReader(data)
 	}
@@ -262,7 +274,10 @@ func (c *adminClient) do(method, path string, body any) (int, []byte, error) {
 	target.RawQuery = rawQuery
 	req, err := http.NewRequestWithContext(context.Background(), method, target.String(), rd)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.secret)
 	req.Header.Set("Accept", "application/json")
@@ -271,14 +286,14 @@ func (c *adminClient) do(method, path string, body any) (int, []byte, error) {
 	}
 	resp, err := c.env.HTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, safeTransportError(err)
+		return 0, nil, nil, safeTransportError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("read response: %w", err)
 	}
-	return resp.StatusCode, data, nil
+	return resp.StatusCode, resp.Header, data, nil
 }
 
 // safeTransportError drops the request URL (which could carry userinfo) and
@@ -308,18 +323,28 @@ func decodeAPIError(status int, data []byte) *apiError {
 // getWebhook reads one endpoint. It returns (nil, apiError 404) for a
 // missing endpoint and a plain error for transport or shape failures.
 func (c *adminClient) getWebhook(webhookType, identifier string) (*webhookResponse, error) {
-	status, data, err := c.do(http.MethodGet, "/admin/v1/webhooks/"+url.PathEscape(webhookType)+"/"+url.PathEscape(identifier), nil)
+	w, _, err := c.getWebhookTagged(webhookType, identifier)
+	return w, err
+}
+
+// getWebhookTagged is getWebhook that also returns the entity ETag.
+func (c *adminClient) getWebhookTagged(webhookType, identifier string) (*webhookResponse, string, error) {
+	status, headers, data, err := c.doHeaders(http.MethodGet, webhookPath(webhookType, identifier), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if status != http.StatusOK {
-		return nil, decodeAPIError(status, data)
+		return nil, "", decodeAPIError(status, data)
 	}
 	var w webhookResponse
 	if err := json.Unmarshal(data, &w); err != nil {
-		return nil, fmt.Errorf("unreadable endpoint response: %w", err)
+		return nil, "", fmt.Errorf("unreadable endpoint response: %w", err)
 	}
-	return &w, nil
+	return &w, headers.Get("ETag"), nil
+}
+
+func webhookPath(webhookType, identifier string) string {
+	return "/admin/v1/webhooks/" + url.PathEscape(webhookType) + "/" + url.PathEscape(identifier)
 }
 
 func adminWebhookGet(args []string, env adminIO) int {

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -133,5 +134,108 @@ func TestListWebhooksValidation(t *testing.T) {
 	}
 	if rec := doJSON(t, h, http.MethodGet, "/admin/v1/webhooks", "wrong", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("unauthenticated list = %d", rec.Code)
+	}
+}
+
+// doPatch sends a PATCH with an optional If-Match header.
+func doPatch(t *testing.T, h http.Handler, path, ifMatch, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPatch, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func errCode(rec *httptest.ResponseRecorder) string {
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	return env.Error.Code
+}
+
+// TestPatchWebhookContract pins enable/disable: 200 with the new ETag and
+// the full safe representation, the audit copy and feature event, a no-op
+// for the current value (unchanged ETag, no audit), and the bounded
+// refusals in precedence order.
+func TestPatchWebhookContract(t *testing.T) {
+	repo := newFakeRepo()
+	repo.endpoints["telegram:wh_a"] = storedEndpoint("wh_a", 100, true)
+	h, logs := webhookService(t, repo)
+	const path = "/admin/v1/webhooks/telegram/wh_a"
+	etag := `"0195c4d8-0000-7000-8000-00000000000a:2"`
+
+	rec := doPatch(t, h, path, etag, `{"enabled":false}`)
+	if rec.Code != http.StatusOK || rec.Header().Get("ETag") != `"0195c4d8-0000-7000-8000-00000000000a:3"` {
+		t.Fatalf("disable = %d %s etag %s", rec.Code, rec.Body, rec.Header().Get("ETag"))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["enabled"] != false || body["config_version"] != 3.0 || body["bot_platform"] != "telegram" ||
+		body["credential"].(map[string]any)["configured"] != true || strings.Contains(rec.Body.String(), "super-secret") {
+		t.Errorf("body = %s", rec.Body)
+	}
+	if c := repo.mutations[0]; c.target != "telegram:wh_a" || c.expected == nil || c.expected.ConfigVersion != 2 || c.eventID == "" || c.requestID == "" {
+		t.Errorf("mutation call = %+v", c)
+	}
+	for _, want := range []string{`"event":"webhook_endpoint_disabled"`, `"operation":"webhook_endpoint_disabled"`, `"credential_kind":"secret_token"`} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs lack %s: %s", want, logs)
+		}
+	}
+	if strings.Contains(logs.String(), "super-secret") {
+		t.Error("the credential leaked into logs")
+	}
+
+	// The same value again: unchanged ETag, no audit, no event.
+	logs.Reset()
+	newTag := `"0195c4d8-0000-7000-8000-00000000000a:3"`
+	rec = doPatch(t, h, path, newTag, `{"enabled":false}`)
+	if rec.Code != http.StatusOK || rec.Header().Get("ETag") != newTag || logs.Len() != 0 {
+		t.Errorf("no-op = %d etag %s logs %s", rec.Code, rec.Header().Get("ETag"), logs)
+	}
+	if rec := doPatch(t, h, path, newTag, `{"enabled":true}`); rec.Code != http.StatusOK || !strings.Contains(logs.String(), `"event":"webhook_endpoint_enabled"`) {
+		t.Errorf("enable = %d %s", rec.Code, logs)
+	}
+
+	for name, tc := range map[string]struct {
+		path, ifMatch, body string
+		status              int
+		code                string
+	}{
+		"stale":            {path, etag, `{"enabled":false}`, 412, "precondition_failed"},
+		"missing if-match": {path, "", `{"enabled":false}`, 428, "precondition_required"},
+		"missing endpoint": {"/admin/v1/webhooks/telegram/wh_x", "", `{"enabled":false}`, 404, "webhook_endpoint_not_found"},
+		"unknown type":     {"/admin/v1/webhooks/other/wh_a", etag, `{"enabled":false}`, 404, "webhook_endpoint_not_found"},
+		"bad identifier":   {"/admin/v1/webhooks/telegram/wh.a", etag, `{"enabled":false}`, 404, "webhook_endpoint_not_found"},
+		"weak tag":         {path, "W/" + etag, `{"enabled":false}`, 400, "invalid_request"},
+		"wildcard":         {path, "*", `{"enabled":false}`, 400, "invalid_request"},
+		"tag list":         {path, etag + ", " + etag, `{"enabled":false}`, 400, "invalid_request"},
+		"unquoted":         {path, "0195:2", `{"enabled":false}`, 400, "invalid_request"},
+		"missing enabled":  {path, etag, `{}`, 400, "invalid_request"},
+		"unknown field":    {path, etag, `{"enabled":false,"bot_id":"1"}`, 400, "invalid_request"},
+	} {
+		rec := doPatch(t, h, tc.path, tc.ifMatch, tc.body)
+		if rec.Code != tc.status || errCode(rec) != tc.code {
+			t.Errorf("%s = %d %s, want %d %s", name, rec.Code, rec.Body, tc.status, tc.code)
+		}
+	}
+
+	for result, code := range map[SetEnabledResult]string{
+		SetEnabledWrongType: "dependency_unavailable", SetEnabledUncertain: "dependency_unavailable", SetEnabledUnavailable: "dependency_unavailable",
+	} {
+		repo.setEnabledResult = result
+		if rec := doPatch(t, h, path, etag, `{"enabled":false}`); rec.Code != http.StatusServiceUnavailable || errCode(rec) != code {
+			t.Errorf("%s = %d %s", result, rec.Code, rec.Body)
+		}
 	}
 }

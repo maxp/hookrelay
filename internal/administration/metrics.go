@@ -8,10 +8,12 @@ import (
 
 // Bounded audit operation and outcome label values.
 const (
-	opWebhookEndpointCreated = "webhook_endpoint_created"
-	opAdminAuthRejected      = "admin_auth_rejected"
-	opRecipientBlockCleared  = "recipient_block_cleared"
-	opDeadLetterReplayed     = "dead_letter_replayed"
+	opWebhookEndpointCreated  = "webhook_endpoint_created"
+	opAdminAuthRejected       = "admin_auth_rejected"
+	opRecipientBlockCleared   = "recipient_block_cleared"
+	opDeadLetterReplayed      = "dead_letter_replayed"
+	opWebhookEndpointEnabled  = "webhook_endpoint_enabled"
+	opWebhookEndpointDisabled = "webhook_endpoint_disabled"
 
 	outcomeSuccess = "success"
 	outcomeFailure = "failure"

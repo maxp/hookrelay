@@ -3,9 +3,16 @@ package administration_test
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/maxp/hookrelay/internal/gen"
+	"github.com/maxp/hookrelay/internal/ingestion"
+	"github.com/maxp/hookrelay/internal/valkey"
 )
 
 // createWebhook creates one endpoint through the API and returns its
@@ -72,5 +79,91 @@ func TestWebhookListOverRealValkey(t *testing.T) {
 	}
 	if len(seen) != len(want) {
 		t.Errorf("listed %v, want %v", seen, want)
+	}
+}
+
+// webhookIngestion composes the webhook route over the same Valkey.
+func webhookIngestion(t *testing.T, a *valkey.Adapter) http.Handler {
+	t.Helper()
+	types, err := ingestion.Builtin(ingestion.BuiltinOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := ingestion.NewHandler(ingestion.HandlerDeps{
+		Registry: types, Endpoints: valkey.NewEndpointLookup(a),
+		Acceptor: valkey.NewMessageAcceptor(a, valkey.AcceptLimits{MaxQueuedMessages: 100, MaxQueuedMessagesPerRecipient: 10, MaxDedupRecords: 100, DedupRetention: time.Hour}),
+		Gen:      gen.Crypto{}, Clock: gen.SystemClock{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// sendUpdate posts one signed Telegram update to the endpoint.
+func sendUpdate(h http.Handler, id string, updateID int) int {
+	body := `{"update_id":` + strconv.Itoa(updateID) + `,"message":{"message_id":1,"date":1700000000,"chat":{"id":-5}}}`
+	req := httptest.NewRequest(http.MethodPost, "/webhook/telegram/"+id, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Telegram-Bot-Api-Secret-Token", "telegram-secret-001")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// patchEnabled sends PATCH with If-Match and returns the response.
+func patchEnabled(t *testing.T, h http.Handler, id, etag string, enabled bool) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/v1/webhooks/telegram/"+id, strings.NewReader(`{"enabled":`+strconv.FormatBool(enabled)+`}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer admin-secret-value-016")
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestWebhookEnableDisableOverRealValkey drives disable → the webhook route
+// answers 404 like an unknown endpoint → re-enable → accepted again, with
+// ETags advancing, a stale ETag refused, and one audit entry per change.
+func TestWebhookEnableDisableOverRealValkey(t *testing.T) {
+	a := testAdapter(t, false)
+	flushAll(t, a)
+	admin := composedHandler(t, a)
+	hooks := webhookIngestion(t, a)
+	createWebhook(t, admin, "wh_toggle", "123456789", true)
+	if code := sendUpdate(hooks, "wh_toggle", 1); code != http.StatusOK {
+		t.Fatalf("enabled webhook = %d", code)
+	}
+
+	etag := doJSON(t, admin, http.MethodGet, "/admin/v1/webhooks/telegram/wh_toggle", "admin-secret-value-016", "").Header().Get("ETag")
+	if rec := patchEnabled(t, admin, "wh_toggle", "", false); rec.Code != http.StatusPreconditionRequired {
+		t.Fatalf("without If-Match = %d", rec.Code)
+	}
+	rec := patchEnabled(t, admin, "wh_toggle", etag, false)
+	if rec.Code != http.StatusOK || rec.Header().Get("ETag") == etag || !strings.HasSuffix(rec.Header().Get("ETag"), `:2"`) {
+		t.Fatalf("disable = %d %s etag %s", rec.Code, rec.Body, rec.Header().Get("ETag"))
+	}
+	disabledTag := rec.Header().Get("ETag")
+	if code := sendUpdate(hooks, "wh_toggle", 2); code != http.StatusNotFound {
+		t.Errorf("disabled webhook = %d, want 404", code)
+	}
+	if rec := patchEnabled(t, admin, "wh_toggle", etag, true); rec.Code != http.StatusPreconditionFailed {
+		t.Errorf("stale enable = %d", rec.Code)
+	}
+	if rec := patchEnabled(t, admin, "wh_toggle", disabledTag, true); rec.Code != http.StatusOK {
+		t.Fatalf("enable = %d %s", rec.Code, rec.Body)
+	}
+	if code := sendUpdate(hooks, "wh_toggle", 3); code != http.StatusOK {
+		t.Errorf("re-enabled webhook = %d", code)
+	}
+	var ops []string
+	for _, e := range auditTail(t, a, 100) {
+		ops = append(ops, e["operation"])
+	}
+	if got := strings.Join(ops, ","); got != "webhook_endpoint_created,webhook_endpoint_disabled,webhook_endpoint_enabled" {
+		t.Errorf("audit operations = %s", got)
 	}
 }

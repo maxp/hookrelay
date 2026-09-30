@@ -2,6 +2,9 @@ package valkey
 
 import (
 	"context"
+	"errors"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/maxp/hookrelay/internal/administration"
@@ -68,5 +71,131 @@ func TestListEndpoints(t *testing.T) {
 	flushAll(t, a)
 	if page, err := store.ListEndpoints(ctx, 10, nil); err != nil || len(page) != 0 {
 		t.Errorf("empty listing = %+v, %v", page, err)
+	}
+}
+
+// adminSetup creates the fixture endpoint (generation ...0001, version 1,
+// enabled) on a fresh gated database.
+func adminSetup(t *testing.T) (*Adapter, administration.EndpointRepository) {
+	t.Helper()
+	a := testAdapter(t, false)
+	flushAll(t, a)
+	gate(t, a, false)
+	if _, _, r := a.CreateEndpoint(context.Background(), endpointFixture(), "event-0", "webhook_endpoint_created", "req-0"); r != CreateOK {
+		t.Fatalf("create = %s", r)
+	}
+	return a, NewEndpointStore(a)
+}
+
+func fixtureVersion(v int64) *administration.EntityVersion {
+	return &administration.EntityVersion{GenerationID: endpointFixture().GenerationID, ConfigVersion: v}
+}
+
+// lastAudit returns the newest audit entry.
+func lastAudit(t *testing.T, a *Adapter) map[string]string {
+	t.Helper()
+	entries, err := a.AuditEntries(context.Background(), 100)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("audit: %v", err)
+	}
+	return entries[len(entries)-1]
+}
+
+// TestSetEndpointEnabledTuples pins endpoint_set_enabled_v1: updated with
+// the safe fields, the Hash and the audit entry written together,
+// unchanged without any write, and every refusal leaving state
+// snapshot-equal.
+func TestSetEndpointEnabledTuples(t *testing.T) {
+	a, store := adminSetup(t)
+	ctx := context.Background()
+	before, _ := a.GetEndpoint(ctx, "telegram", "wh_test1")
+
+	e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(1), "event-1", "req-1")
+	if r != administration.SetEnabledUpdated || e.Enabled || e.ConfigVersion != 2 || e.BotID != "123456789" ||
+		e.CredentialKind != "secret_token" || e.CredentialValue != "" || e.CreatedMs != before.CreatedMs || e.UpdatedMs < before.UpdatedMs {
+		t.Fatalf("disable = %s %+v", r, e)
+	}
+	stored, _ := a.GetEndpoint(ctx, "telegram", "wh_test1")
+	if stored.Enabled || stored.ConfigVersion != 2 || stored.UpdatedMs != e.UpdatedMs || stored.CredentialValue != "test-credential-value" {
+		t.Errorf("stored = %+v", stored)
+	}
+	audit := lastAudit(t, a)
+	if audit["operation"] != "webhook_endpoint_disabled" || audit["event_id"] != "event-1" || audit["target"] != "telegram:wh_test1" ||
+		audit["request_id"] != "req-1" || audit["actor"] != "admin_bearer" || audit["outcome"] != "success" || audit["timestamp_ms"] != strconv.FormatInt(e.UpdatedMs, 10) {
+		t.Errorf("audit = %v", audit)
+	}
+	for _, v := range audit {
+		if strings.Contains(v, "test-credential-value") {
+			t.Fatal("the credential reached the audit stream")
+		}
+	}
+
+	snap := snapshot(t, a)
+	if e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(2), "event-2", "req-2"); r != administration.SetEnabledUnchanged || e.ConfigVersion != 2 || e.Enabled {
+		t.Errorf("same value = %s %+v", r, e)
+	}
+	assertUnchanged(t, a, snap, "unchanged")
+	if e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, fixtureVersion(1), "event-3", "req-3"); r != administration.SetEnabledPreconditionFailed ||
+		e.GenerationID != endpointFixture().GenerationID || e.ConfigVersion != 2 {
+		t.Errorf("stale = %s %+v", r, e)
+	}
+	other := &administration.EntityVersion{GenerationID: "0195c4d8-0000-7000-8000-000000000099", ConfigVersion: 2}
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, other, "event-4", "req-4"); r != administration.SetEnabledPreconditionFailed {
+		t.Errorf("other generation = %s", r)
+	}
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, nil, "event-5", "req-5"); r != administration.SetEnabledPreconditionRequired {
+		t.Errorf("no precondition = %s", r)
+	}
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_none", true, nil, "event-6", "req-6"); r != administration.SetEnabledNotFound {
+		t.Errorf("missing = %s", r)
+	}
+	assertUnchanged(t, a, snap, "refusals")
+
+	if e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, fixtureVersion(2), "event-7", "req-7"); r != administration.SetEnabledUpdated || !e.Enabled || e.ConfigVersion != 3 {
+		t.Errorf("enable = %s %+v", r, e)
+	}
+	if audit := lastAudit(t, a); audit["operation"] != "webhook_endpoint_enabled" {
+		t.Errorf("enable audit = %v", audit)
+	}
+
+	// Wrong types and a malformed Hash refuse without writing.
+	a.testDo(t, "HSET", "hr1:wh:telegram:wh_bad", "bot_id", "1", "enabled", "1", "config_version", "x")
+	a.testDo(t, "SET", "hr1:wh:telegram:wh_str", "x")
+	snap = snapshot(t, a)
+	for _, id := range []string{"wh_bad", "wh_str"} {
+		if _, r := store.SetEndpointEnabled(ctx, "telegram", id, false, fixtureVersion(1), "event-8", "req-8"); r != administration.SetEnabledWrongType {
+			t.Errorf("%s = %s", id, r)
+		}
+	}
+	a.testDo(t, "DEL", "hr1:audit")
+	a.testDo(t, "SET", "hr1:audit", "x")
+	snap = snapshot(t, a)
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(3), "event-9", "req-9"); r != administration.SetEnabledWrongType {
+		t.Errorf("audit wrong type = %s", r)
+	}
+	assertUnchanged(t, a, snap, "wrong types")
+}
+
+// TestSetEndpointEnabledArgumentsAndReload pins argument rejection (a
+// caller bug, not a bounded status) and EVAL reload after SCRIPT FLUSH.
+func TestSetEndpointEnabledArgumentsAndReload(t *testing.T) {
+	a, store := adminSetup(t)
+	ctx := context.Background()
+	keys := []string{"hr1:wh:telegram:wh_test1", "hr1:audit"}
+	for name, args := range map[string][]string{
+		"too few":           {"telegram", "wh_test1", "1", "", "", "e"},
+		"empty identifier":  {"telegram", "", "1", "", "", "e", "r"},
+		"bad enabled":       {"telegram", "wh_test1", "yes", "", "", "e", "r"},
+		"half version":      {"telegram", "wh_test1", "1", "g", "", "e", "r"},
+		"malformed version": {"telegram", "wh_test1", "1", "g", "01", "e", "r"},
+		"key mismatch":      {"telegram", "wh_other", "1", "", "", "e", "r"},
+	} {
+		if _, err := a.RunScript(ctx, "endpoint_set_enabled_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	a.testDo(t, "SCRIPT", "FLUSH")
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(1), "e", "r"); r != administration.SetEnabledUpdated {
+		t.Errorf("after SCRIPT FLUSH = %s", r)
 	}
 }

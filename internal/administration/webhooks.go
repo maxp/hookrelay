@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/maxp/hookrelay/internal/observability"
 )
@@ -94,4 +96,130 @@ func (s *Service) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// entityTagPattern is one strong entity tag "<generation_id>:<config_version>".
+// Weak tags, "*", and lists are unsupported.
+var entityTagPattern = regexp.MustCompile(`^"([A-Za-z0-9-]{1,64}):([1-9][0-9]{0,18})"$`)
+
+// parseIfMatch reads the optional If-Match precondition. Absent → nil;
+// present but not exactly one strong tag → 400.
+func parseIfMatch(r *http.Request) (*EntityVersion, error) {
+	values := r.Header.Values("If-Match")
+	if len(values) == 0 {
+		return nil, nil
+	}
+	m := entityTagPattern.FindStringSubmatch(strings.TrimSpace(values[0]))
+	if len(values) != 1 || m == nil {
+		return nil, BadRequestError{msg: `If-Match must be one strong entity tag "<generation_id>:<config_version>"`}
+	}
+	version, err := strconv.ParseInt(m[2], 10, 64)
+	if err != nil {
+		return nil, BadRequestError{msg: "If-Match config_version is out of range"}
+	}
+	return &EntityVersion{GenerationID: m[1], ConfigVersion: version}, nil
+}
+
+func preconditionRequired() error {
+	return StatusError{Status: http.StatusPreconditionRequired, Code: "precondition_required",
+		Msg: "If-Match with the current ETag is required: read the endpoint first"}
+}
+
+func preconditionFailed() error {
+	return StatusError{Status: http.StatusPreconditionFailed, Code: "precondition_failed",
+		Msg: "the endpoint changed: read it again for the current ETag"}
+}
+
+// PatchRequest is the strict PATCH body; only the enabled flag may change.
+type PatchRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// SetWebhookEnabled runs the audited enable/disable transition. Setting the
+// current value is a no-op that returns the unchanged representation.
+func (s *Service) SetWebhookEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, requestID string) (EndpointView, error) {
+	platform, _, ok := s.catalog.Lookup(webhookType)
+	if !ok {
+		return EndpointView{}, NotFoundError{}
+	}
+	eventID := s.gen.UUIDv7()
+	e, result := s.repo.SetEndpointEnabled(ctx, webhookType, identifier, enabled, expected, eventID, requestID)
+	switch result {
+	case SetEnabledUpdated, SetEnabledUnchanged:
+		e.BotPlatform = platform
+		view := viewOf(e)
+		if result == SetEnabledUnchanged {
+			return view, nil
+		}
+		op := opWebhookEndpointDisabled
+		if enabled {
+			op = opWebhookEndpointEnabled
+		}
+		target := webhookType + ":" + identifier
+		s.metrics.auditEvents.WithLabelValues(op, outcomeSuccess).Inc()
+		s.logAudit(eventID, op, target, requestID, outcomeSuccess)
+		observability.LogEvent(s.log, slog.LevelInfo, op, "webhook endpoint "+map[bool]string{true: "enabled", false: "disabled"}[enabled],
+			"request_id", requestID, "webhook_type", webhookType, "webhook_identifier", identifier, "bot_platform", platform,
+			"bot_id", e.BotID, "credential_kind", e.CredentialKind, "generation_id", e.GenerationID, "config_version", e.ConfigVersion)
+		return view, nil
+	case SetEnabledNotFound:
+		return EndpointView{}, NotFoundError{}
+	case SetEnabledPreconditionRequired:
+		return EndpointView{}, preconditionRequired()
+	case SetEnabledPreconditionFailed:
+		return EndpointView{}, preconditionFailed()
+	case SetEnabledWrongType:
+		s.logMutationFailure("webhook_endpoint_update_failed", requestID, webhookType, identifier, "wrong_type")
+		return EndpointView{}, DependencyError{detail: "stored structure has an unexpected type"}
+	case SetEnabledUncertain:
+		s.logMutationFailure("webhook_endpoint_update_failed", requestID, webhookType, identifier, "outcome_uncertain")
+		return EndpointView{}, DependencyError{detail: "update outcome is uncertain: read the endpoint and audit before retrying"}
+	default:
+		s.logMutationFailure("webhook_endpoint_update_failed", requestID, webhookType, identifier, "dependency_unavailable")
+		return EndpointView{}, DependencyError{}
+	}
+}
+
+// logMutationFailure records a bounded error event for an endpoint
+// mutation that could not be confirmed.
+func (s *Service) logMutationFailure(event, requestID, webhookType, identifier, reason string) {
+	observability.LogEvent(s.log, slog.LevelError, event, "webhook endpoint mutation not confirmed",
+		"request_id", requestID, "webhook_type", webhookType, "webhook_identifier", identifier,
+		"error_code", "dependency_unavailable", "reason_code", reason)
+}
+
+// endpointPath validates the endpoint route values; unknown shapes are
+// indistinguishable from unknown endpoints.
+func endpointPath(r *http.Request) (webhookType, identifier string, ok bool) {
+	webhookType, identifier = r.PathValue("webhook_type"), r.PathValue("webhook_identifier")
+	return webhookType, identifier, webhookTypePattern.MatchString(webhookType) && identifierPattern.MatchString(identifier)
+}
+
+func (s *Service) handlePatch(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFrom(r.Context())
+	webhookType, identifier, ok := endpointPath(r)
+	if !ok {
+		writeAPIError(w, NotFoundError{}, requestID)
+		return
+	}
+	var req PatchRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	if req.Enabled == nil {
+		writeAPIError(w, BadRequestError{msg: "enabled is required"}, requestID)
+		return
+	}
+	expected, err := parseIfMatch(r)
+	if err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	view, err := s.SetWebhookEnabled(r.Context(), webhookType, identifier, *req.Enabled, expected, requestID)
+	if err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	writeEndpoint(w, http.StatusOK, view)
 }

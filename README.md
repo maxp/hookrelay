@@ -379,6 +379,14 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   `next_cursor`; `400 invalid_cursor` for a malformed cursor.
 - `GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` — read the
   endpoint metadata with its `ETag`; a missing endpoint returns `404`.
+- `PATCH /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` with
+  `{"enabled": true|false}` and `If-Match: "<generation_id>:<config_version>"`
+  — enable or disable; `200` with the new `ETag` and the endpoint. A
+  disabled endpoint answers webhooks exactly like an unknown one (`404`)
+  and keeps its credential. Re-sending the current value changes nothing
+  (same `ETag`, no audit). `428 precondition_required` without `If-Match`,
+  `412 precondition_failed` for a stale or earlier-generation tag, `400`
+  for a weak, wildcard, or malformed tag, `404` for a missing endpoint.
 - `GET /admin/v1/recipient-states?status=ready|leased|retry_wait|blocked&limit&cursor`
   — Recipients in one state as structured Recipient fields with the state's
   time (`ready_sequence`, `lease_expires_ms`, `retry_at_ms`, or `detected_ms`
@@ -444,6 +452,8 @@ export HOOKRELAY_ADMIN_SECRET_FILE=.secrets/admin
 hookrelay admin webhook create --type telegram --bot-id 123456 --credential-file telegram-secret
 hookrelay admin webhook get --type telegram --identifier wh_...
 hookrelay admin webhook list [--limit 50] [--cursor <next_cursor>]
+hookrelay admin webhook disable --type telegram --identifier wh_... --yes
+hookrelay admin webhook enable --type telegram --identifier wh_... --yes
 hookrelay admin recipients list --status blocked
 hookrelay admin recipients inspect-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100
 hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100 \

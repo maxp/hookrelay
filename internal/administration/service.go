@@ -19,10 +19,35 @@ import (
 type EndpointRepository interface {
 	CreateEndpoint(ctx context.Context, e Endpoint, eventID, operation, requestID string) (createdMs, updatedMs int64, result CreateEndpointResult)
 	GetEndpoint(ctx context.Context, webhookType, identifier string) (*Endpoint, error)
+	// SetEndpointEnabled runs the audited enable/disable transition under
+	// the expected entity version (nil when no If-Match was sent).
+	SetEndpointEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult)
 	// ListEndpoints pages the global listing newest first (descending
 	// created_ms, then descending member), strictly after the cursor.
 	ListEndpoints(ctx context.Context, limit int, after *EndpointCursor) ([]EndpointListing, error)
 }
+
+// EntityVersion is a parsed strong entity tag.
+type EntityVersion struct {
+	GenerationID  string
+	ConfigVersion int64
+}
+
+// SetEnabledResult is the bounded outcome of the enable/disable transition.
+type SetEnabledResult string
+
+const (
+	SetEnabledUpdated              SetEnabledResult = "updated"
+	SetEnabledUnchanged            SetEnabledResult = "unchanged"
+	SetEnabledNotFound             SetEnabledResult = "not_found"
+	SetEnabledPreconditionRequired SetEnabledResult = "precondition_required"
+	SetEnabledPreconditionFailed   SetEnabledResult = "precondition_failed"
+	SetEnabledWrongType            SetEnabledResult = "wrong_type"
+	SetEnabledUnavailable          SetEnabledResult = "dependency_unavailable"
+	// SetEnabledUncertain: the transition may have run; neither success nor
+	// failure may be reported.
+	SetEnabledUncertain SetEnabledResult = "uncertain"
+)
 
 // EndpointCursor is the position after the last listed endpoint.
 type EndpointCursor struct {

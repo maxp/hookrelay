@@ -19,12 +19,15 @@ import (
 
 type fakeRepo struct {
 	// listings back ListEndpoints, already in index order.
-	listings      []EndpointListing
-	listCalls     []listEndpointsCall
-	endpoints     map[string]*Endpoint
-	createCalls   int
-	failWrongType bool
-	createResult  CreateEndpointResult // forced create outcome when set
+	listings  []EndpointListing
+	listCalls []listEndpointsCall
+	mutations []mutationCall
+	// setEnabledResult forces the SetEndpointEnabled outcome when set.
+	setEnabledResult SetEnabledResult
+	endpoints        map[string]*Endpoint
+	createCalls      int
+	failWrongType    bool
+	createResult     CreateEndpointResult // forced create outcome when set
 }
 
 func newFakeRepo() *fakeRepo {
@@ -63,6 +66,38 @@ func (f *fakeRepo) GetEndpoint(_ context.Context, webhookType, identifier string
 		return &stored, nil
 	}
 	return nil, nil
+}
+
+// SetEndpointEnabled mirrors endpoint_set_enabled_v1 over the fake store;
+// setEnabledResult forces an outcome.
+func (f *fakeRepo) SetEndpointEnabled(_ context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult) {
+	f.mutations = append(f.mutations, mutationCall{webhookType + ":" + identifier, expected, eventID, requestID})
+	if f.setEnabledResult != "" {
+		return nil, f.setEnabledResult
+	}
+	e, ok := f.endpoints[key(webhookType, identifier)]
+	switch {
+	case !ok:
+		return nil, SetEnabledNotFound
+	case expected == nil:
+		return nil, SetEnabledPreconditionRequired
+	case expected.GenerationID != e.GenerationID || expected.ConfigVersion != e.ConfigVersion:
+		return &Endpoint{GenerationID: e.GenerationID, ConfigVersion: e.ConfigVersion}, SetEnabledPreconditionFailed
+	case e.Enabled == enabled:
+		safe := *e
+		safe.CredentialValue = ""
+		return &safe, SetEnabledUnchanged
+	}
+	e.Enabled, e.ConfigVersion, e.UpdatedMs = enabled, e.ConfigVersion+1, e.UpdatedMs+1
+	safe := *e
+	safe.CredentialValue = ""
+	return &safe, SetEnabledUpdated
+}
+
+type mutationCall struct {
+	target             string
+	expected           *EntityVersion
+	eventID, requestID string
 }
 
 type listEndpointsCall struct {

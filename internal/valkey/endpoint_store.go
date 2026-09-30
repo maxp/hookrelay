@@ -246,6 +246,92 @@ func (s *endpointStore) GetEndpoint(ctx context.Context, webhookType, identifier
 	return adminEndpoint(e), nil
 }
 
+// SetEndpointEnabled runs endpoint_set_enabled_v1: the enabled flag,
+// config_version, updated_ms, and the mandatory audit append in one atomic
+// operation under the expected entity version.
+func (s *endpointStore) SetEndpointEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *administration.EntityVersion, eventID, requestID string) (*administration.Endpoint, administration.SetEnabledResult) {
+	flag := "0"
+	if enabled {
+		flag = "1"
+	}
+	generation, version := expectedArgs(expected)
+	res, err := s.a.RunScript(ctx, "endpoint_set_enabled_v1",
+		[]string{"hr1:wh:" + webhookType + ":" + identifier, auditKey},
+		[]string{webhookType, identifier, flag, generation, version, eventID, requestID})
+	if err != nil {
+		if errors.Is(err, ErrNotDispatched) {
+			return nil, administration.SetEnabledUnavailable
+		}
+		return nil, administration.SetEnabledUncertain
+	}
+	switch administration.SetEnabledResult(res.Status) {
+	case administration.SetEnabledUpdated, administration.SetEnabledUnchanged:
+		e, ok := safeEndpointFields(webhookType, identifier, res.Fields)
+		if !ok {
+			// The script ran; an unreadable result proves nothing.
+			return nil, administration.SetEnabledUncertain
+		}
+		return e, administration.SetEnabledResult(res.Status)
+	case administration.SetEnabledPreconditionFailed:
+		current, ok := versionFields(res.Fields)
+		if !ok {
+			return nil, administration.SetEnabledUncertain
+		}
+		return &administration.Endpoint{Type: webhookType, Identifier: identifier, GenerationID: current.GenerationID, ConfigVersion: current.ConfigVersion},
+			administration.SetEnabledPreconditionFailed
+	case administration.SetEnabledNotFound, administration.SetEnabledPreconditionRequired, administration.SetEnabledWrongType:
+		return nil, administration.SetEnabledResult(res.Status)
+	default:
+		return nil, administration.SetEnabledUncertain
+	}
+}
+
+// expectedArgs encodes an optional expected entity version as script
+// arguments ("" and "" when absent).
+func expectedArgs(v *administration.EntityVersion) (generation, version string) {
+	if v == nil {
+		return "", ""
+	}
+	return v.GenerationID, strconv.FormatInt(v.ConfigVersion, 10)
+}
+
+// safeEndpointFields maps the seven safe fields of an endpoint script
+// result: bot_id, enabled, credential_kind, generation_id, created_ms,
+// updated_ms, config_version. The credential value is never returned by a
+// script, so CredentialValue stays empty and CredentialSet is inferred by
+// the caller from the credential kind.
+func safeEndpointFields(webhookType, identifier string, f []valkey.ValkeyMessage) (*administration.Endpoint, bool) {
+	var s [7]string
+	for i := range s {
+		v, err := f[i].ToString()
+		if err != nil {
+			return nil, false
+		}
+		s[i] = v
+	}
+	created, err1 := strconv.ParseInt(s[4], 10, 64)
+	updated, err2 := strconv.ParseInt(s[5], 10, 64)
+	version, err3 := strconv.ParseInt(s[6], 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil || (s[1] != "0" && s[1] != "1") {
+		return nil, false
+	}
+	return &administration.Endpoint{
+		Type: webhookType, Identifier: identifier, BotID: s[0], Enabled: s[1] == "1", CredentialKind: s[2],
+		GenerationID: s[3], CreatedMs: created, UpdatedMs: updated, ConfigVersion: version,
+	}, true
+}
+
+// versionFields maps a precondition_failed result's current version.
+func versionFields(f []valkey.ValkeyMessage) (administration.EntityVersion, bool) {
+	generation, err1 := f[0].ToString()
+	raw, err2 := f[1].ToString()
+	version, err3 := strconv.ParseInt(raw, 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return administration.EntityVersion{}, false
+	}
+	return administration.EntityVersion{GenerationID: generation, ConfigVersion: version}, true
+}
+
 // ListEndpoints pages hr1:webhooks in descending (score, member) order and
 // reads every member's Hash in one pipelined round trip.
 func (s *endpointStore) ListEndpoints(ctx context.Context, limit int, after *administration.EndpointCursor) (_ []administration.EndpointListing, err error) {

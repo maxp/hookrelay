@@ -20,6 +20,16 @@ func init() {
 		"bot_endpoint_limit": 0,
 		"wrong_type":         0,
 	})
+	register("endpoint_set_enabled_v1", 1, map[string]int{
+		// bot_id, enabled, credential_kind, generation_id, created_ms,
+		// updated_ms, config_version
+		"updated":               7,
+		"unchanged":             7,
+		"not_found":             0,
+		"precondition_required": 0,
+		"precondition_failed":   2, // generation_id, config_version
+		"wrong_type":            0,
+	})
 	register("accept_v3", 3, map[string]int{
 		"accepted":           2, // accepted_ms, early_evicted
 		"duplicate":          1, // original message_id

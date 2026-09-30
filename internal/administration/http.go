@@ -34,6 +34,7 @@ func Handler(svc *Service) http.Handler {
 	mux.Handle("POST /admin/v1/webhooks", svc.auth(http.HandlerFunc(svc.handleCreate)))
 	mux.Handle("GET /admin/v1/webhooks", svc.auth(http.HandlerFunc(svc.handleListWebhooks)))
 	mux.Handle("GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handleGet)))
+	mux.Handle("PATCH /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handlePatch)))
 	if svc.recipients != nil {
 		mux.Handle("GET /admin/v1/recipient-states", svc.auth(http.HandlerFunc(svc.handleListRecipientStates)))
 		mux.Handle("POST /admin/v1/recipient-blocks/inspect", svc.auth(http.HandlerFunc(svc.handleInspectBlock)))
@@ -108,13 +109,9 @@ func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r.Context())
-	webhookType := r.PathValue("webhook_type")
-	identifier := r.PathValue("webhook_identifier")
-
-	if !webhookTypePattern.MatchString(webhookType) || !identifierPattern.MatchString(identifier) {
-		// Unknown shapes are indistinguishable from unknown endpoints so
-		// endpoint registration is not disclosed.
-		writeError(w, http.StatusNotFound, "webhook_endpoint_not_found", "webhook endpoint not found", requestID)
+	webhookType, identifier, ok := endpointPath(r)
+	if !ok {
+		writeAPIError(w, NotFoundError{}, requestID)
 		return
 	}
 

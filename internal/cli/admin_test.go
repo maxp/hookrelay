@@ -29,8 +29,8 @@ type fakeAdminAPI struct {
 }
 
 type recordedRequest struct {
-	Method, Path, Authorization, ContentType string
-	Body                                     map[string]any
+	Method, Path, Authorization, ContentType, IfMatch string
+	Body                                              map[string]any
 }
 
 func (f *fakeAdminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
