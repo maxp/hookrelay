@@ -26,6 +26,8 @@ type fakeDeadLetters struct {
 	record    *DeadLetter
 	replay    Replay
 	replays   []replayCall
+	payload   Payload
+	views     []replayCall // messageID, actor (as resolution), eventID, requestID
 }
 
 func (f *fakeDeadLetters) ListDeadLetters(_ context.Context, limit int, after *DeadLetterCursor) ([]DeadLetter, error) {
@@ -44,6 +46,11 @@ func (f *fakeDeadLetters) GetDeadLetter(_ context.Context, messageID string) (*D
 func (f *fakeDeadLetters) ReplayDeadLetter(_ context.Context, messageID, resolution, eventID, requestID string) Replay {
 	f.replays = append(f.replays, replayCall{messageID, resolution, eventID, requestID})
 	return f.replay
+}
+
+func (f *fakeDeadLetters) ViewPayload(_ context.Context, messageID, actor, eventID, requestID string) Payload {
+	f.views = append(f.views, replayCall{messageID, actor, eventID, requestID})
+	return f.payload
 }
 
 func deadLetterService(t *testing.T, f *fakeDeadLetters) (http.Handler, *bytes.Buffer, *prometheus.Registry) {
@@ -204,5 +211,80 @@ func TestReplayDeadLetterContract(t *testing.T) {
 	}
 	if rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/replay", "wrong-secret", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("unauthenticated replay = %d", rec.Code)
+	}
+}
+
+// TestDeadLetterPayloadContract pins the payload route: the stored
+// Canonical Message embedded verbatim, the actor passed to the audited
+// store operation, no-store caching, the audit and feature events without
+// payload, the metric, and the error mapping that never discloses.
+func TestDeadLetterPayloadContract(t *testing.T) {
+	msg := `{"message_id":"` + dlqID + `","payload":{"text":"secret-ish"}}`
+	f := &fakeDeadLetters{payload: Payload{Result: PayloadDisclosed, Message: json.RawMessage(msg), DeliveryCycle: 2,
+		DeadLetteredMs: 1740000000000, RecipientIdentity: "telegram:42:chat:-100"}}
+	h, logs, reg := deadLetterService(t, f)
+	for _, body := range []string{"", "{}"} {
+		rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "admin-secret-value-016", body)
+		want := `{"message_id":"` + dlqID + `","delivery_cycle":2,"dead_lettered_ms":1740000000000,"message":` + msg + "}\n"
+		if rec.Code != http.StatusOK || rec.Body.String() != want {
+			t.Fatalf("payload (body %q) = %d %s", body, rec.Code, rec.Body.String())
+		}
+		if rec.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("Cache-Control = %q", rec.Header().Get("Cache-Control"))
+		}
+	}
+	if c := f.views[0]; c.messageID != dlqID || c.resolution != "admin_bearer" || c.eventID == "" || c.requestID == "" {
+		t.Errorf("view call = %+v", c)
+	}
+	if got := counterValue(t, reg, "hookrelay_dead_letter_payload_views_total", map[string]string{"outcome": "disclosed"}); got != 2 {
+		t.Errorf("views = %v", got)
+	}
+	if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "dead_letter_payload_viewed", "outcome": "success"}); got != 2 {
+		t.Errorf("audit events = %v", got)
+	}
+	if !strings.Contains(logs.String(), `"event":"dead_letter_payload_viewed"`) || !strings.Contains(logs.String(), `"recipient_scope":"chat"`) {
+		t.Errorf("logs = %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "secret-ish") {
+		t.Error("payload logged")
+	}
+
+	for name, body := range map[string]string{"unknown field": `{"x":1}`, "not an object": `[]`} {
+		if rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "admin-secret-value-016", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	if len(f.views) != 2 {
+		t.Error("an invalid request reached the store")
+	}
+
+	for result, want := range map[PayloadResult]struct {
+		status  int
+		code    string
+		outcome string
+	}{
+		PayloadNotFound:       {404, "dead_letter_not_found", "not_found"},
+		PayloadMessageMissing: {503, "dependency_unavailable", "unavailable"},
+		PayloadWrongType:      {503, "dependency_unavailable", "unavailable"},
+		PayloadUnavailable:    {503, "dependency_unavailable", "unavailable"},
+	} {
+		f := &fakeDeadLetters{payload: Payload{Result: result, Message: json.RawMessage(msg)}}
+		h, _, reg := deadLetterService(t, f)
+		rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "admin-secret-value-016", "")
+		if rec.Code != want.status || !strings.Contains(rec.Body.String(), `"code":"`+want.code+`"`) || strings.Contains(rec.Body.String(), "secret-ish") {
+			t.Errorf("%s: %d %s", result, rec.Code, rec.Body.String())
+		}
+		if got := counterValue(t, reg, "hookrelay_dead_letter_payload_views_total", map[string]string{"outcome": want.outcome}); got != 1 {
+			t.Errorf("%s: views{outcome=%s} = %v", result, want.outcome, got)
+		}
+	}
+
+	f = &fakeDeadLetters{}
+	h, _, _ = deadLetterService(t, f)
+	if rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/not-a-uuid/payload", "admin-secret-value-016", ""); rec.Code != http.StatusNotFound || len(f.views) != 0 {
+		t.Errorf("malformed id = %d, calls %d", rec.Code, len(f.views))
+	}
+	if rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "wrong-secret", ""); rec.Code != http.StatusUnauthorized || len(f.views) != 0 {
+		t.Errorf("unauthenticated payload = %d", rec.Code)
 	}
 }

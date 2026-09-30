@@ -26,6 +26,25 @@ func requestIDFrom(ctx context.Context) string {
 	return ""
 }
 
+// Audit actors of authenticated administrative requests.
+const (
+	actorAdminBearer  = "admin_bearer"
+	actorAdminSession = "admin_session"
+)
+
+// actorKey carries the authenticated audit actor from the auth middleware.
+type actorKeyType struct{}
+
+var actorKey actorKeyType
+
+// actorFrom returns the request's audit actor; admin_bearer when unset.
+func actorFrom(ctx context.Context) string {
+	if v, ok := ctx.Value(actorKey).(string); ok {
+		return v
+	}
+	return actorAdminBearer
+}
+
 // Handler builds the administrative API routes. Authentication applies only
 // to the API routes; health and metrics stay on the surrounding admin mux
 // without an Admin Secret (they are protected by the listener placement).
@@ -46,6 +65,7 @@ func Handler(svc *Service) http.Handler {
 		mux.Handle("GET /admin/v1/dead-letters", svc.auth(http.HandlerFunc(svc.handleListDeadLetters)))
 		mux.Handle("GET /admin/v1/dead-letters/{message_id}", svc.auth(http.HandlerFunc(svc.handleGetDeadLetter)))
 		mux.Handle("POST /admin/v1/dead-letters/{message_id}/replay", svc.auth(http.HandlerFunc(svc.handleReplayDeadLetter)))
+		mux.Handle("POST /admin/v1/dead-letters/{message_id}/payload", svc.auth(http.HandlerFunc(svc.handleDeadLetterPayload)))
 	}
 	if svc.messages != nil {
 		mux.Handle("GET /admin/v1/messages/{message_id}/delivery-state", svc.auth(http.HandlerFunc(svc.handleDeliveryState)))
@@ -59,7 +79,10 @@ func (s *Service) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := s.gen.UUIDv7()
 		w.Header().Set("X-Request-Id", requestID)
-		r = r.WithContext(context.WithValue(r.Context(), requestIDKey, requestID))
+		// Administrative responses may carry payloads or CSRF tokens.
+		w.Header().Set("Cache-Control", "no-store")
+		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+		r = r.WithContext(context.WithValue(ctx, actorKey, actorAdminBearer))
 
 		if !s.secretMatches(bearerToken(r.Header.Get("Authorization"))) {
 			// Best-effort audit; refusal never depends on audit success.

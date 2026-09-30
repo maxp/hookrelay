@@ -81,6 +81,7 @@ const adminUsage = `usage:
       --expected-reason-code <code> --yes [common flags]
   hookrelay admin dlq list [--limit <n>] [--cursor <c>] [common flags]
   hookrelay admin dlq get --message-id <id> [common flags]
+  hookrelay admin dlq payload --message-id <id> [common flags]
   hookrelay admin dlq replay --message-id <id> [--deduplication-conflict-resolution reject|keep_current]
       --yes [common flags]
   hookrelay admin message delivery-state --message-id <id> [common flags]

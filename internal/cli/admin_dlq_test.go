@@ -215,3 +215,45 @@ func TestAdminMessageDeliveryState(t *testing.T) {
 		t.Errorf("not found = %d %s", code, r.stderr.String())
 	}
 }
+
+// TestAdminDLQPayload pins the audited payload view: one POST, the
+// response printed as JSON, the audit note on stderr, and a refusal
+// reported without retry.
+func TestAdminDLQPayload(t *testing.T) {
+	body := `{"message_id":"` + dlqMessageID + `","delivery_cycle":1,"dead_lettered_ms":1740000000000,"message":{"payload":{"text":"hi"}}}`
+	api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+		"POST " + dlqGetPath + "/payload": respond(http.StatusOK, body),
+	}}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	r := newTestRun(srv.URL)
+	r.tty = true
+	if code := r.run("dlq", "payload", "--message-id", dlqMessageID); code != ExitOK {
+		t.Fatalf("exit = %d: %s", code, r.stderr.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(r.stdout.Bytes(), &out); err != nil || out["message"].(map[string]any)["payload"] == nil {
+		t.Errorf("stdout = %s (%v)", r.stdout.String(), err)
+	}
+	if !strings.Contains(r.stderr.String(), "audit") {
+		t.Errorf("stderr = %s", r.stderr.String())
+	}
+	if calls := api.calls(http.MethodPost, dlqGetPath+"/payload"); len(calls) != 1 {
+		t.Errorf("calls = %d", len(calls))
+	}
+	r.assertNoSecrets(t)
+
+	api.routes["POST "+dlqGetPath+"/payload"] = respond(http.StatusServiceUnavailable,
+		`{"error":{"code":"dependency_unavailable","message":"payload not disclosed","request_id":"r"}}`)
+	r = newTestRun(srv.URL)
+	if code := r.run("dlq", "payload", "--message-id", dlqMessageID); code != ExitError || r.stdout.Len() != 0 ||
+		!strings.Contains(r.stderr.String(), "dependency_unavailable") {
+		t.Errorf("refusal = %d %q %q", code, r.stdout.String(), r.stderr.String())
+	}
+	if calls := api.calls(http.MethodPost, dlqGetPath+"/payload"); len(calls) != 2 {
+		t.Errorf("refusal retried: calls = %d", len(calls))
+	}
+	if code := newTestRun(srv.URL).run("dlq", "payload"); code != ExitUsage {
+		t.Errorf("payload without --message-id = %d, want usage", code)
+	}
+}

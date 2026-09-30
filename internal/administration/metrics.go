@@ -15,6 +15,7 @@ const (
 	opWebhookEndpointEnabled  = "webhook_endpoint_enabled"
 	opWebhookEndpointDisabled = "webhook_endpoint_disabled"
 	opWebhookEndpointDeleted  = "webhook_endpoint_deleted"
+	opDeadLetterPayloadViewed = "dead_letter_payload_viewed"
 
 	outcomeSuccess = "success"
 	outcomeFailure = "failure"
@@ -23,6 +24,11 @@ const (
 	// or an unavailable dependency; the other outcomes are ReplayResult
 	// values.
 	replayFailed = "failed"
+
+	// Payload inspection outcomes.
+	payloadViewDisclosed   = "disclosed"
+	payloadViewNotFound    = "not_found"
+	payloadViewUnavailable = "unavailable"
 )
 
 // metrics holds the required administrative audit metrics. Labels use only
@@ -31,6 +37,7 @@ type metrics struct {
 	auditEvents        *prometheus.CounterVec
 	auditWriteFailures *prometheus.CounterVec
 	replays            *prometheus.CounterVec
+	payloadViews       *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer) (*metrics, error) {
@@ -47,8 +54,12 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "hookrelay_dead_letter_replays_total",
 			Help: "Administrative dead-letter replays, by bounded outcome.",
 		}, []string{"outcome"}),
+		payloadViews: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hookrelay_dead_letter_payload_views_total",
+			Help: "Privileged dead-letter payload inspections, by bounded outcome.",
+		}, []string{"outcome"}),
 	}
-	for _, c := range []prometheus.Collector{m.auditEvents, m.auditWriteFailures, m.replays} {
+	for _, c := range []prometheus.Collector{m.auditEvents, m.auditWriteFailures, m.replays, m.payloadViews} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("administration: register metrics: %w", err)
 		}
@@ -58,6 +69,10 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 	m.auditEvents.WithLabelValues(opAdminAuthRejected, outcomeFailure)
 	m.auditEvents.WithLabelValues(opRecipientBlockCleared, outcomeSuccess)
 	m.auditEvents.WithLabelValues(opDeadLetterReplayed, outcomeSuccess)
+	m.auditEvents.WithLabelValues(opDeadLetterPayloadViewed, outcomeSuccess)
+	for _, o := range []string{payloadViewDisclosed, payloadViewNotFound, payloadViewUnavailable} {
+		m.payloadViews.WithLabelValues(o)
+	}
 	for _, o := range []string{string(ReplayReplayed), string(ReplayNotFound), string(ReplayMessageMissing), string(ReplayRecipientBlocked),
 		string(ReplayDeduplicationConflict), string(ReplayUncertain), replayFailed} {
 		m.replays.WithLabelValues(o)

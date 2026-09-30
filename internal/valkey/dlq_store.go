@@ -157,3 +157,31 @@ func parseReplayed(res *Result) (administration.Replay, error) {
 	return administration.Replay{Result: administration.ReplayReplayed, DeliveryCycle: cycle, QueuePosition: position,
 		ReplayedMs: replayed, DeduplicationResolution: resolution, RecipientIdentity: rid}, nil
 }
+
+// ViewPayload runs dlq_payload_v1: the access audit is appended in the
+// same operation that returns the blob, so a disclosed payload is always
+// audited. A blob that is not a JSON object is refused as wrong_type
+// (already audited, never disclosed).
+func (s *deadLetterStore) ViewPayload(ctx context.Context, messageID, actor, eventID, requestID string) administration.Payload {
+	res, err := s.a.RunScript(ctx, "dlq_payload_v1", []string{auditKey}, []string{messageID, actor, eventID, requestID, "hr1"})
+	if err != nil {
+		return administration.Payload{Result: administration.PayloadUnavailable}
+	}
+	if res.Status != "disclosed" {
+		return administration.Payload{Result: administration.PayloadResult(res.Status)}
+	}
+	f := res.Fields
+	blob, err1 := f[0].ToString()
+	cycle, err2 := f[1].AsInt64()
+	dead, err3 := f[2].AsInt64()
+	rid, err4 := f[3].ToString()
+	if errors.Join(err1, err2, err3, err4) != nil {
+		return administration.Payload{Result: administration.PayloadUnavailable}
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(blob), &obj) != nil {
+		return administration.Payload{Result: administration.PayloadWrongType}
+	}
+	return administration.Payload{Result: administration.PayloadDisclosed, Message: json.RawMessage(blob),
+		DeliveryCycle: cycle, DeadLetteredMs: dead, RecipientIdentity: rid}
+}

@@ -1,6 +1,9 @@
 package administration
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // DeadLetterCursor is the position after the last listed DLQ member
 // (newest first: descending score, then descending member).
@@ -77,6 +80,30 @@ type Replay struct {
 	RecipientIdentity       string
 }
 
+// PayloadResult is the bounded outcome of the audited payload disclosure.
+type PayloadResult string
+
+const (
+	PayloadDisclosed      PayloadResult = "disclosed"
+	PayloadNotFound       PayloadResult = "not_found"
+	PayloadMessageMissing PayloadResult = "message_missing"
+	PayloadWrongType      PayloadResult = "wrong_type"
+	// PayloadUnavailable: nothing was disclosed; the access audit may or
+	// may not have been appended.
+	PayloadUnavailable PayloadResult = "dependency_unavailable"
+)
+
+// Payload is the disclosure result; the fields are set for
+// PayloadDisclosed, which the store returns only after the access audit
+// was appended in the same operation.
+type Payload struct {
+	Result            PayloadResult
+	Message           json.RawMessage
+	DeliveryCycle     int64
+	DeadLetteredMs    int64
+	RecipientIdentity string
+}
+
 // DeadLetterRepository is the DLQ storage the Valkey adapter implements.
 type DeadLetterRepository interface {
 	// ListDeadLetters returns at most limit DLQ members newest first after
@@ -87,4 +114,7 @@ type DeadLetterRepository interface {
 	GetDeadLetter(ctx context.Context, messageID string) (*DeadLetter, error)
 	// ReplayDeadLetter runs the audited replay transition.
 	ReplayDeadLetter(ctx context.Context, messageID, resolution, eventID, requestID string) Replay
+	// ViewPayload appends the access audit for actor and returns the
+	// Canonical Message in the same operation.
+	ViewPayload(ctx context.Context, messageID, actor, eventID, requestID string) Payload
 }

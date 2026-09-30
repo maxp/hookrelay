@@ -23,6 +23,8 @@ func runDLQ(args []string, env adminIO) int {
 		return adminDLQGet(args[1:], env)
 	case "replay":
 		return adminDLQReplay(args[1:], env)
+	case "payload":
+		return adminDLQPayload(args[1:], env)
 	default:
 		fmt.Fprintf(env.Stderr, "hookrelay admin: unknown dlq command %q\n", args[0])
 		fmt.Fprint(env.Stderr, adminUsage)
@@ -193,6 +195,50 @@ func adminDLQGet(args []string, env adminIO) int {
 		return ExitError
 	}
 	if client.printDeadLetter(d) != nil {
+		return ExitError
+	}
+	return ExitOK
+}
+
+// adminDLQPayload prints a dead letter's Canonical Message. The server
+// discloses it only after appending the access audit, so every successful
+// call is an audited view; a failed call is simply reported (repeating it
+// is another audited view, not a mutation).
+func adminDLQPayload(args []string, env adminIO) int {
+	const name = "hookrelay admin dlq payload"
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(env.Stderr)
+	var common commonFlags
+	common.register(fs)
+	messageID := fs.String("message-id", "", "Message Identifier (required)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if *messageID == "" || fs.NArg() > 0 {
+		fmt.Fprintf(env.Stderr, "%s: --message-id is required\n", name)
+		return ExitUsage
+	}
+	client, err := common.resolve(env)
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitUsage
+	}
+	code, data, err := client.do(http.MethodPost, "/admin/v1/dead-letters/"+url.PathEscape(*messageID)+"/payload", nil)
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitError
+	}
+	if code != http.StatusOK {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, decodeAPIError(code, data))
+		return ExitError
+	}
+	var body json.RawMessage
+	if err := json.Unmarshal(data, &body); err != nil {
+		fmt.Fprintf(env.Stderr, "%s: unreadable response: %v\n", name, err)
+		return ExitError
+	}
+	fmt.Fprintf(env.Stderr, "%s: this payload access was recorded in the administrative audit\n", name)
+	if writeJSONResult(env.Stdout, body) != nil {
 		return ExitError
 	}
 	return ExitOK

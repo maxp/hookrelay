@@ -166,6 +166,12 @@ func init() {
 		"stale":      0,
 		"wrong_type": 0,
 	})
+	register("dlq_payload_v1", 1, map[string]int{
+		"disclosed":       4, // blob, delivery_cycle, dead_lettered_ms, recipient_identity
+		"not_found":       0,
+		"message_missing": 0,
+		"wrong_type":      0,
+	})
 	register("evict_dedup_v1", 1, map[string]int{
 		// count, oldest_accepted_ms, live_records, stop
 		"evicted":    4,

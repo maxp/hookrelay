@@ -2,6 +2,7 @@ package administration
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -213,6 +214,73 @@ func (s *Service) handleReplayDeadLetter(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	v, err := s.ReplayDeadLetter(r.Context(), r.PathValue("message_id"), req, requestID)
+	if err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+// PayloadView is the privileged payload response: the stored Canonical
+// Message in its Consumer API representation.
+type PayloadView struct {
+	MessageID      string          `json:"message_id"`
+	DeliveryCycle  int64           `json:"delivery_cycle"`
+	DeadLetteredMs int64           `json:"dead_lettered_ms"`
+	Message        json.RawMessage `json:"message"`
+}
+
+// ViewDeadLetterPayload discloses a dead letter's Canonical Message after
+// its access audit is appended in the same storage operation. Nothing is
+// disclosed when the audit is not confirmed.
+func (s *Service) ViewDeadLetterPayload(ctx context.Context, messageID, requestID string) (PayloadView, error) {
+	if !messageIDPattern.MatchString(messageID) {
+		s.metrics.payloadViews.WithLabelValues(payloadViewNotFound).Inc()
+		return PayloadView{}, deadLetterNotFound()
+	}
+	actor := actorFrom(ctx)
+	eventID := s.gen.UUIDv7()
+	p := s.deadLetters.ViewPayload(ctx, messageID, actor, eventID, requestID)
+	switch p.Result {
+	case PayloadDisclosed:
+		s.metrics.payloadViews.WithLabelValues(payloadViewDisclosed).Inc()
+		s.metrics.auditEvents.WithLabelValues(opDeadLetterPayloadViewed, outcomeSuccess).Inc()
+		s.logAudit(eventID, opDeadLetterPayloadViewed, messageID, requestID, outcomeSuccess)
+		fields := []any{"request_id", requestID, "message_id", messageID, "actor", actor, "delivery_cycle", p.DeliveryCycle}
+		if rcpt, ok := recipientOf(p.RecipientIdentity); ok {
+			fields = append(fields, "recipient_scope", rcpt.Scope, "bot_platform", rcpt.BotPlatform)
+		}
+		observability.LogEvent(s.log, slog.LevelInfo, opDeadLetterPayloadViewed, "dead-letter payload disclosed", fields...)
+		return PayloadView{MessageID: messageID, DeliveryCycle: p.DeliveryCycle, DeadLetteredMs: p.DeadLetteredMs, Message: p.Message}, nil
+	case PayloadNotFound:
+		s.metrics.payloadViews.WithLabelValues(payloadViewNotFound).Inc()
+		return PayloadView{}, deadLetterNotFound()
+	default:
+		s.metrics.payloadViews.WithLabelValues(payloadViewUnavailable).Inc()
+		reason, detail := "dependency_unavailable", "payload not disclosed: the access audit could not be confirmed"
+		switch p.Result {
+		case PayloadMessageMissing:
+			reason, detail = "message_missing", "the dead-letter message is missing: reconciliation holds readiness until it is corrected"
+		case PayloadWrongType:
+			reason, detail = "wrong_type", "stored structure has an unexpected type"
+		}
+		observability.LogEvent(s.log, slog.LevelError, "dead_letter_payload_failed", "dead-letter payload not disclosed",
+			"request_id", requestID, "message_id", messageID, "error_code", "dependency_unavailable", "reason_code", reason)
+		return PayloadView{}, DependencyError{detail: detail}
+	}
+}
+
+func (s *Service) handleDeadLetterPayload(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFrom(r.Context())
+	if r.ContentLength != 0 {
+		// The only accepted body is an empty JSON object.
+		var empty struct{}
+		if err := decodeBody(r, &empty); err != nil {
+			writeAPIError(w, err, requestID)
+			return
+		}
+	}
+	v, err := s.ViewDeadLetterPayload(r.Context(), r.PathValue("message_id"), requestID)
 	if err != nil {
 		writeAPIError(w, err, requestID)
 		return
