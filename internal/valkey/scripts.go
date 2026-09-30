@@ -198,6 +198,24 @@ func init() {
 		"too_many_sessions": 0,
 		"wrong_type":        0,
 	})
+	register("session_create_v1", 1, map[string]int{
+		// created_ms, idle_expires_ms, absolute_expires_ms, expired_count
+		"created":            4,
+		"capacity_exceeded":  1, // expired_count
+		"auth_uninitialized": 0,
+		"collision":          0,
+		"wrong_type":         0,
+	})
+	register("session_authenticate_v1", 1, map[string]int{
+		"valid":      3, // csrf_token, idle_expires_ms, absolute_expires_ms
+		"invalid":    1, // reason
+		"wrong_type": 0,
+	})
+	register("session_delete_v1", 1, map[string]int{
+		"deleted":    0,
+		"absent":     0,
+		"wrong_type": 0,
+	})
 	register("evict_dedup_v1", 1, map[string]int{
 		// count, oldest_accepted_ms, live_records, stop
 		"evicted":    4,

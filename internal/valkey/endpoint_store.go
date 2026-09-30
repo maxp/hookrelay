@@ -167,29 +167,33 @@ func isWrongType(err error) bool {
 	return err != nil && strings.HasPrefix(err.Error(), "WRONGTYPE")
 }
 
-// AppendRejectedAuth records a rejected administrative authentication attempt
-// in the audit stream, best effort: the caller counts the returned error but
-// never changes the refusal. The timestamp uses authoritative Valkey TIME,
+// AppendBestEffort appends one administrative audit event outside a Lua
+// transition, best effort: the caller counts the returned error but never
+// changes its outcome. The timestamp uses authoritative Valkey TIME,
 // matching the Lua-path entries; without it nothing is appended rather than
 // an entry with a fabricated timestamp.
-func (a *Adapter) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) error {
+func (a *Adapter) AppendBestEffort(ctx context.Context, e administration.AuditEvent) error {
 	auditCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	timestampMs, err := a.serverTimeMs(auditCtx)
 	if err != nil {
 		return err
 	}
-	_, err = a.client.Do(auditCtx, a.client.B().Arbitrary(
-		"XADD", auditKey, "MAXLEN", "~", "1000000", "*",
-		"event_id", eventID,
+	args := []string{"XADD", auditKey, "MAXLEN", "~", "1000000", "*",
+		"event_id", e.EventID,
 		"timestamp_ms", strconv.FormatInt(timestampMs, 10),
-		"actor", "admin_bearer",
-		"operation", "admin_auth_rejected",
-		"target", target,
-		"request_id", requestID,
-		"outcome", "failure",
-	).Build()).ToMessage()
-	if err != nil {
+		"actor", e.Actor,
+		"operation", e.Operation,
+		"target", e.Target,
+	}
+	if e.RequestID != "" {
+		args = append(args, "request_id", e.RequestID)
+	}
+	args = append(args, "outcome", e.Outcome)
+	if e.Reason != "" {
+		args = append(args, "reason", e.Reason)
+	}
+	if _, err = a.client.Do(auditCtx, a.client.B().Arbitrary(args...).Build()).ToMessage(); err != nil {
 		return fmt.Errorf("valkey: audit xadd: %w", err)
 	}
 	return nil
@@ -495,8 +499,8 @@ type auditSink struct{ a *Adapter }
 // NewAuditSink returns the administration best-effort audit implementation.
 func NewAuditSink(a *Adapter) administration.AuditSink { return &auditSink{a: a} }
 
-func (s *auditSink) AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) error {
-	return s.a.AppendRejectedAuth(ctx, eventID, requestID, target)
+func (s *auditSink) AppendBestEffort(ctx context.Context, e administration.AuditEvent) error {
+	return s.a.AppendBestEffort(ctx, e)
 }
 
 // AuditEntries reads the bounded recent administrative audit stream. It backs

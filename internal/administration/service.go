@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/maxp/hookrelay/internal/gen"
+	"github.com/maxp/hookrelay/internal/ratelimit"
 )
 
 // EndpointRepository is the storage interface the Valkey adapter implements.
@@ -160,10 +161,22 @@ type TypeCatalog interface {
 	KnownPlatform(botPlatform string) bool
 }
 
+// AuditEvent is one best-effort administrative audit event. It carries
+// bounded metadata only, never credentials, tokens, or payloads.
+type AuditEvent struct {
+	EventID   string
+	Actor     string
+	Operation string
+	Target    string
+	RequestID string
+	Outcome   string
+	Reason    string
+}
+
 // AuditSink records best-effort audit events outside Lua transitions. The
 // returned error is only counted; it never changes the caller's outcome.
 type AuditSink interface {
-	AppendRejectedAuth(ctx context.Context, eventID, requestID, target string) error
+	AppendBestEffort(ctx context.Context, e AuditEvent) error
 }
 
 // ServiceDeps carries the administrative service collaborators.
@@ -187,6 +200,14 @@ type ServiceDeps struct {
 	GrafanaURL string
 	// Now is the clock for generated timestamps; nil uses time.Now.
 	Now func() time.Time
+	// Sessions serves the browser-session routes; nil leaves them
+	// unregistered. AdminOrigin is the exact allowed Origin
+	// ("scheme://host[:port]"), CookieSecure sets the cookie's Secure
+	// attribute, and LoginLimits the login buckets (zero: the defaults).
+	Sessions     SessionStore
+	AdminOrigin  string
+	CookieSecure bool
+	LoginLimits  ratelimit.Limits
 	// AdminSecret must already be resolved and validated by the
 	// configuration layer.
 	AdminSecret string
@@ -234,7 +255,13 @@ type Service struct {
 	readiness   ReadinessView
 	grafanaURL  string
 	now         func() time.Time
-	ready       ReadySignal
+	sessions    SessionStore
+	// adminOrigin is the exact allowed Origin of cookie-authenticated
+	// state-changing requests.
+	adminOrigin  string
+	cookieSecure bool
+	loginLimiter *ratelimit.Limiter
+	ready        ReadySignal
 	// adminSecretDigest is the SHA-256 of the Admin Secret: comparing
 	// fixed-size digests keeps the check constant-time in the secret length.
 	adminSecretDigest [sha256.Size]byte
@@ -257,6 +284,10 @@ func NewService(d ServiceDeps) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
+	limits := d.LoginLimits
+	if limits == (ratelimit.Limits{}) {
+		limits = DefaultLoginLimits
+	}
 	log := d.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -273,6 +304,10 @@ func NewService(d ServiceDeps) (*Service, error) {
 		readiness:         d.Readiness,
 		grafanaURL:        d.GrafanaURL,
 		now:               now,
+		sessions:          d.Sessions,
+		adminOrigin:       d.AdminOrigin,
+		cookieSecure:      d.CookieSecure,
+		loginLimiter:      ratelimit.New(limits, now()),
 		ready:             d.Ready,
 		adminSecretDigest: sha256.Sum256([]byte(d.AdminSecret)),
 		gen:               d.Gen,

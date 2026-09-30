@@ -129,25 +129,37 @@ func (s *Service) logCreateFailure(requestID string, e Endpoint, reason string) 
 // recordRejectedAuth appends the best-effort rejected-authentication audit
 // event and counts its outcome. It never changes the refusal.
 func (s *Service) recordRejectedAuth(ctx context.Context, requestID string) {
-	eventID := s.gen.UUIDv7()
-	s.logAudit(eventID, opAdminAuthRejected, "admin_api", requestID, outcomeFailure)
+	s.appendBestEffort(ctx, AuditEvent{Actor: actorAdminBearer, Operation: opAdminAuthRejected, Target: "admin_api",
+		RequestID: requestID, Outcome: outcomeFailure})
+}
+
+// appendBestEffort writes the stdout copy and appends the event to the
+// audit Stream without affecting the caller: a failure is only counted.
+func (s *Service) appendBestEffort(ctx context.Context, e AuditEvent) {
+	e.EventID = s.gen.UUIDv7()
+	s.logAuditAs(e.Actor, e.EventID, e.Operation, e.Target, e.RequestID, e.Outcome)
 	if s.audit == nil {
 		return
 	}
-	if err := s.audit.AppendRejectedAuth(ctx, eventID, requestID, "admin_api"); err != nil {
-		s.metrics.auditWriteFailures.WithLabelValues(opAdminAuthRejected).Inc()
+	if err := s.audit.AppendBestEffort(ctx, e); err != nil {
+		s.metrics.auditWriteFailures.WithLabelValues(e.Operation).Inc()
 		return
 	}
-	s.metrics.auditEvents.WithLabelValues(opAdminAuthRejected, outcomeFailure).Inc()
+	s.metrics.auditEvents.WithLabelValues(e.Operation, e.Outcome).Inc()
 }
 
 // logAudit is the best-effort stdout copy of an administrative audit event.
 // It shares its identity with the Valkey Stream entry but carries only bounded
 // metadata. The log handler provides the millisecond timestamp envelope.
 func (s *Service) logAudit(eventID, operation, target, requestID, outcome string) {
+	s.logAuditAs(actorAdminBearer, eventID, operation, target, requestID, outcome)
+}
+
+// logAuditAs is logAudit for an explicit actor.
+func (s *Service) logAuditAs(actor, eventID, operation, target, requestID, outcome string) {
 	observability.LogEvent(s.log, slog.LevelInfo, "administrative_audit", "administrative audit event",
 		"event_id", eventID,
-		"actor", "admin_bearer",
+		"actor", actor,
 		"operation", operation,
 		"target", target,
 		"request_id", requestID,

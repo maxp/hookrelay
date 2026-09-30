@@ -11,9 +11,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -169,21 +171,24 @@ func Serve(args []string) int {
 	}
 	readiness := &app.Readiness{}
 	svc, err := administration.NewService(administration.ServiceDeps{
-		Ready:       notifier,
-		Repo:        valkey.NewEndpointStore(adapter),
-		Recipients:  valkey.NewRecipientStore(adapter, cfg.MaxQueuedMessagesPerRecipient),
-		DeadLetters: valkey.NewDeadLetterStore(adapter),
-		Messages:    valkey.NewMessageStateStore(adapter),
-		Catalog:     typeCatalog{registry: webhookTypes},
-		Audit:       valkey.NewAuditSink(adapter),
-		AuditLog:    valkey.NewAuditLog(adapter),
-		Operations:  valkey.NewOperationsStore(adapter),
-		Readiness:   readiness,
-		GrafanaURL:  cfg.UIGrafanaURL,
-		AdminSecret: adminSecret,
-		Gen:         gen.Crypto{},
-		Logger:      log,
-		Registerer:  registry,
+		Ready:        notifier,
+		Repo:         valkey.NewEndpointStore(adapter),
+		Recipients:   valkey.NewRecipientStore(adapter, cfg.MaxQueuedMessagesPerRecipient),
+		DeadLetters:  valkey.NewDeadLetterStore(adapter),
+		Messages:     valkey.NewMessageStateStore(adapter),
+		Catalog:      typeCatalog{registry: webhookTypes},
+		Audit:        valkey.NewAuditSink(adapter),
+		AuditLog:     valkey.NewAuditLog(adapter),
+		Operations:   valkey.NewOperationsStore(adapter),
+		Readiness:    readiness,
+		GrafanaURL:   cfg.UIGrafanaURL,
+		Sessions:     valkey.NewSessionStore(adapter),
+		AdminOrigin:  adminOrigin(cfg.AdminOrigin),
+		CookieSecure: cfg.AdminCookieSecure,
+		AdminSecret:  adminSecret,
+		Gen:          gen.Crypto{},
+		Logger:       log,
+		Registerer:   registry,
 	})
 	if err != nil {
 		log.Error("administration wiring failed", "event", "startup_failed", "error_code", "internal_error")
@@ -497,4 +502,13 @@ func Healthcheck(args []string) int {
 		return ExitError
 	}
 	return ExitOK
+}
+
+// adminOrigin serializes the configured administrative origin the way a
+// browser sends it: lowercase scheme://host[:port], no path.
+func adminOrigin(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host)
 }

@@ -165,10 +165,14 @@ func (fakeCatalog) Lookup(webhookType string) (string, []string, bool) {
 type fakeAudit struct {
 	rejected int
 	fail     bool
+	events   []AuditEvent
 }
 
-func (f *fakeAudit) AppendRejectedAuth(context.Context, string, string, string) error {
-	f.rejected++
+func (f *fakeAudit) AppendBestEffort(_ context.Context, e AuditEvent) error {
+	f.events = append(f.events, e)
+	if e.Operation == opAdminAuthRejected {
+		f.rejected++
+	}
 	if f.fail {
 		return errors.New("audit unavailable")
 	}
@@ -178,8 +182,10 @@ func (f *fakeAudit) AppendRejectedAuth(context.Context, string, string, string) 
 type fixedGen struct{ uuid string }
 
 func (fixedGen) UUIDv7() string { return "0195-uuid" }
-func (fixedGen) Base64URL(int) (string, error) {
-	return "AAAAAAAAAAAAAAAAAAAAAA", nil
+
+// Base64URL returns a fixed value of the encoded length of n bytes.
+func (fixedGen) Base64URL(n int) (string, error) {
+	return strings.Repeat("A", (n*8+5)/6), nil
 }
 
 func testService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit) {

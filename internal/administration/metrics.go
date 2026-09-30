@@ -46,6 +46,8 @@ type metrics struct {
 	replays            *prometheus.CounterVec
 	payloadViews       *prometheus.CounterVec
 	dlqDeletions       *prometheus.CounterVec
+	loginAttempts      *prometheus.CounterVec
+	csrfRejections     *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer) (*metrics, error) {
@@ -70,8 +72,17 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "hookrelay_dead_letter_deletions_total",
 			Help: "Administrative permanent dead-letter deletions, by bounded outcome.",
 		}, []string{"outcome"}),
+		loginAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hookrelay_admin_login_attempts_total",
+			Help: "Administrative browser login attempts, by bounded outcome.",
+		}, []string{"outcome"}),
+		csrfRejections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hookrelay_admin_csrf_rejections_total",
+			Help: "Cookie-authenticated requests refused by the Origin or CSRF check, by reason.",
+		}, []string{"reason"}),
 	}
-	for _, c := range []prometheus.Collector{m.auditEvents, m.auditWriteFailures, m.replays, m.payloadViews, m.dlqDeletions} {
+	for _, c := range []prometheus.Collector{m.auditEvents, m.auditWriteFailures, m.replays, m.payloadViews, m.dlqDeletions,
+		m.loginAttempts, m.csrfRejections} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("administration: register metrics: %w", err)
 		}
@@ -86,6 +97,12 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 		m.payloadViews.WithLabelValues(o)
 	}
 	m.auditEvents.WithLabelValues(opDeadLetterDeleted, outcomeSuccess)
+	for _, o := range []string{loginSuccess, loginFailure, loginRateLimited, loginCapacityExceeded, loginUnavailable} {
+		m.loginAttempts.WithLabelValues(o)
+	}
+	for _, r := range []string{csrfReasonOrigin, csrfReasonToken} {
+		m.csrfRejections.WithLabelValues(r)
+	}
 	for _, o := range []string{dlqDeletionDeleted, dlqDeletionAbsent, dlqDeletionRefused, dlqDeletionUnavailable} {
 		m.dlqDeletions.WithLabelValues(o)
 	}
