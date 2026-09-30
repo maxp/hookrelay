@@ -66,7 +66,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Help: "Administrative dead-letter replays, by bounded outcome.",
 		}, []string{"outcome"}),
 		payloadViews: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "hookrelay_dead_letter_payload_views_total",
+			Name: "hookrelay_dlq_payload_inspections_total",
 			Help: "Privileged dead-letter payload inspections, by bounded outcome.",
 		}, []string{"outcome"}),
 		dlqDeletions: prometheus.NewCounterVec(prometheus.CounterOpts{

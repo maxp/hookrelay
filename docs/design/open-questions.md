@@ -11,7 +11,6 @@ The following questions remain intentionally unresolved. The Milestone 1 choices
 - Exact OpenAPI representation for the accepted Consumer and Admin API contracts after DTOs stabilize, and whether later versions need generated clients; neither blocks Milestone 1.
 - Operational procedures for coordinated single-secret rotation of Consumer and Admin secrets.
 - Encoded-character constraints or larger login-body handling needed to guarantee that every accepted 8192-byte Admin Secret can be represented in JSON without exceeding the current 16 KiB login limit; the same question applies to future credential kinds that permit the full 8192-byte value.
-- Per-operation reconciliation details for later administrative DLQ and session mutations after uncertain Lua execution; the accepted policy already forbids blind retries and false success claims.
 
 ## Valkey schema and durability
 
@@ -31,3 +30,8 @@ The following questions remain intentionally unresolved. The Milestone 1 choices
 
 - **Routing-issue precedence (Telegram):** a Canonical Message carries one `routing_issue`, and the first detected issue wins. An invalid or missing `update_id` is detected first, so `invalid_source_event_id` takes precedence over an event-structure or identifier issue in the same Update; the message is relay-scoped either way and keeps its `platform_event_type`.
 - **Timestamp extraction failures:** measured by `hookrelay_event_time_issues_total{bot_platform,reason}` (`missing`, `invalid_type`, `invalid_value`) with the `event_time_invalid` structured warning.
+
+## Resolved during Milestone 4
+
+- **Uncertain DLQ and session mutations:** permanent deletion is reconciled by one dead-letter read (absence is reported as observed, not confirmed); payload inspection is not a mutation beyond its audit and may simply be repeated; an unconfirmed login never issues the cookie (an orphan session only holds capacity until it expires); logout answers `503` until revocation is confirmed. See the [Milestone 4 spec](../../.scratch/milestone-4/spec.md).
+- **Session expiry audit:** scripts that remove expired sessions return the count and the caller appends the best-effort `admin_session_expired` events, because audit event identifiers are UUIDv7 generated outside Lua.

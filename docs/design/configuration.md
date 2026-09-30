@@ -99,6 +99,16 @@ HOOKRELAY_ADMIN_COOKIE_SECURE=false
 
 Production uses an explicit HTTPS origin and secure cookie. An insecure cookie is permitted only when the administrative listener binds to loopback; non-loopback plus insecure cookie is a startup error. The cookie name remains `hookrelay_admin`. Hookrelay does not trust arbitrary forwarded scheme or host headers in place of the configured origin.
 
+Milestone 4 compares the `Origin` header of login and of every cookie-authenticated state-changing request with the lowercase `scheme://host[:port]` of `HOOKRELAY_ADMIN_ORIGIN` (any path is ignored); it must therefore be the exact origin the browser shows, which behind a TLS-terminating proxy is the proxy's origin.
+
+## Operational UI link
+
+```text
+HOOKRELAY_UI_GRAFANA_URL      (flag --ui-grafana-url)
+```
+
+Optional, default empty. An absolute `http` or `https` URL without userinfo (the validation error never echoes the value). It is returned as `links.grafana_url` by `GET /admin/v1/operations/summary` and shown as a link in the operational UI; empty shows no link.
+
 ## Trusted proxies and source addresses
 
 ```text

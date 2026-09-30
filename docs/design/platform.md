@@ -204,6 +204,8 @@ hookrelay_webhook_endpoints
 hookrelay_audit_events_total{operation,outcome}
 hookrelay_audit_write_failures_total{operation}
 hookrelay_dlq_payload_inspections_total{outcome}
+hookrelay_dead_letter_deletions_total{outcome}
+hookrelay_admin_csrf_rejections_total{reason}
 ```
 
 Administrative labels use only bounded operation and outcome allowlists. They never contain session, endpoint, message, Recipient, or actor identifiers.

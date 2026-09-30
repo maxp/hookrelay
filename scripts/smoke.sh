@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Compose smoke test: the Milestone 1 vertical slice and the Milestone 2
-# failure path end to end against the pinned Compose stack, in production
-# mode (AOF + noeviction gate).
+# Compose smoke test: the Milestone 1 vertical slice, the Milestone 2
+# failure path, and the Milestone 3 and 4 additions end to end against the
+# pinned Compose stack, in production mode (AOF + noeviction gate).
 #
 #   start stack → create Telegram endpoint (CLI) → send signed fixture →
 #   repeat and prove exactly one stored message → claim (wait_ms=0) → ack →
@@ -15,7 +15,11 @@
 #   claim woken by the ready-work notifier when a webhook arrives →
 #   credential replacement through the CLI (create a second endpoint, list
 #   the bot's endpoints, disable and delete the old one, the old path 404s,
-#   the new one accepts).
+#   the new one accepts) → Milestone 4: two dead letters → operations
+#   summary → browser login (production cookie attributes) → cookie replay
+#   refused without and accepted with the CSRF token → audited payload view
+#   → deletion refused without and accepted with If-Match → audit list shows
+#   the session actions → logout → the /ui/ panel with its CSP → metrics.
 #
 # The run uses its own Compose project, generated secrets, and free loopback
 # ports, so it never touches a developer's .secrets/ or running stack.
@@ -303,5 +307,83 @@ expect "webhook to the new endpoint" "$(curl_ -o /dev/null -w '%{http_code}' -X 
 metrics="$(curl_ "$admin/metrics")"
 expect "disable audit" "$(metric 'hookrelay_audit_events_total\{operation="webhook_endpoint_disabled",outcome="success"\}')" 1
 expect "delete audit" "$(metric 'hookrelay_audit_events_total\{operation="webhook_endpoint_deleted",outcome="success"\}')" 1
+
+step "Milestone 4: two dead letters for the operational views"
+send2() { # send2 <update_id> <chat_id>
+  curl_ -o /dev/null -w '%{http_code}' -X POST "$public/webhook/telegram/wh_smoke2" \
+    -H 'Content-Type: application/json' -H "X-Telegram-Bot-Api-Secret-Token: $credential2" \
+    -d "{\"update_id\":$1,\"message\":{\"message_id\":$1,\"date\":1700000000,\"chat\":{\"id\":$2,\"type\":\"group\"},\"text\":\"<img src=x onerror=alert(1)>\"}}"
+}
+expect "failing webhook A" "$(send2 790 -100557)" 200
+expect "failing webhook B" "$(send2 791 -100558)" 200
+dead=0
+for n in $(seq 1 40); do
+  out="$(claim "0195c4d8-0000-7000-8000-0000000d$(printf '%04d' "$n")" 5000)"
+  [[ "$(tail -n1 <<<"$out")" == 200 ]] || continue
+  body="$(head -n -1 <<<"$out")"
+  token="$(json "$body" 'd["delivery"]["delivery_token"]')"
+  if [[ "$(json "$body" 'd["message"]["recipient"]["chat_id"]')" == -100556 ]]; then
+    ack >/dev/null
+    continue
+  fi
+  [[ "$(json "$(head -n -1 <<<"$(nack "$token")")" 'd["status"]')" == dead_lettered ]] && dead=$((dead + 1))
+  [[ $dead -eq 2 ]] && break
+done
+expect "dead-lettered messages" "$dead" 2
+dlq="$(admin_cli dlq list)"
+dl_replay="$(json "$dlq" '[i["message_id"] for i in d["items"] if i["recipient"]["chat_id"] == "-100557"][0]')"
+dl_delete="$(json "$dlq" '[i["message_id"] for i in d["items"] if i["recipient"]["chat_id"] == "-100558"][0]')"
+expect "summary dead letters" "$(json "$(admin_cli operations summary)" 'd["dead_letters"]["count"], d["readiness"]["ready"]')" "(2, True)"
+
+step "Milestone 4: browser session with CSRF"
+origin='https://admin.smoke.invalid'
+admin_secret="$(tr -d '\n' <"$work/secrets/admin")"
+curl_ -D "$work/login.headers" -o /dev/null -X POST "$admin/admin/v1/session" -H "Origin: $origin" \
+  -H 'Content-Type: application/json' -d "{\"admin_secret\":\"$admin_secret\"}"
+expect "login status" "$(head -n1 "$work/login.headers" | awk '{print $2}')" 204
+set_cookie="$(grep -i '^set-cookie: hookrelay_admin=' "$work/login.headers" | tr -d '\r')"
+for attr in HttpOnly Secure SameSite=Strict 'Path=/' 'Max-Age=43200'; do
+  expect "cookie $attr" "$(grep -c "; $attr" <<<"$set_cookie")" 1
+done
+# The cookie is Secure; curl will not send it over plain HTTP from a jar,
+# so it is passed explicitly.
+cookie="$(sed -E 's/^[^:]*: (hookrelay_admin=[^;]*).*/\1/' <<<"$set_cookie")"
+session="$(curl_ "$admin/admin/v1/session" -H "Cookie: $cookie")"
+csrf="$(json "$session" 'd["csrf_token"]')"
+expect "session read" "$(json "$session" 'd["authenticated"], len(d["csrf_token"])')" "(True, 22)"
+cookie_call() { # cookie_call <method> <path> [extra curl args...]
+  local method="$1" path="$2"
+  shift 2
+  curl_ -X "$method" "$admin$path" -H "Cookie: $cookie" -H "Origin: $origin" "$@" -w '\n%{http_code}'
+}
+expect "replay without CSRF" "$(tail -n1 <<<"$(cookie_call POST "/admin/v1/dead-letters/$dl_replay/replay")")" 403
+out="$(cookie_call POST "/admin/v1/dead-letters/$dl_replay/replay" -H "X-CSRF-Token: $csrf")"
+expect "replay with CSRF" "$(tail -n1 <<<"$out")" 200
+expect "cookie replay" "$(json "$(head -n -1 <<<"$out")" 'd["status"], d["delivery_cycle"]')" "('replayed', 2)"
+out="$(cookie_call POST "/admin/v1/dead-letters/$dl_delete/payload" -H "X-CSRF-Token: $csrf")"
+expect "payload status" "$(tail -n1 <<<"$out")" 200
+expect "payload text" "$(json "$(head -n -1 <<<"$out")" 'd["message"]["payload"]["message"]["text"]')" '<img src=x onerror=alert(1)>'
+etag="$(curl_ -D - -o /dev/null "$admin/admin/v1/dead-letters/$dl_delete" -H "Cookie: $cookie" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)"
+expect "delete without If-Match" "$(tail -n1 <<<"$(cookie_call DELETE "/admin/v1/dead-letters/$dl_delete" -H "X-CSRF-Token: $csrf")")" 428
+expect "delete with If-Match" "$(tail -n1 <<<"$(cookie_call DELETE "/admin/v1/dead-letters/$dl_delete" -H "X-CSRF-Token: $csrf" -H "If-Match: $etag")")" 204
+expect "deleted message gone" "$(vk EXISTS "hr1:m:$dl_delete" "hr1:dl:$dl_delete")" 0
+summary="$(curl_ "$admin/admin/v1/operations/summary" -H "Cookie: $cookie")"
+expect "summary via cookie" "$(json "$summary" 'd["dead_letters"]["count"], d["admin_sessions"]["indexed"]')" "(0, 1)"
+audit="$(admin_cli audit list --limit 5)"
+expect "audit trail" "$(json "$audit" '[(i["operation"], i["actor"]) for i in d["items"][:4]]')" \
+  "[('dead_letter_deleted', 'admin_session'), ('dead_letter_payload_viewed', 'admin_session'), ('dead_letter_replayed', 'admin_session'), ('admin_login', 'admin_session')]"
+expect "logout" "$(tail -n1 <<<"$(cookie_call DELETE /admin/v1/session -H "X-CSRF-Token: $csrf")")" 204
+expect "session after logout" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/admin/v1/session" -H "Cookie: $cookie")" 401
+
+step "Milestone 4: operational UI and metrics"
+ui_headers="$(curl_ -D - -o /dev/null "$admin/ui/" | tr -d '\r')"
+expect "UI status" "$(head -n1 <<<"$ui_headers" | awk '{print $2}')" 200
+expect "UI CSP" "$(grep -ci "^content-security-policy: default-src 'none'; script-src 'self'" <<<"$ui_headers")" 1
+expect "root redirect" "$(curl_ -o /dev/null -w '%{http_code} %{redirect_url}' "$admin/")" "302 $admin/ui/"
+metrics="$(curl_ "$admin/metrics")"
+expect "login success" "$(metric 'hookrelay_admin_login_attempts_total\{outcome="success"\}')" 1
+expect "CSRF rejection" "$(metric 'hookrelay_admin_csrf_rejections_total\{reason="token"\}')" 1
+expect "payload views" "$(metric 'hookrelay_dlq_payload_inspections_total\{outcome="disclosed"\}')" 1
+expect "deletions" "$(metric 'hookrelay_dead_letter_deletions_total\{outcome="deleted"\}')" 1
 
 printf '\nSMOKE PASSED\n'

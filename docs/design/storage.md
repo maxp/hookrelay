@@ -182,6 +182,8 @@ At startup, a missing record is initialized before browser sessions are accepted
 
 Successful login atomically removes expired indexed sessions and their Hashes, checks `ZCARD` against the 100-session limit, creates the session Hash and index member with the current generation ID, and appends the required audit event. Throttled idle-expiry refresh updates both the Hash and score atomically. Logout removes both records. Stale or missing index/Hash pairs are handled by the session slice's startup reconciliation contract.
 
+Milestone 4 fixes these contracts ([spec](../../.scratch/milestone-4/spec.md)): the session token is 32 random bytes (43 base64url characters) and the key uses the lowercase hex SHA-256 of that string; the CSRF token is 16 random bytes; the index score is `min(idle_expires_ms, absolute_expires_ms)`. The generation check runs first in every reconciliation pass; session reconciliation follows it, removing orphan index members, deleting malformed, expired, or stale-generation sessions (sessions are disposable), and restoring the member of a valid session from its Hash; a wrong-typed index or session key fails the pass. The maintenance loop removes due sessions in batches of 100. Expiry audit is best effort and appended by the caller, because audit event identifiers are UUIDv7 generated outside Lua.
+
 ## Webhook Endpoint configuration
 
 Webhook Endpoint configuration and verification credentials are stored in the dedicated Valkey instance behind an internal repository interface. The first version stores webhook credentials in plaintext rather than introducing an application encryption key or external secret manager.
@@ -301,7 +303,7 @@ Dead-letter replay removes the dead-letter record and index entry, starts a new 
 
 The dead-letter Hash is authoritative. Startup reconciliation removes stale global index members and restores missing index members. If a dead-letter entry lacks its Canonical Message, startup reconciliation fails readiness rather than creating a Recipient block marker: the block-clear operation only verifies active queue state and cannot establish DLQ integrity. An operator must resolve the missing dead-letter data through a reviewed incident-specific procedure and rerun reconciliation. Ambiguity in an active Recipient queue still creates the Recipient block marker described below.
 
-Administrative permanent deletion removes the global index member, dead-letter Hash, Canonical Message, and attempt history and appends the required audit event in the same Lua operation, without copying the payload into audit.
+Administrative permanent deletion removes the global index member, dead-letter Hash, Canonical Message, message metadata, and attempt history and appends the required audit event in the same Lua operation, without copying the payload into audit. It requires the reviewed entry's `(delivery_cycle, dead_lettered_ms)` pair as its precondition, refuses while the Recipient is blocked, and leaves deduplication records untouched (as retention expiry does).
 
 ## Ambiguous Recipient block marker
 

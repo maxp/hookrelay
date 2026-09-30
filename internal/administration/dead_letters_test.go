@@ -252,7 +252,7 @@ func TestDeadLetterPayloadContract(t *testing.T) {
 	if c := f.views[0]; c.messageID != dlqID || c.resolution != "admin_bearer" || c.eventID == "" || c.requestID == "" {
 		t.Errorf("view call = %+v", c)
 	}
-	if got := counterValue(t, reg, "hookrelay_dead_letter_payload_views_total", map[string]string{"outcome": "disclosed"}); got != 2 {
+	if got := counterValue(t, reg, "hookrelay_dlq_payload_inspections_total", map[string]string{"outcome": "disclosed"}); got != 2 {
 		t.Errorf("views = %v", got)
 	}
 	if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "dead_letter_payload_viewed", "outcome": "success"}); got != 2 {
@@ -290,7 +290,7 @@ func TestDeadLetterPayloadContract(t *testing.T) {
 		if rec.Code != want.status || !strings.Contains(rec.Body.String(), `"code":"`+want.code+`"`) || strings.Contains(rec.Body.String(), "secret-ish") {
 			t.Errorf("%s: %d %s", result, rec.Code, rec.Body.String())
 		}
-		if got := counterValue(t, reg, "hookrelay_dead_letter_payload_views_total", map[string]string{"outcome": want.outcome}); got != 1 {
+		if got := counterValue(t, reg, "hookrelay_dlq_payload_inspections_total", map[string]string{"outcome": want.outcome}); got != 1 {
 			t.Errorf("%s: views{outcome=%s} = %v", result, want.outcome, got)
 		}
 	}

@@ -8,7 +8,9 @@ Milestone 1 (the tracer-bullet vertical slice) is implemented; its exit criterio
 
 Milestone 2 (the complete delivery failure path, the first deployable release candidate) is implemented; its exit criterion is a green CI pipeline including the extended Compose smoke. It adds negative acknowledgement, lease extension and expiry, bounded retries with jitter, the global DLQ after the fourth failed attempt, audited DLQ replay with deduplication-conflict protection, the delivery-state read, DLQ retention, cooperative background and inline maintenance, Recipient block listing, inspection, and preconditioned clearing, startup reconciliation that executes overdue expiries and retries before readiness, webhook rate limits, the Valkey memory acceptance stop, and deduplication early eviction. 
 
-Milestone 3 (notification wake-up and Webhook Endpoint administration) is implemented. An in-process ready-work notifier wakes waiting claims as soon as this process makes work ready, with the periodic recheck kept as the loss-recovery path (ADR 0008), and the Admin API and CLI gain the endpoint list, `PATCH` enable/disable and deletion under strong `If-Match`, and the Bot Identity endpoint listing, which together complete credential replacement. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/), [`.scratch/milestone-2/`](.scratch/milestone-2/), and [`.scratch/milestone-3/`](.scratch/milestone-3/).
+Milestone 3 (notification wake-up and Webhook Endpoint administration) is implemented. An in-process ready-work notifier wakes waiting claims as soon as this process makes work ready, with the periodic recheck kept as the loss-recovery path (ADR 0008), and the Admin API and CLI gain the endpoint list, `PATCH` enable/disable and deletion under strong `If-Match`, and the Bot Identity endpoint listing, which together complete credential replacement.
+
+Milestone 4 (browser sessions, operational UI, audit views, and the remaining DLQ operations) is implemented. Operators log in to an embedded operational panel at `/ui/` on the administrative listener with the Admin Secret (HttpOnly `SameSite=Strict` session cookie, CSRF token and exact `Origin` for every state-changing request, 1 h idle / 12 h absolute expiry, at most 100 sessions, all revoked when the Admin Secret changes), and the Admin API and CLI gain audited DLQ payload inspection, permanent deletion under `If-Match`, the operations summary, and the audit listing (ADR 0009). Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/) through [`.scratch/milestone-4/`](.scratch/milestone-4/).
 
 ## Goals
 
@@ -112,7 +114,7 @@ docker compose up --build
 ```
 
 The Compose smoke test proves the Milestone 1 slice, the Milestone 2
-failure path, and the Milestone 3 additions against that stack in production mode (endpoint via the Admin
+failure path, and the Milestone 3 and 4 additions against that stack in production mode (endpoint via the Admin
 CLI → signed webhook and its duplicate → claim → ack and repeated ack →
 empty queue → metrics and health → three nacks with observed retries →
 fourth nack dead-letters → `admin dlq list|get|replay` → `admin message
@@ -122,7 +124,12 @@ processed by startup reconciliation before readiness → persisted endpoint
 and continued deduplication → a waiting claim woken by a new webhook →
 credential replacement: a second endpoint, `admin bot webhooks`, `admin
 webhook list`, disable and delete the old endpoint, which then answers
-`404` while the new one accepts). It shortens retry delays to 300 ms and the
+`404` while the new one accepts → two new dead letters → `admin operations
+summary` → browser login with the production cookie attributes → a
+cookie-authenticated replay refused without the CSRF token and accepted with
+it → audited payload view → permanent deletion refused without and accepted
+with `If-Match` → `admin audit list` shows the session actions → logout →
+the `/ui/` panel served with its Content Security Policy). It shortens retry delays to 300 ms and the
 initial lease to 5 s. It uses its own Compose project, generated secrets, and free
 loopback ports, and cleans up after itself; CI runs it as the `smoke` job:
 
@@ -245,7 +252,12 @@ letter and `replay_dlq_v2` keeps waiting replays in replay order, and `ack_v4`, 
 cycle/attempt that replay saves as `pending_delivery_cycle` /
 `pending_attempt` in `hr1:mi` when they expose the next head), and
 [`.scratch/milestone-3/spec.md`](.scratch/milestone-3/spec.md)
-(`endpoint_set_enabled_v1` and `endpoint_delete_v1`); see also
+(`endpoint_set_enabled_v1` and `endpoint_delete_v1`), and
+[`.scratch/milestone-4/spec.md`](.scratch/milestone-4/spec.md) (the
+`hr1:admin_auth` generation record, `hr1:admin_session:<digest>` sessions
+and their `hr1:admin_sessions` index, `admin_auth_v1`, the `session_*_v1`
+scripts, `expire_sessions_v1`, `reconcile_session_v1`, `dlq_payload_v1`,
+`dlq_delete_v1`, `operations_summary_v1`, and `replay_dlq_v3`); see also
 [`docs/design/storage.md`](docs/design/storage.md).
 
 ## Consumer API
@@ -370,6 +382,30 @@ The administrative listener serves the authenticated Admin API. Requests
 authenticate with `Authorization: Bearer <admin secret>`
 (`HOOKRELAY_ADMIN_SECRET` or `HOOKRELAY_ADMIN_SECRET_FILE`); rejected attempts
 are audited best effort. Health and metrics endpoints stay unauthenticated.
+The operational routes (operations summary, Recipient states, delivery
+state, dead letters, audit) also accept the browser session cookie;
+cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` requests need the
+session's `X-CSRF-Token` and the exact configured `Origin` (`403 forbidden`
+otherwise). Webhook Endpoint, Bot Identity, and block inspect/clear routes
+stay Bearer-only. With an `Authorization` header only Bearer is evaluated.
+Every `/admin/v1/` response is `Cache-Control: no-store`.
+
+- `POST /admin/v1/session` with `{"admin_secret": "..."}` (JSON, at most
+  16 KiB, exact `Origin` required) — `204` and the `hookrelay_admin` cookie
+  (`HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=43200`, `Secure` unless
+  `HOOKRELAY_ADMIN_COOKIE_SECURE=false` on a loopback listener) once the
+  session and its login audit are stored; `401` for a wrong secret, `429
+  rate_limit_exceeded` (5/min per source address, 60/min globally) with
+  `Retry-After`, `429 session_capacity_exceeded` at 100 sessions. `GET
+  /admin/v1/session` returns the expiries and the CSRF token; `DELETE`
+  logs out (`204`, also for an already invalid session; `503` when
+  revocation cannot be confirmed).
+- `GET /admin/v1/operations/summary` — readiness, Valkey memory, queue
+  depths with the earliest lease and retry deadlines, DLQ count and age,
+  endpoint, session, and audit counts, and the optional Grafana link
+  (`HOOKRELAY_UI_GRAFANA_URL`). Served while not ready.
+- `GET /admin/v1/audit?limit&cursor` — the administrative audit newest
+  first (allowlisted fields plus `stream_id`), 50 per page by default.
 
 - `POST /admin/v1/webhooks` — create a Webhook Endpoint (`webhook_type`,
   `bot_id`, `credential`; optional `webhook_identifier`, `enabled`). The body
@@ -425,8 +461,17 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   `dead_letter_reason`, `delivery_cycle`), 50 per page by default (1–200),
   with an opaque `next_cursor`. Payloads are never returned.
 - `GET /admin/v1/dead-letters/{message_id}` — one dead letter with its
-  retained attempt history (and any `archived_cycles_summary`);
-  `404 dead_letter_not_found`.
+  retained attempt history (and any `archived_cycles_summary`) and
+  `ETag: "<delivery_cycle>:<dead_lettered_ms>"`; `404 dead_letter_not_found`.
+- `POST /admin/v1/dead-letters/{message_id}/payload` (empty body or `{}`) —
+  the stored Canonical Message, returned only after its access audit event
+  is appended in the same Lua operation; `503` discloses nothing.
+- `DELETE /admin/v1/dead-letters/{message_id}` with that `ETag` in
+  `If-Match` — permanently delete the reviewed entry (record, Canonical
+  Message, metadata, attempt history) with its audit event; `204`, also for
+  an absent entry (no audit). `428` without `If-Match`, `412` when the entry
+  was replayed or dead-lettered again since it was read, `409
+  recipient_blocked`; a `503` may be an uncertain outcome.
 - `POST /admin/v1/dead-letters/{message_id}/replay` with an optional
   `{"deduplication_conflict_resolution": "reject" | "keep_current"}`
   (default `reject`) — `200 {"status":"replayed","message_id",
@@ -456,7 +501,11 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
 Every mutation commits the state change and the audit append as one atomic
 Lua operation, logs a feature event such as `webhook_endpoint_created` or
 `delivery_replayed`, and is counted in `hookrelay_audit_events_total`
-(replays also in `hookrelay_dead_letter_replays_total{outcome}`); failed best-effort audit
+(replays also in `hookrelay_dead_letter_replays_total{outcome}`, payload views in
+`hookrelay_dlq_payload_inspections_total{outcome}`, deletions in
+`hookrelay_dead_letter_deletions_total{outcome}`, logins in
+`hookrelay_admin_login_attempts_total{outcome}`, CSRF/Origin refusals in
+`hookrelay_admin_csrf_rejections_total{reason}`); failed best-effort audit
 appends are counted in `hookrelay_audit_write_failures_total`. The full contract lives in
 [`docs/design/admin-api.md`](docs/design/admin-api.md).
 
@@ -481,7 +530,11 @@ hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 -
 hookrelay admin dlq list
 hookrelay admin dlq get --message-id <message_id>
 hookrelay admin dlq replay --message-id <message_id> [--deduplication-conflict-resolution keep_current] --yes
+hookrelay admin dlq payload --message-id <message_id>
+hookrelay admin dlq delete --message-id <message_id> --yes
 hookrelay admin message delivery-state --message-id <message_id>
+hookrelay admin operations summary
+hookrelay admin audit list [--limit 50] [--cursor <next_cursor>]
 ```
 
 - Admin URL: `--admin-url`, then `HOOKRELAY_ADMIN_URL`, then
@@ -512,7 +565,29 @@ current Delivery Cycle first; after a lost response or `5xx` it never
 retries, reads the message's delivery state once, and reports
 `desired_state_observed` when it is in a newer Delivery Cycle (queued,
 active, acknowledged, or dead-lettered again; the audit is still
-unconfirmed), otherwise `uncertain` — always exiting `1`.
+unconfirmed), otherwise `uncertain` — always exiting `1`. `dlq delete`
+reads the entry and its `ETag` first, deletes under `If-Match`, and after a
+lost response or `5xx` reads once: absence is `desired_state_observed`
+(deletion and audit unconfirmed), anything else `uncertain`. `dlq payload`
+notes on standard error that the view was audited.
+
+## Operational UI
+
+The administrative listener serves an operational panel at `/ui/` (`/`
+redirects there): plain HTML, CSS, and JavaScript modules embedded in the
+binary, with no build step ([ADR 0009](docs/adr/0009-embedded-static-operational-ui.md)).
+Log in with the Admin Secret; the panel then polls the JSON API with the
+session cookie. It shows readiness, Valkey memory, queues, leases, retries,
+blocked Recipients, the DLQ, delivery state by message, and the audit, and
+offers exactly three actions: audited payload inspection, replay (with an
+explicit `keep_current` choice after a deduplication conflict), and
+confirmed permanent deletion. After an unknown outcome it re-reads state
+and reports what it observed instead of retrying. Webhook configuration and
+block recovery stay with the API and CLI. Every page is served with a
+strict Content Security Policy (`script-src 'self'`, no inline script or
+style), and data is rendered only as text. Set `HOOKRELAY_ADMIN_ORIGIN` to
+the exact origin operators use (for example `https://admin.example:8081`);
+behind a TLS-terminating proxy that is the proxy's origin.
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
 

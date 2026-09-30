@@ -1,6 +1,6 @@
 # Milestone 4 — browser sessions, operational UI, audit views, and the remaining DLQ operations
 
-Status: ready-for-agent
+Status: done
 
 Specification source of truth: `CONTEXT.md`, `docs/design/*`, `docs/adr/*`, and the implemented contracts in `.scratch/milestone-1/spec.md`, `.scratch/milestone-2/spec.md`, and `.scratch/milestone-3/spec.md`. This spec fixes the Milestone 4 storage encodings, Lua script contracts, session and CSRF behavior, and the M4 subsets of the Admin API and CLI before any of it is coded (`docs/design/implementation-milestones.md`). Domain vocabulary follows `CONTEXT.md`.
 
@@ -67,7 +67,7 @@ If an `Authorization` header is present, only Bearer is evaluated (no cookie fal
 }
 ```
 
-`not_found` → `404 dead_letter_not_found`; `message_missing` and `wrong_type` → `503 dependency_unavailable` with an error log; any script error or lost reply → `503` and no payload. Feature event `dead_letter_payload_viewed` (message ID, actor, Recipient scope — never payload). Metric `hookrelay_dead_letter_payload_views_total{outcome}` (`disclosed`, `not_found`, `unavailable`). Payload inspection does not consult Recipient blocks.
+`not_found` → `404 dead_letter_not_found`; `message_missing` and `wrong_type` → `503 dependency_unavailable` with an error log; any script error or lost reply → `503` and no payload. Feature event `dead_letter_payload_viewed` (message ID, actor, Recipient scope — never payload). Metric `hookrelay_dlq_payload_inspections_total{outcome}` (`disclosed`, `not_found`, `unavailable`). Payload inspection does not consult Recipient blocks.
 
 ### DLQ permanent deletion
 
