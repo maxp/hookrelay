@@ -18,6 +18,9 @@ import (
 // --- fakes ------------------------------------------------------------------
 
 type fakeRepo struct {
+	// listings back ListEndpoints, already in index order.
+	listings      []EndpointListing
+	listCalls     []listEndpointsCall
 	endpoints     map[string]*Endpoint
 	createCalls   int
 	failWrongType bool
@@ -60,6 +63,25 @@ func (f *fakeRepo) GetEndpoint(_ context.Context, webhookType, identifier string
 		return &stored, nil
 	}
 	return nil, nil
+}
+
+type listEndpointsCall struct {
+	limit int
+	after *EndpointCursor
+}
+
+func (f *fakeRepo) ListEndpoints(_ context.Context, limit int, after *EndpointCursor) ([]EndpointListing, error) {
+	f.listCalls = append(f.listCalls, listEndpointsCall{limit, after})
+	var out []EndpointListing
+	for _, l := range f.listings {
+		if after != nil && (l.CreatedMs > after.CreatedMs || l.CreatedMs == after.CreatedMs && l.Member >= after.ID) {
+			continue
+		}
+		if len(out) < limit {
+			out = append(out, l)
+		}
+	}
+	return out, nil
 }
 
 type fakeCatalog struct{}

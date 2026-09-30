@@ -374,6 +374,9 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   return `409`. A `503` whose message says the outcome is uncertain means the
   create may have been applied: read the endpoint and the audit before
   retrying.
+- `GET /admin/v1/webhooks?limit&cursor` — every endpoint's safe metadata,
+  newest first, 50 per page by default (1–200), with an opaque
+  `next_cursor`; `400 invalid_cursor` for a malformed cursor.
 - `GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` — read the
   endpoint metadata with its `ETag`; a missing endpoint returns `404`.
 - `GET /admin/v1/recipient-states?status=ready|leased|retry_wait|blocked&limit&cursor`
@@ -440,6 +443,7 @@ Valkey directly.
 export HOOKRELAY_ADMIN_SECRET_FILE=.secrets/admin
 hookrelay admin webhook create --type telegram --bot-id 123456 --credential-file telegram-secret
 hookrelay admin webhook get --type telegram --identifier wh_...
+hookrelay admin webhook list [--limit 50] [--cursor <next_cursor>]
 hookrelay admin recipients list --status blocked
 hookrelay admin recipients inspect-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100
 hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100 \

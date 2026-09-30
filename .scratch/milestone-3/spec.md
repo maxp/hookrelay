@@ -76,8 +76,8 @@ Keys unchanged: `hr1:wh:<type>:<identifier>` Hash, `hr1:bot:<platform>:<bot_id>:
 
 ### CLI
 
-- `hookrelay admin webhook list [--limit N] [--cursor C] [--all]` — `--all` follows cursors; table or JSON.
-- `hookrelay admin webhook enable|disable|delete --type T --id I --yes` — `--yes` is required (as for `dlq replay`); the command GETs the endpoint and its `ETag`, then sends the mutation with `If-Match`. `412` is reported and not retried. `delete` of an enabled endpoint reports the `409` and suggests `disable` first.
+- `hookrelay admin webhook list [--limit N] [--cursor C]` — one page, `next_cursor` printed like `dlq list`; table or JSON.
+- `hookrelay admin webhook enable|disable|delete --type T --identifier I --yes` — `--yes` is required (as for `dlq replay`); the command GETs the endpoint and its `ETag`, then sends the mutation with `If-Match`. `412` is reported and not retried. `delete` of an enabled endpoint reports the `409` and suggests `disable` first.
 - Lost response (transport error or `5xx`): re-read the endpoint. Enable/disable: same `generation_id`, desired `enabled`, and `config_version` greater than the read one → "desired state observed" warning that mutation and audit are unconfirmed; otherwise uncertain outcome. Delete: `404` → "absence observed" with the same caveat; otherwise uncertain. Exit codes follow the existing CLI convention.
 - `hookrelay admin bot webhooks --platform P --bot-id B`.
 

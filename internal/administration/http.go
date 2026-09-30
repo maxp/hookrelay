@@ -32,6 +32,7 @@ func requestIDFrom(ctx context.Context) string {
 func Handler(svc *Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /admin/v1/webhooks", svc.auth(http.HandlerFunc(svc.handleCreate)))
+	mux.Handle("GET /admin/v1/webhooks", svc.auth(http.HandlerFunc(svc.handleListWebhooks)))
 	mux.Handle("GET /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handleGet)))
 	if svc.recipients != nil {
 		mux.Handle("GET /admin/v1/recipient-states", svc.auth(http.HandlerFunc(svc.handleListRecipientStates)))
@@ -127,8 +128,19 @@ func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 
 // writeEndpoint writes the entity ETag and the safe endpoint representation.
 func writeEndpoint(w http.ResponseWriter, status int, view EndpointView) {
-	w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprintf("%s:%d", view.GenerationID, view.ConfigVersion)))
-	writeJSON(w, status, endpointResponse{
+	w.Header().Set("ETag", entityTag(view))
+	writeJSON(w, status, endpointBody(view))
+}
+
+// entityTag is the strong ETag "<generation_id>:<config_version>".
+func entityTag(view EndpointView) string {
+	return fmt.Sprintf("%q", fmt.Sprintf("%s:%d", view.GenerationID, view.ConfigVersion))
+}
+
+// endpointBody is the safe endpoint representation: never the credential
+// value, Valkey keys, or the public scheme and host.
+func endpointBody(view EndpointView) endpointResponse {
+	return endpointResponse{
 		WebhookType:       view.Type,
 		WebhookIdentifier: view.Identifier,
 		BotPlatform:       view.BotPlatform,
@@ -140,7 +152,7 @@ func writeEndpoint(w http.ResponseWriter, status int, view EndpointView) {
 		CreatedMs:         view.CreatedMs,
 		UpdatedMs:         view.UpdatedMs,
 		WebhookPath:       fmt.Sprintf("/webhook/%s/%s", view.Type, view.Identifier),
-	})
+	}
 }
 
 // CreateRequest is the strict create body. Unknown fields are rejected.

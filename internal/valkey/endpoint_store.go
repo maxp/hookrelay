@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/valkey-io/valkey-go"
+
 	"github.com/maxp/hookrelay/internal/administration"
 )
 
@@ -123,9 +125,19 @@ func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier strin
 	if len(fields) == 0 {
 		return nil, nil
 	}
+	return parseEndpoint(webhookType, identifier, fields)
+}
+
+// errMalformedEndpoint reports an endpoint Hash with a missing or
+// unparsable field.
+var errMalformedEndpoint = errors.New("valkey: malformed endpoint record")
+
+// parseEndpoint maps the fields of a non-empty endpoint Hash.
+func parseEndpoint(webhookType, identifier string, fields map[string]string) (_ *Endpoint, err error) {
+	key := "hr1:wh:" + webhookType + ":" + identifier
 	for _, required := range []string{"bot_id", "enabled", "credential_kind", "credential_value", "generation_id"} {
 		if fields[required] == "" {
-			return nil, fmt.Errorf("valkey: %s: missing field %s", key, required)
+			return nil, fmt.Errorf("%w: %s: missing field %s", errMalformedEndpoint, key, required)
 		}
 	}
 	e := &Endpoint{
@@ -138,13 +150,13 @@ func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier strin
 		GenerationID:    fields["generation_id"],
 	}
 	if e.ConfigVersion, err = strconv.ParseInt(fields["config_version"], 10, 64); err != nil {
-		return nil, fmt.Errorf("valkey: %s config_version: %w", key, err)
+		return nil, fmt.Errorf("%w: %s config_version: %w", errMalformedEndpoint, key, err)
 	}
 	if e.CreatedMs, err = strconv.ParseInt(fields["created_ms"], 10, 64); err != nil {
-		return nil, fmt.Errorf("valkey: %s created_ms: %w", key, err)
+		return nil, fmt.Errorf("%w: %s created_ms: %w", errMalformedEndpoint, key, err)
 	}
 	if e.UpdatedMs, err = strconv.ParseInt(fields["updated_ms"], 10, 64); err != nil {
-		return nil, fmt.Errorf("valkey: %s updated_ms: %w", key, err)
+		return nil, fmt.Errorf("%w: %s updated_ms: %w", errMalformedEndpoint, key, err)
 	}
 	return e, nil
 }
@@ -231,6 +243,84 @@ func (s *endpointStore) GetEndpoint(ctx context.Context, webhookType, identifier
 	if e == nil {
 		return nil, nil
 	}
+	return adminEndpoint(e), nil
+}
+
+// ListEndpoints pages hr1:webhooks in descending (score, member) order and
+// reads every member's Hash in one pipelined round trip.
+func (s *endpointStore) ListEndpoints(ctx context.Context, limit int, after *administration.EndpointCursor) (_ []administration.EndpointListing, err error) {
+	start := time.Now()
+	defer func() { s.a.metrics.observe("endpoint_read", start, err) }()
+	c := s.a.client
+	from := "+inf"
+	if after != nil {
+		from = strconv.FormatInt(after.CreatedMs, 10)
+	}
+	var out []administration.EndpointListing
+	// Members sharing the cursor score are skipped down to the cursor
+	// member; read further pages until the limit is filled or the index ends.
+	for offset := int64(0); len(out) < limit; {
+		page, err := c.Do(ctx, c.B().Zrange().Key("hr1:webhooks").Min(from).Max("-inf").Byscore().Rev().Limit(offset, int64(limit)).Withscores().Build()).AsZScores()
+		if err != nil {
+			return nil, err
+		}
+		for _, z := range page {
+			sc := int64(z.Score)
+			if after != nil && sc == after.CreatedMs && z.Member >= after.ID {
+				continue
+			}
+			if len(out) < limit {
+				out = append(out, administration.EndpointListing{Member: z.Member, CreatedMs: sc})
+			}
+		}
+		if len(page) < limit {
+			break
+		}
+		offset += int64(len(page))
+	}
+	return out, s.readListings(ctx, out)
+}
+
+// readListings fills each listing with its endpoint record or an orphan
+// reason. Only a transport failure is an error.
+func (s *endpointStore) readListings(ctx context.Context, items []administration.EndpointListing) error {
+	if len(items) == 0 {
+		return nil
+	}
+	c := s.a.client
+	cmds := make(valkey.Commands, len(items))
+	for i, it := range items {
+		cmds[i] = c.B().Hgetall().Key("hr1:wh:" + it.Member).Build()
+	}
+	for i, r := range c.DoMulti(ctx, cmds...) {
+		fields, err := r.AsStrMap()
+		switch {
+		case isWrongType(err):
+			items[i].Orphan = administration.OrphanWrongType
+			continue
+		case err != nil:
+			return err
+		case len(fields) == 0:
+			items[i].Orphan = administration.OrphanMissing
+			continue
+		}
+		webhookType, identifier, ok := strings.Cut(items[i].Member, ":")
+		if !ok {
+			items[i].Orphan = administration.OrphanMalformed
+			continue
+		}
+		e, err := parseEndpoint(webhookType, identifier, fields)
+		if err != nil {
+			items[i].Orphan = administration.OrphanMalformed
+			continue
+		}
+		items[i].Endpoint = adminEndpoint(e)
+	}
+	return nil
+}
+
+// adminEndpoint maps a stored record to the administration model.
+func adminEndpoint(e *Endpoint) *administration.Endpoint {
 	return &administration.Endpoint{
 		Type:            e.Type,
 		Identifier:      e.Identifier,
@@ -243,7 +333,7 @@ func (s *endpointStore) GetEndpoint(ctx context.Context, webhookType, identifier
 		CreatedMs:       e.CreatedMs,
 		UpdatedMs:       e.UpdatedMs,
 		ConfigVersion:   e.ConfigVersion,
-	}, nil
+	}
 }
 
 type auditSink struct{ a *Adapter }

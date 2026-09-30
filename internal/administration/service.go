@@ -19,7 +19,33 @@ import (
 type EndpointRepository interface {
 	CreateEndpoint(ctx context.Context, e Endpoint, eventID, operation, requestID string) (createdMs, updatedMs int64, result CreateEndpointResult)
 	GetEndpoint(ctx context.Context, webhookType, identifier string) (*Endpoint, error)
+	// ListEndpoints pages the global listing newest first (descending
+	// created_ms, then descending member), strictly after the cursor.
+	ListEndpoints(ctx context.Context, limit int, after *EndpointCursor) ([]EndpointListing, error)
 }
+
+// EndpointCursor is the position after the last listed endpoint.
+type EndpointCursor struct {
+	CreatedMs int64  `json:"created_ms"`
+	ID        string `json:"id"` // <webhook_type>:<webhook_identifier>
+}
+
+// EndpointListing is one listing-index member with its record. A member
+// whose record is missing, of the wrong type, or malformed carries the
+// Orphan reason and no Endpoint; listings skip it and the cursor advances.
+type EndpointListing struct {
+	Member    string
+	CreatedMs int64
+	Endpoint  *Endpoint
+	Orphan    string
+}
+
+// Orphan reasons of an EndpointListing.
+const (
+	OrphanMissing   = "missing"
+	OrphanWrongType = "wrong_type"
+	OrphanMalformed = "malformed"
+)
 
 // Endpoint mirrors the stored record without importing the adapter package.
 type Endpoint struct {
