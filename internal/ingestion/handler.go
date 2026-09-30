@@ -22,6 +22,7 @@ import (
 	"github.com/maxp/hookrelay/internal/gen"
 	"github.com/maxp/hookrelay/internal/model"
 	"github.com/maxp/hookrelay/internal/observability"
+	"github.com/maxp/hookrelay/internal/ratelimit"
 )
 
 // RoutePrefix is the webhook route prefix on the public listener.
@@ -86,7 +87,7 @@ type Handler struct {
 	log      *slog.Logger
 	metrics  *metrics
 	inflight chan struct{}
-	limiter  *rateLimiter
+	limiter  *ratelimit.Limiter
 	// memoryStopped is the last evaluated memory stop condition.
 	memoryStopped atomic.Bool
 }
@@ -183,7 +184,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, req *request) Ou
 	req.endpoint = endpoint
 
 	// Rate limits: checked before the in-flight slot and the body read.
-	if ok, retryAfter := h.limiter.allow(req.webhookType+":"+req.identifier, h.d.Clock.Now()); !ok {
+	if ok, retryAfter := h.limiter.Allow(req.webhookType+":"+req.identifier, h.d.Clock.Now()); !ok {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		return h.reject(w, req, OutcomeRateLimited)
 	}
