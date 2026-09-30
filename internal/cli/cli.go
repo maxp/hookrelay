@@ -307,6 +307,7 @@ func Serve(args []string) int {
 		report, err := adapter.ReconcileAndProcessDue(ctx, valkey.ReconcileOptions{
 			Full:              full,
 			MessageCheckBound: cfg.MaxQueuedMessagesPerRecipient,
+			DedupRetention:    cfg.DedupRetention,
 			Logger:            log,
 			AdminSecret:       adminSecret,
 		}, maintenance.ProcessDue)

@@ -39,6 +39,14 @@ func init() {
 		"must_be_disabled":      0,
 		"wrong_type":            0,
 	})
+	register("reconcile_endpoint_v1", 1, map[string]int{
+		"consistent":     0,
+		"repaired":       2, // bot_membership_repaired, listing_repair
+		"orphan_removed": 1, // reason
+		"invalid":        1, // reason
+		"wrong_type":     1, // reason
+		"absent":         0,
+	})
 	register("accept_v3", 3, map[string]int{
 		"accepted":           2, // accepted_ms, early_evicted
 		"duplicate":          1, // original message_id
@@ -143,6 +151,26 @@ func init() {
 		"due_lease":       3,
 		"due_retry":       3,
 		"unhandled":       3,
+	})
+	register("reconcile_attempt_v1", 1, map[string]int{
+		"consistent":      0,
+		"repaired":        0,
+		"not_leased":      0,
+		"already_blocked": 0,
+		"blocked":         1, // detailed reason
+		"legacy":          0,
+		"changed":         0,
+		"wrong_type":      1, // reason
+	})
+	register("reconcile_message_v1", 1, map[string]int{
+		"consistent":      1, // lifecycle
+		"legacy":          1, // lifecycle
+		"already_blocked": 1, // lifecycle
+		"blocked":         1, // reason
+		"orphan_records":  2, // metadata_present, history_present
+		"removed_orphans": 1, // removed_count
+		"inconsistent":    1, // reason
+		"wrong_type":      1, // reason
 	})
 	register("replay_dlq_v3", 3, map[string]int{
 		// delivery_cycle, queue_position, replayed_ms,

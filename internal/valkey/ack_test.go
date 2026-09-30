@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/maxp/hookrelay/internal/delivery"
+	"github.com/maxp/hookrelay/internal/model"
 )
 
 func ackReq(token string) delivery.AckRequest {
@@ -28,9 +30,19 @@ func exists(t *testing.T, a *Adapter, key string) bool {
 // received_ms.
 func enqueueJSON(t *testing.T, a *Adapter, messageID, rid string) {
 	t.Helper()
+	recipient, err := model.ParseIdentity(rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := (model.CanonicalMessage{
+		MessageID: messageID, ReceivedMs: 1740000000123, Recipient: recipient,
+		PlatformEventType: "test", Payload: json.RawMessage(`{"n":12345678901234567890}`),
+	}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
 	r := acceptReq(messageID, "d-"+messageID, "b-"+messageID)
-	r.RecipientIdentity = rid
-	r.MessageJSON = []byte(`{"message_id":"` + messageID + `","received_ms":1740000000123,"payload":{"n":12345678901234567890}}`)
+	r.RecipientIdentity, r.MessageJSON = rid, blob
 	NewMessageAcceptor(a, testLimits()).Accept(context.Background(), r)
 }
 

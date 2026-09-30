@@ -2,11 +2,14 @@ package valkey
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/maxp/hookrelay/internal/gen"
 	"github.com/maxp/hookrelay/internal/observability"
@@ -21,8 +24,11 @@ type ReconcileOptions struct {
 	// MessageCheckBound is how many queued messages per Recipient must have
 	// a stored blob (the per-recipient queue limit).
 	MessageCheckBound int
-	// BatchSize bounds SCAN/ZSCAN pages and dedup script batches.
+	// BatchSize bounds SCAN/ZSCAN pages and script batches.
 	BatchSize int
+	// DedupRetention bounds validation of live dedup records referenced by
+	// message metadata. Zero uses the accepted default of seven days.
+	DedupRetention time.Duration
 	// Gen supplies audit event identifiers (gen.Crypto when nil).
 	Gen gen.Gen
 	// Logger receives best-effort stdout copies of reconciliation audit events.
@@ -41,8 +47,12 @@ type ReconcileReport struct {
 	// dedup_skipped, dlq_orphans_removed, dlq_restored, dlq_invalid,
 	// dlq_message_missing, counter_repaired, counter_unverified,
 	// admin_auth_initialized, admin_auth_rotated, session_orphans_removed,
-	// sessions_removed, session_index_restored, and (from
-	// ReconcileAndProcessDue) due_leases_processed, due_retries_processed.
+	// sessions_removed, session_index_restored, endpoint_index_removed,
+	// endpoint_bot_restored, endpoint_listing_restored,
+	// endpoint_listing_score_repaired, endpoint_invalid,
+	// active_attempt_repaired, active_attempt_legacy,
+	// active_attempt_<detailed_reason>, and (from ReconcileAndProcessDue)
+	// due_leases_processed, due_retries_processed.
 	Findings map[string]int
 	// BlockReasons counts newly created markers by bounded reason.
 	BlockReasons map[string]int
@@ -64,18 +74,20 @@ const maxMissingSample = 100
 // readiness.
 func (r ReconcileReport) Hold() string {
 	switch {
+	case r.Findings["endpoint_invalid"] > 0:
+		return "webhook_endpoint_inconsistent"
+	case r.Findings["dlq_message_missing"] > 0:
+		return "dead_letter_message_missing"
+	case r.Findings["message_lifecycle_inconsistent"] > 0:
+		return "message_lifecycle_inconsistent"
 	case r.Findings["unhandled"] > 0:
 		return "unhandled_inconsistency"
-	case r.Findings["dlq_message_missing"] > 0:
-		// Not isolatable behind a Recipient block: clearing a block cannot
-		// certify DLQ integrity.
-		return "dead_letter_message_missing"
 	}
 	return ""
 }
 
-// Reconcile validates every persisted delivery structure in bounded
-// batches, repairs derived indexes and counters, isolates ambiguous
+// Reconcile validates persisted administration and delivery structures in
+// bounded batches, repairs derived indexes and counters, isolates ambiguous
 // Recipient state behind block markers, and reports due leases and retries
 // for the caller to execute. It never uses KEYS.
 func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (ReconcileReport, error) {
@@ -84,6 +96,9 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 	}
 	if opts.MessageCheckBound <= 0 {
 		opts.MessageCheckBound = 1000
+	}
+	if opts.DedupRetention <= 0 {
+		opts.DedupRetention = 168 * time.Hour
 	}
 	if opts.Gen == nil {
 		opts.Gen = gen.Crypto{}
@@ -116,10 +131,11 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 	if err := a.reconcileSessions(ctx, opts, &rep); err != nil {
 		return rep, fmt.Errorf("valkey: administrative sessions: %w", err)
 	}
-	// Scan administrative records at startup and after loss of readiness, not
-	// on every one-second connectivity probe while the service is healthy.
-	if err := a.checkAdminRecords(ctx); err != nil {
-		return rep, fmt.Errorf("valkey: administrative structure: %w", err)
+	// Reconcile Webhook Endpoint derived indexes before validating the
+	// authoritative records. Reverse cleanup runs before restoration so stale
+	// members do not create a false Bot Identity capacity hold.
+	if err := a.reconcileEndpoints(ctx, opts, &rep); err != nil {
+		return rep, fmt.Errorf("valkey: webhook endpoints: %w", err)
 	}
 
 	observedCounter := ""
@@ -133,6 +149,7 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 
 	// Recipients from every structure that can name one.
 	seen := map[string]struct{}{}
+	isolatedRecipients := map[string]bool{}
 	total, countable := int64(0), true
 	visit := func(rid string) error {
 		if rid == "" {
@@ -142,9 +159,21 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 			return nil
 		}
 		seen[rid] = struct{}{}
-		n, err := a.reconcileRecipient(ctx, opts.Gen, opts.Logger, rid, opts.MessageCheckBound, &rep)
+		n, status, err := a.reconcileRecipient(ctx, opts.Gen, opts.Logger, rid, opts.MessageCheckBound, &rep)
 		if err != nil {
 			return err
+		}
+		if status == "blocked" || status == "already_blocked" || status == "unhandled" {
+			isolatedRecipients[rid] = true
+			// The Recipient scan may be reached again from another derived
+			// source after creating a marker; keep the original incident state.
+		} else if _, blocked := isolatedRecipients[rid]; blocked {
+			isolatedRecipients[rid] = true
+		}
+		if (status == "consistent" || status == "repaired") && a.recipientHasNonDueLease(ctx, rid) {
+			if err := a.reconcileAttempt(ctx, opts.Gen, opts.Logger, rid, &rep); err != nil {
+				return err
+			}
 		}
 		if n < 0 {
 			countable = false
@@ -259,6 +288,16 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 		}
 	}
 
+	// Complete message lifecycle validation runs after the existing DLQ pass,
+	// so already-reported dead-letter corruption is not double-counted. If
+	// Recipient reconciliation already found unhandled structural state, its
+	// incident remains authoritative and message scanning cannot locate safely.
+	if rep.Findings["unhandled"] == 0 {
+		if err := a.reconcileMessages(ctx, opts, isolatedRecipients, dlReported, &rep); err != nil {
+			return rep, fmt.Errorf("valkey: message lifecycle: %w", err)
+		}
+	}
+
 	// The queued-message counter, on the full pass only.
 	if opts.Full {
 		if !countable || rep.Findings["unhandled"] > 0 {
@@ -285,7 +324,8 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 // rather than work it did; a verifying pass replaces them instead of adding.
 var stateFindings = []string{
 	"unhandled", "already_blocked", "due_lease", "due_retry", "dedup_skipped",
-	"dlq_invalid", "dlq_message_missing", "counter_unverified",
+	"dlq_invalid", "dlq_message_missing", "counter_unverified", "endpoint_invalid",
+	"active_attempt_legacy", "message_lifecycle_inconsistent", "message_legacy",
 }
 
 // ReconcileAndProcessDue is the startup and recovery composition: one pass,
@@ -336,19 +376,19 @@ func (a *Adapter) ReconcileAndProcessDue(ctx context.Context, opts ReconcileOpti
 }
 
 // reconcileRecipient runs reconcile_recipient_v3 and returns the counted
-// queue length (-1 when uncountable).
-func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, log *slog.Logger, rid string, bound int, rep *ReconcileReport) (int64, error) {
+// queue length (-1 when uncountable) and its bounded status.
+func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, log *slog.Logger, rid string, bound int, rep *ReconcileReport) (int64, string, error) {
 	res, err := a.RunScript(ctx, "reconcile_recipient_v3",
 		[]string{"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:retries"},
 		[]string{rid, strconv.Itoa(bound), "hr1"})
 	if err != nil {
-		return 0, fmt.Errorf("valkey: reconcile recipient: %w", err)
+		return 0, "", fmt.Errorf("valkey: reconcile recipient: %w", err)
 	}
 	repairs, err1 := res.Fields[0].AsInt64()
 	length, err2 := res.Fields[1].AsInt64()
 	reason, err3 := res.Fields[2].ToString()
 	if err1 != nil || err2 != nil || err3 != nil {
-		return 0, fmt.Errorf("valkey: reconcile recipient: result shape")
+		return 0, "", fmt.Errorf("valkey: reconcile recipient: result shape")
 	}
 	switch res.Status {
 	case "consistent":
@@ -374,7 +414,262 @@ func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, log *slog.L
 			a.auditRepair(ctx, g, log, "reconciliation_repair", rid, res.Status)
 		}
 	}
-	return length, nil
+	return length, res.Status, nil
+}
+
+// recipientHasNonDueLease is a cheap post-reconcile guard. The script remains
+// authoritative and returns not_leased/changed if the state changes before it
+// executes; this read only avoids inspecting ready and retry-wait Recipients.
+func (a *Adapter) recipientHasNonDueLease(ctx context.Context, rid string) bool {
+	status, err1 := a.client.Do(ctx, a.client.B().Hget().Key("hr1:r:"+rid+":s").Field("status").Build()).ToString()
+	deadline, err2 := a.client.Do(ctx, a.client.B().Hget().Key("hr1:r:"+rid+":s").Field("lease_expires_ms").Build()).AsInt64()
+	if err1 != nil || err2 != nil || status != "leased" {
+		return false
+	}
+	now, err := a.serverTimeMs(ctx)
+	return err == nil && deadline > now
+}
+
+// reconcileAttempt validates the secret-bearing active Delivery Attempt
+// cross-links without logging or auditing a token. A plaintext-token/digest
+// mismatch is detected in Go because Valkey Lua has no SHA-256 implementation;
+// the block-mode script fences and performs only the atomic isolation write.
+func (a *Adapter) reconcileAttempt(ctx context.Context, g gen.Gen, log *slog.Logger, rid string, rep *ReconcileReport) error {
+	stateKey := "hr1:r:" + rid + ":s"
+	for read := 0; read < 2; read++ {
+		values, err := a.client.Do(ctx, a.client.B().Hmget().Key(stateKey).Field("status", "delivery_token", "delivery_token_digest").Build()).ToArray()
+		if err != nil {
+			if isWrongType(err) || isNil(err) {
+				return nil // reconcile_attempt_v1 classifies the persisted structure
+			}
+			return fmt.Errorf("valkey: reconcile attempt state: %w", err)
+		}
+		toString := func(i int) string {
+			if i >= len(values) {
+				return ""
+			}
+			v, e := values[i].ToString()
+			if e != nil {
+				return ""
+			}
+			return v
+		}
+		if toString(0) != "leased" {
+			return nil
+		}
+		token, digest := toString(1), toString(2)
+		mode, expected, detail := "verify", digest, ""
+		validDigest := len(digest) == 64
+		for i := 0; validDigest && i < len(digest); i++ {
+			validDigest = digest[i] >= '0' && digest[i] <= '9' || digest[i] >= 'a' && digest[i] <= 'f'
+		}
+		if digest != "" && token != "" {
+			sum := sha256.Sum256([]byte(token))
+			computed := hex.EncodeToString(sum[:])
+			if validDigest && computed != digest {
+				mode, expected, detail = "block", "", "token_digest_mismatch"
+			} else if !validDigest {
+				// Fence with a syntactically valid digest so Lua can classify the
+				// persisted malformed digest as active_attempt_state.
+				expected = computed
+			}
+		}
+		res, err := a.RunScript(ctx, "reconcile_attempt_v1",
+			[]string{"hr1:ready", "hr1:leases", "hr1:retries", "hr1:blocked"},
+			[]string{mode, rid, expected, detail, strconv.FormatInt(ClaimOpTTL.Milliseconds(), 10), "hr1"})
+		if err != nil {
+			return fmt.Errorf("valkey: reconcile attempt: %w", err)
+		}
+		switch res.Status {
+		case "consistent", "not_leased":
+			return nil
+		case "changed":
+			continue // one fenced reread; a second change waits for the next pass
+		case "legacy":
+			rep.Findings["active_attempt_legacy"]++
+			return nil
+		case "repaired":
+			rep.Findings["active_attempt_repaired"]++
+			a.auditRepair(ctx, g, log, "reconciliation_repair", rid, "active_attempt_lease_index_repaired")
+			return nil
+		case "already_blocked":
+			rep.Findings["already_blocked"]++
+			return nil
+		case "blocked":
+			reason, e := res.Fields[0].ToString()
+			if e != nil {
+				return fmt.Errorf("valkey: reconcile attempt: result shape")
+			}
+			rep.Findings["blocked"]++
+			rep.Findings["active_attempt_"+reason]++
+			rep.BlockReasons["active_attempt_inconsistent"]++
+			if log != nil {
+				observability.LogEvent(log, slog.LevelError, "active_attempt_inconsistent",
+					"Recipient isolated because its active Delivery Attempt records disagree",
+					"recipient_identity", rid, "reason_code", reason, "error_code", "internal_error")
+			}
+			a.auditRepair(ctx, g, log, "recipient_blocked", rid, "active_attempt_inconsistent")
+			return nil
+		case "wrong_type":
+			rep.Findings["unhandled"]++
+			return nil
+		default:
+			return fmt.Errorf("valkey: reconcile attempt: unexpected result %q", res.Status)
+		}
+	}
+	return nil
+}
+
+// reconcileMessages discovers message IDs from every first-version lifecycle
+// family, then validates each ID once. Queue discovery supplies the only safe
+// Recipient locator; IDs found from blobs/metadata/history/DLQ/success remain
+// unlocatable unless also present in a queue.
+func (a *Adapter) reconcileMessages(ctx context.Context, opts ReconcileOptions, isolatedRecipients, dlReported map[string]bool, rep *ReconcileReport) error {
+	type locator struct {
+		rid      string
+		position string
+	}
+	ids := map[string]locator{}
+	add := func(id string) {
+		if id != "" {
+			if _, exists := ids[id]; !exists {
+				ids[id] = locator{position: "none"}
+			}
+		}
+	}
+	if err := a.scanKeys(ctx, "hr1:r:*:q", opts.BatchSize, func(key string) error {
+		rest := strings.TrimSuffix(strings.TrimPrefix(key, "hr1:r:"), ":q")
+		if rest == "" {
+			return nil
+		}
+		t, err := a.keyType(ctx, key)
+		if err != nil {
+			return err
+		}
+		if t != "list" {
+			return nil // recipient reconciliation owns this incompatibility
+		}
+		var offset int64
+		for {
+			page, err := a.client.Do(ctx, a.client.B().Lrange().Key(key).Start(offset).Stop(offset+int64(opts.BatchSize)-1).Build()).AsStrSlice()
+			if err != nil {
+				return err
+			}
+			for i, id := range page {
+				position := "behind_head"
+				if offset+int64(i) == 0 {
+					position = "head"
+				}
+				if previous, exists := ids[id]; exists && previous.rid != "" && previous.rid != rest {
+					ids[id] = locator{position: "none"} // duplicated across queues: no safe owner
+				} else {
+					ids[id] = locator{rid: rest, position: position}
+				}
+			}
+			if len(page) < opts.BatchSize {
+				break
+			}
+			offset += int64(len(page))
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, prefix := range []string{"hr1:m:", "hr1:mi:", "hr1:a:", "hr1:dl:", "hr1:success:"} {
+		if err := a.scanKeys(ctx, prefix+"*", opts.BatchSize, func(key string) error {
+			add(strings.TrimPrefix(key, prefix))
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	for id, loc := range ids {
+		if dlReported[id] || isolatedRecipients[loc.rid] {
+			continue
+		}
+		if loc.rid == "" && rep.Findings["blocked"] > 0 {
+			// A blob may have lost its queue locator because recipient
+			// reconciliation just isolated a wrong-typed/missing queue. Do not
+			// turn that same queue-local incident into a global orphan hold.
+			continue
+		}
+		// A valid marker already isolates queue-local residue; recipient
+		// reconciliation owns that incident. Malformed markers still flow into
+		// reconcile_message_v1 and hold readiness as marker_invalid.
+		if loc.rid != "" {
+			markerKey := "hr1:q:" + loc.rid
+			if t, _ := a.keyType(ctx, markerKey); t == "hash" {
+				detected, e1 := a.client.Do(ctx, a.client.B().Hget().Key(markerKey).Field("detected_ms").Build()).AsInt64()
+				reason, e2 := a.client.Do(ctx, a.client.B().Hget().Key(markerKey).Field("reason_code").Build()).ToString()
+				if e1 == nil && detected > 0 && e2 == nil && reason != "" {
+					continue
+				}
+			}
+		}
+		res, err := a.RunScript(ctx, "reconcile_message_v1",
+			[]string{"hr1:ready", "hr1:leases", "hr1:retries", "hr1:blocked"},
+			[]string{"inspect", id, loc.rid, loc.position, strconv.FormatInt(opts.DedupRetention.Milliseconds(), 10), "hr1"})
+		if err != nil {
+			return err
+		}
+		reason := func() (string, error) {
+			if len(res.Fields) == 0 {
+				return "", fmt.Errorf("valkey: reconcile message: result shape")
+			}
+			return res.Fields[0].ToString()
+		}
+		switch res.Status {
+		case "consistent", "legacy":
+			// Accepted pre-M2 compatibility is observable through the script
+			// status but is not itself a consistency issue.
+		case "already_blocked":
+			// Recipient reconciliation already counted the existing marker.
+		case "blocked":
+			detail, e := reason()
+			if e != nil {
+				return e
+			}
+			rep.Findings["blocked"]++
+			rep.Findings["message_lifecycle_"+detail]++
+			rep.BlockReasons["message_lifecycle_inconsistent"]++
+			a.auditRepair(ctx, opts.Gen, opts.Logger, "recipient_blocked", loc.rid, "message_lifecycle_inconsistent")
+		case "orphan_records":
+			removed, err := a.RunScript(ctx, "reconcile_message_v1",
+				[]string{"hr1:ready", "hr1:leases", "hr1:retries", "hr1:blocked"},
+				[]string{"delete_orphans", id, "", "none", strconv.FormatInt(opts.DedupRetention.Milliseconds(), 10), "hr1"})
+			if err != nil {
+				return err
+			}
+			if removed.Status == "removed_orphans" {
+				n, e := removed.Fields[0].AsInt64()
+				if e != nil {
+					return fmt.Errorf("valkey: reconcile message: result shape")
+				}
+				rep.Findings["message_orphans_removed"] += int(n)
+				a.auditRepair(ctx, opts.Gen, opts.Logger, "reconciliation_repair", id, "message_orphan_records_removed")
+			} else if removed.Status != "consistent" {
+				rep.Findings["message_lifecycle_inconsistent"]++
+				rep.Findings["unhandled"]++
+			}
+		case "inconsistent", "wrong_type":
+			detail, e := reason()
+			if e != nil {
+				return e
+			}
+			rep.Findings["message_lifecycle_inconsistent"]++
+			rep.Findings["message_lifecycle_"+detail]++
+			rep.Findings["unhandled"]++
+			if opts.Logger != nil {
+				observability.LogEvent(opts.Logger, slog.LevelError, "message_lifecycle_inconsistent",
+					"message lifecycle could not be reconciled", "message_id", id,
+					"reason_code", detail, "error_code", "internal_error")
+			}
+		default:
+			return fmt.Errorf("valkey: reconcile message: unexpected result %q", res.Status)
+		}
+	}
+	return nil
 }
 
 func (a *Adapter) reconcileDedup(ctx context.Context, digests []string, rep *ReconcileReport) error {
@@ -551,16 +846,39 @@ func (r ReconcileReport) ConsistencyIssues() []ConsistencyIssue {
 		}
 	}
 	add("derived_index_drift", "repaired", f["repaired"])
+	add("active_attempt_lease_index_drift", "repaired", f["active_attempt_repaired"])
+	add("active_attempt_legacy", "kept", f["active_attempt_legacy"])
+	add("message_legacy", "kept", f["message_legacy"])
+	add("message_orphan_records", "removed", f["message_orphans_removed"])
+	for _, reason := range []string{
+		"message_invalid", "message_orphan", "message_missing", "metadata_invalid", "history_invalid",
+		"pending_state_missing", "pending_state_invalid", "dead_letter_invalid", "dead_letter_overlap",
+		"success_invalid", "success_overlap", "dedup_record_invalid", "marker_invalid", "lifecycle_ambiguous",
+	} {
+		add("message_lifecycle_"+reason, "held", f["message_lifecycle_"+reason])
+	}
+	for _, reason := range []string{
+		"active_attempt_structure", "active_attempt_state", "token_digest_mismatch",
+		"token_missing", "token_type", "token_mismatch", "claim_operation_missing",
+		"claim_operation_type", "claim_operation_mismatch", "token_ttl", "claim_operation_ttl",
+	} {
+		add("active_attempt_"+reason, "blocked", f["active_attempt_"+reason])
+	}
 	add("stale_index_entry", "removed", f["drained"])
 	for reason, n := range r.BlockReasons {
-		add(reason, "blocked", n)
+		// Active-attempt blocks keep one bounded marker reason, while the
+		// metric uses the detailed bounded cross-link reason below.
+		if reason != "active_attempt_inconsistent" {
+			add(reason, "blocked", n)
+		}
 	}
 	add("existing_block", "kept", f["already_blocked"])
 	// Invalid dedup and dead-letter records are also counted as unhandled;
 	// report them once.
 	add("dedup_record_invalid", "held", f["dedup_skipped"])
 	add("dead_letter_record_invalid", "held", f["dlq_invalid"])
-	add("unhandled_state", "held", f["unhandled"]-f["dedup_skipped"]-f["dlq_invalid"])
+	add("endpoint_record_invalid", "held", f["endpoint_invalid"])
+	add("unhandled_state", "held", f["unhandled"]-f["dedup_skipped"]-f["dlq_invalid"]-f["endpoint_invalid"])
 	add("dead_letter_message_missing", "held", f["dlq_message_missing"])
 	add("dead_letter_index_orphan", "removed", f["dlq_orphans_removed"])
 	add("dead_letter_index_missing", "restored", f["dlq_restored"])
@@ -572,6 +890,10 @@ func (r ReconcileReport) ConsistencyIssues() []ConsistencyIssue {
 	add("session_index_orphan", "removed", f["session_orphans_removed"])
 	add("session_invalid", "removed", f["sessions_removed"])
 	add("session_index_missing", "restored", f["session_index_restored"])
+	add("endpoint_index_orphan", "removed", f["endpoint_index_removed"])
+	add("endpoint_bot_index_missing", "restored", f["endpoint_bot_restored"])
+	add("endpoint_listing_missing", "restored", f["endpoint_listing_restored"])
+	add("endpoint_listing_score_drift", "repaired", f["endpoint_listing_score_repaired"])
 	return out
 }
 
@@ -622,6 +944,144 @@ func (a *Adapter) reconcileSessions(ctx context.Context, opts ReconcileOptions, 
 	return a.scanKeys(ctx, "hr1:admin_session:*", opts.BatchSize, func(key string) error {
 		return visit(strings.TrimPrefix(key, "hr1:admin_session:"))
 	})
+}
+
+// reconcileEndpoints checks both directions between authoritative Webhook
+// Endpoint Hashes and their rebuildable Bot Identity/global listing indexes.
+func (a *Adapter) reconcileEndpoints(ctx context.Context, opts ReconcileOptions, rep *ReconcileReport) error {
+	invalidReported := map[string]bool{}
+	reportInvalid := func(member, reason string) {
+		key := member + "\x00" + reason
+		if invalidReported[key] {
+			return
+		}
+		invalidReported[key] = true
+		rep.Findings["endpoint_invalid"]++
+		rep.Findings["unhandled"]++
+		if opts.Logger != nil {
+			observability.LogEvent(opts.Logger, slog.LevelError, "webhook_endpoint_inconsistent",
+				"Webhook Endpoint state could not be reconciled", "target", member,
+				"reason_code", reason, "error_code", "internal_error")
+		}
+	}
+	apply := func(mode, member, platform, botID string) error {
+		res, err := a.RunScript(ctx, "reconcile_endpoint_v1", []string{"hr1:webhooks"},
+			[]string{mode, member, platform, botID, "hr1"})
+		if err != nil {
+			return err
+		}
+		switch res.Status {
+		case "consistent", "absent":
+			return nil
+		case "orphan_removed":
+			reason, err := res.Fields[0].ToString()
+			if err != nil {
+				return fmt.Errorf("valkey: reconcile endpoint: result shape")
+			}
+			rep.Findings["endpoint_index_removed"]++
+			a.auditRepair(ctx, opts.Gen, opts.Logger, "reconciliation_repair", member, reason)
+			return nil
+		case "repaired":
+			botRepair, err1 := res.Fields[0].AsInt64()
+			listingRepair, err2 := res.Fields[1].AsInt64()
+			if err1 != nil || err2 != nil {
+				return fmt.Errorf("valkey: reconcile endpoint: result shape")
+			}
+			if botRepair > 0 {
+				rep.Findings["endpoint_bot_restored"] += int(botRepair)
+				a.auditRepair(ctx, opts.Gen, opts.Logger, "reconciliation_repair", member, "endpoint_bot_index_restored")
+			}
+			switch listingRepair {
+			case 0:
+			case 1:
+				rep.Findings["endpoint_listing_restored"]++
+				a.auditRepair(ctx, opts.Gen, opts.Logger, "reconciliation_repair", member, "endpoint_listing_restored")
+			case 2:
+				rep.Findings["endpoint_listing_score_repaired"]++
+				a.auditRepair(ctx, opts.Gen, opts.Logger, "reconciliation_repair", member, "endpoint_listing_score_repaired")
+			default:
+				return fmt.Errorf("valkey: reconcile endpoint: result shape")
+			}
+			return nil
+		case "invalid", "wrong_type":
+			reason, err := res.Fields[0].ToString()
+			if err != nil {
+				return fmt.Errorf("valkey: reconcile endpoint: result shape")
+			}
+			reportInvalid(member, reason)
+			return nil
+		default:
+			return fmt.Errorf("valkey: reconcile endpoint: unexpected result %q", res.Status)
+		}
+	}
+
+	// 1. Reverse Bot Identity memberships.
+	if err := a.scanKeys(ctx, "hr1:bot:*:webhooks", opts.BatchSize, func(key string) error {
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(key, "hr1:bot:"), ":webhooks"), ":")
+		if len(parts) != 2 || parts[0] != "telegram" || !validAdminBotID(parts[1]) {
+			reportInvalid(key, "bot_index_key_invalid")
+			return nil
+		}
+		return a.scanSetMembers(ctx, key, opts.BatchSize, func(members []string) error {
+			for _, member := range members {
+				if err := apply("bot_member", member, parts[0], parts[1]); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+
+	// 2. Reverse global listing memberships.
+	if err := a.scanMembers(ctx, "hr1:webhooks", opts.BatchSize, func(members []string) error {
+		for _, member := range members {
+			if err := apply("listing_member", member, "", ""); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// 3. Authoritative endpoint Hashes restore both indexes.
+	return a.scanKeys(ctx, "hr1:wh:*", opts.BatchSize, func(key string) error {
+		member := strings.TrimPrefix(key, "hr1:wh:")
+		if err := apply("endpoint", member, "", ""); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// scanSetMembers walks a Set with SSCAN in bounded pages.
+func (a *Adapter) scanSetMembers(ctx context.Context, key string, count int, fn func([]string) error) error {
+	t, err := a.keyType(ctx, key)
+	if err != nil {
+		return err
+	}
+	if t == "none" {
+		return nil
+	}
+	if t != "set" {
+		return fmt.Errorf("valkey: index %s has unexpected type %q", key, t)
+	}
+	cursor := uint64(0)
+	for {
+		entry, err := a.client.Do(ctx, a.client.B().Sscan().Key(key).Cursor(cursor).Count(int64(count)).Build()).AsScanEntry()
+		if err != nil {
+			return fmt.Errorf("valkey: sscan %s: %w", key, err)
+		}
+		if err := fn(entry.Elements); err != nil {
+			return err
+		}
+		if entry.Cursor == 0 {
+			return nil
+		}
+		cursor = entry.Cursor
+	}
 }
 
 func validSessionDigest(s string) bool {

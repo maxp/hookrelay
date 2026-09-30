@@ -292,11 +292,11 @@ func TestReplayPreemptsLegacyHead(t *testing.T) {
 // queue order.
 func TestMultipleReplays(t *testing.T) {
 	a, s := claimSetup(t)
-	enqueue(t, a, "m1", ridA)
-	enqueue(t, a, "m2", ridA)
+	enqueueJSON(t, a, "m1", ridA)
+	enqueueJSON(t, a, "m2", ridA)
 	deadLetterOne(t, s, "op-1", "dlv_1")
 	deadLetterOne(t, s, "op-2", "dlv_2")
-	enqueue(t, a, "m3", ridA)
+	enqueueJSON(t, a, "m3", ridA)
 	claimNext(t, s, "op-3", "dlv_3")
 
 	if r := replay(a, "m1", "reject"); r.QueuePosition != "after_active_head" {
@@ -332,11 +332,11 @@ func TestReplayOrderIgnoresClaims(t *testing.T) {
 	for _, claimFirst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ready", true: "leased"}[claimFirst], func(t *testing.T) {
 			a, s := claimSetup(t)
-			enqueue(t, a, "m1", ridA)
-			enqueue(t, a, "m2", ridA)
+			enqueueJSON(t, a, "m1", ridA)
+			enqueueJSON(t, a, "m2", ridA)
 			deadLetterOne(t, s, "op-1", "dlv_1")
 			deadLetterOne(t, s, "op-2", "dlv_2")
-			enqueue(t, a, "m3", ridA)
+			enqueueJSON(t, a, "m3", ridA)
 
 			if r := replay(a, "m1", "reject"); r.QueuePosition != "head" {
 				t.Fatalf("first replay = %+v", r)
@@ -634,9 +634,9 @@ func TestReconcileQueuedDeliveryState(t *testing.T) {
 	} {
 		t.Run(reason, func(t *testing.T) {
 			a, s := claimSetup(t)
-			enqueue(t, a, "m1", ridA)
+			enqueueJSON(t, a, "m1", ridA)
 			deadLetterOne(t, s, "op-1", "dlv_1")
-			enqueue(t, a, "m2", ridA)
+			enqueueJSON(t, a, "m2", ridA)
 			claimNext(t, s, "op-2", "dlv_2")
 			replay(a, "m1", "reject")
 			if rep := reconcile(t, a, true); rep.Findings["blocked"] != 0 {
