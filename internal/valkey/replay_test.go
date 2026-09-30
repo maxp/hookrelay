@@ -15,7 +15,7 @@ import (
 )
 
 func replay(a *Adapter, messageID, resolution string) administration.Replay {
-	return NewDeadLetterStore(a).ReplayDeadLetter(context.Background(), messageID, resolution, "evt-"+messageID, "req-"+messageID)
+	return NewDeadLetterStore(a).ReplayDeadLetter(context.Background(), messageID, resolution, "admin_bearer", "evt-"+messageID, "req-"+messageID)
 }
 
 func headState(t *testing.T, a *Adapter, rid string) map[string]string {
@@ -540,25 +540,30 @@ func TestReplayArgumentsAndReload(t *testing.T) {
 	a, s := claimSetup(t)
 	ctx := context.Background()
 	keys := []string{"hr1:dlq", "hr1:ready", "hr1:ready_seq", "hr1:retries", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages", "hr1:audit"}
-	valid := []string{"m1", "reject", "evt", "req", "hr1"}
+	valid := []string{"m1", "reject", "evt", "req", "admin_session", "hr1"}
 	for i := range valid {
 		args := append([]string(nil), valid...)
 		args[i] = ""
-		if _, err := a.RunScript(ctx, "replay_dlq_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "replay_dlq_v3", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("empty argument %d accepted: %v", i+1, err)
 		}
 	}
 	bad := append([]string(nil), valid...)
 	bad[1] = "repoint"
-	if _, err := a.RunScript(ctx, "replay_dlq_v2", keys, bad); err == nil {
+	if _, err := a.RunScript(ctx, "replay_dlq_v3", keys, bad); err == nil {
 		t.Error("unknown resolution accepted")
 	}
-	if _, err := a.RunScript(ctx, "replay_dlq_v2", keys[:7], valid); err == nil {
+	bad = append([]string(nil), valid...)
+	bad[4] = "maintenance"
+	if _, err := a.RunScript(ctx, "replay_dlq_v3", keys, bad); err == nil {
+		t.Error("unknown actor accepted")
+	}
+	if _, err := a.RunScript(ctx, "replay_dlq_v3", keys[:7], valid); err == nil {
 		t.Error("missing key accepted")
 	}
 	wrong := append([]string(nil), keys...)
 	wrong[7] = "other:audit"
-	if _, err := a.RunScript(ctx, "replay_dlq_v2", wrong, valid); err == nil {
+	if _, err := a.RunScript(ctx, "replay_dlq_v3", wrong, valid); err == nil {
 		t.Error("foreign key accepted")
 	}
 

@@ -18,6 +18,7 @@ const dlqID = "01950000-0000-7000-8000-000000000001"
 
 type replayCall struct {
 	messageID, resolution, eventID, requestID string
+	actor                                     string
 }
 
 type fakeDeadLetters struct {
@@ -53,13 +54,13 @@ func (f *fakeDeadLetters) GetDeadLetter(_ context.Context, messageID string) (*D
 	return f.record, nil
 }
 
-func (f *fakeDeadLetters) ReplayDeadLetter(_ context.Context, messageID, resolution, eventID, requestID string) Replay {
-	f.replays = append(f.replays, replayCall{messageID, resolution, eventID, requestID})
+func (f *fakeDeadLetters) ReplayDeadLetter(_ context.Context, messageID, resolution, actor, eventID, requestID string) Replay {
+	f.replays = append(f.replays, replayCall{messageID, resolution, eventID, requestID, actor})
 	return f.replay
 }
 
 func (f *fakeDeadLetters) ViewPayload(_ context.Context, messageID, actor, eventID, requestID string) Payload {
-	f.views = append(f.views, replayCall{messageID, actor, eventID, requestID})
+	f.views = append(f.views, replayCall{messageID, actor, eventID, requestID, actor})
 	return f.payload
 }
 

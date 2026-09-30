@@ -147,8 +147,8 @@ type DeadLetterRepository interface {
 	// GetDeadLetter reads one record with its attempt history; nil when the
 	// message is not dead-lettered.
 	GetDeadLetter(ctx context.Context, messageID string) (*DeadLetter, error)
-	// ReplayDeadLetter runs the audited replay transition.
-	ReplayDeadLetter(ctx context.Context, messageID, resolution, eventID, requestID string) Replay
+	// ReplayDeadLetter runs the audited replay transition for actor.
+	ReplayDeadLetter(ctx context.Context, messageID, resolution, actor, eventID, requestID string) Replay
 	// ViewPayload appends the access audit for actor and returns the
 	// Canonical Message in the same operation.
 	ViewPayload(ctx context.Context, messageID, actor, eventID, requestID string) Payload

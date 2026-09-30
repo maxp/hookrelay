@@ -57,16 +57,16 @@ func Handler(svc *Service) http.Handler {
 	mux.Handle("DELETE /admin/v1/webhooks/{webhook_type}/{webhook_identifier}", svc.auth(http.HandlerFunc(svc.handleDelete)))
 	mux.Handle("GET /admin/v1/bots/{bot_platform}/{bot_id}/webhooks", svc.auth(http.HandlerFunc(svc.handleBotWebhooks)))
 	if svc.recipients != nil {
-		mux.Handle("GET /admin/v1/recipient-states", svc.auth(http.HandlerFunc(svc.handleListRecipientStates)))
+		mux.Handle("GET /admin/v1/recipient-states", svc.authAdmin(http.HandlerFunc(svc.handleListRecipientStates)))
 		mux.Handle("POST /admin/v1/recipient-blocks/inspect", svc.auth(http.HandlerFunc(svc.handleInspectBlock)))
 		mux.Handle("POST /admin/v1/recipient-blocks/clear", svc.auth(http.HandlerFunc(svc.handleClearBlock)))
 	}
 	if svc.deadLetters != nil {
-		mux.Handle("GET /admin/v1/dead-letters", svc.auth(http.HandlerFunc(svc.handleListDeadLetters)))
-		mux.Handle("GET /admin/v1/dead-letters/{message_id}", svc.auth(http.HandlerFunc(svc.handleGetDeadLetter)))
-		mux.Handle("POST /admin/v1/dead-letters/{message_id}/replay", svc.auth(http.HandlerFunc(svc.handleReplayDeadLetter)))
-		mux.Handle("POST /admin/v1/dead-letters/{message_id}/payload", svc.auth(http.HandlerFunc(svc.handleDeadLetterPayload)))
-		mux.Handle("DELETE /admin/v1/dead-letters/{message_id}", svc.auth(http.HandlerFunc(svc.handleDeleteDeadLetter)))
+		mux.Handle("GET /admin/v1/dead-letters", svc.authAdmin(http.HandlerFunc(svc.handleListDeadLetters)))
+		mux.Handle("GET /admin/v1/dead-letters/{message_id}", svc.authAdmin(http.HandlerFunc(svc.handleGetDeadLetter)))
+		mux.Handle("POST /admin/v1/dead-letters/{message_id}/replay", svc.authAdmin(http.HandlerFunc(svc.handleReplayDeadLetter)))
+		mux.Handle("POST /admin/v1/dead-letters/{message_id}/payload", svc.authAdmin(http.HandlerFunc(svc.handleDeadLetterPayload)))
+		mux.Handle("DELETE /admin/v1/dead-letters/{message_id}", svc.authAdmin(http.HandlerFunc(svc.handleDeleteDeadLetter)))
 	}
 	if svc.sessions != nil {
 		mux.Handle("POST /admin/v1/session", svc.sessionRoute(svc.handleLogin))
@@ -74,36 +74,95 @@ func Handler(svc *Service) http.Handler {
 		mux.Handle("DELETE /admin/v1/session", svc.sessionRoute(svc.handleLogout))
 	}
 	if svc.operations != nil {
-		mux.Handle("GET /admin/v1/operations/summary", svc.auth(http.HandlerFunc(svc.handleOperationsSummary)))
+		mux.Handle("GET /admin/v1/operations/summary", svc.authAdmin(http.HandlerFunc(svc.handleOperationsSummary)))
 	}
 	if svc.auditLog != nil {
-		mux.Handle("GET /admin/v1/audit", svc.auth(http.HandlerFunc(svc.handleListAudit)))
+		mux.Handle("GET /admin/v1/audit", svc.authAdmin(http.HandlerFunc(svc.handleListAudit)))
 	}
 	if svc.messages != nil {
-		mux.Handle("GET /admin/v1/messages/{message_id}/delivery-state", svc.auth(http.HandlerFunc(svc.handleDeliveryState)))
+		mux.Handle("GET /admin/v1/messages/{message_id}/delivery-state", svc.authAdmin(http.HandlerFunc(svc.handleDeliveryState)))
 	}
 	return mux
 }
 
 // auth enforces the Admin Secret Bearer token: constant-time comparison,
-// uniform 401, rejected authentication audited best effort.
+// uniform 401, rejected authentication audited best effort. A session
+// cookie is ignored: these routes are outside the operational UI.
 func (s *Service) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := s.gen.UUIDv7()
-		w.Header().Set("X-Request-Id", requestID)
-		// Administrative responses may carry payloads or CSRF tokens.
-		w.Header().Set("Cache-Control", "no-store")
-		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
-		r = r.WithContext(context.WithValue(ctx, actorKey, actorAdminBearer))
-
-		if !s.secretMatches(bearerToken(r.Header.Get("Authorization"))) {
-			// Best-effort audit; refusal never depends on audit success.
-			s.recordRejectedAuth(r.Context(), requestID)
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "missing or invalid Admin Secret", requestID)
+		r = s.startRequest(w, r)
+		if !s.bearerAllowed(w, r) {
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// authAdmin accepts the Admin Secret Bearer token or a browser session.
+// With an Authorization header only Bearer is evaluated. A session
+// authenticates only through its cookie, and a state-changing request must
+// also carry the exact Origin and the session's CSRF token.
+func (s *Service) authAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = s.startRequest(w, r)
+		requestID := requestIDFrom(r.Context())
+		if r.Header.Get("Authorization") != "" || s.sessions == nil {
+			if s.bearerAllowed(w, r) {
+				next.ServeHTTP(w, r)
+			}
+			return
+		}
+		auth, _, present := s.cookieSession(r)
+		switch {
+		case !present:
+			s.bearerAllowed(w, r) // the uniform refusal
+			return
+		case auth.Result == SessionInvalid:
+			s.clearSessionCookie(w)
+			s.appendBestEffort(r.Context(), AuditEvent{Actor: actorAdminSession, Operation: opAdminAuthRejected, Target: "admin_api",
+				RequestID: requestID, Outcome: outcomeFailure, Reason: "session_" + auth.Reason})
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "no valid administrative session", requestID)
+			return
+		case auth.Result != SessionValid:
+			writeAPIError(w, DependencyError{detail: "the session could not be verified"}, requestID)
+			return
+		}
+		if unsafeMethod(r.Method) {
+			if reason := s.csrfFailure(r, auth); reason != "" {
+				s.forbidden(w, reason, requestID)
+				return
+			}
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey, actorAdminSession)))
+	})
+}
+
+// startRequest assigns the request identifier and the no-store policy
+// shared by every administrative API response, which may carry payloads
+// or CSRF tokens.
+func (s *Service) startRequest(w http.ResponseWriter, r *http.Request) *http.Request {
+	requestID := s.gen.UUIDv7()
+	w.Header().Set("X-Request-Id", requestID)
+	w.Header().Set("Cache-Control", "no-store")
+	ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+	return r.WithContext(context.WithValue(ctx, actorKey, actorAdminBearer))
+}
+
+// bearerAllowed checks the Bearer token and writes the uniform 401 when it
+// does not match.
+func (s *Service) bearerAllowed(w http.ResponseWriter, r *http.Request) bool {
+	if s.secretMatches(bearerToken(r.Header.Get("Authorization"))) {
+		return true
+	}
+	requestID := requestIDFrom(r.Context())
+	// Best-effort audit; refusal never depends on audit success.
+	s.recordRejectedAuth(r.Context(), requestID)
+	writeError(w, http.StatusUnauthorized, "unauthenticated", "missing or invalid Admin Secret", requestID)
+	return false
+}
+
+func unsafeMethod(m string) bool {
+	return m == http.MethodPost || m == http.MethodPut || m == http.MethodPatch || m == http.MethodDelete
 }
 
 func bearerToken(header string) string {

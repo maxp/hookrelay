@@ -130,8 +130,9 @@ func (s *Service) ReplayDeadLetter(ctx context.Context, messageID string, req Re
 		s.metrics.replays.WithLabelValues(string(ReplayNotFound)).Inc()
 		return ReplayView{}, deadLetterNotFound()
 	}
+	actor := actorFrom(ctx)
 	eventID := s.gen.UUIDv7()
-	r := s.deadLetters.ReplayDeadLetter(ctx, messageID, resolution, eventID, requestID)
+	r := s.deadLetters.ReplayDeadLetter(ctx, messageID, resolution, actor, eventID, requestID)
 	switch r.Result {
 	case ReplayReplayed, ReplayNotFound, ReplayMessageMissing, ReplayRecipientBlocked, ReplayDeduplicationConflict, ReplayUncertain:
 		s.metrics.replays.WithLabelValues(string(r.Result)).Inc()
@@ -141,7 +142,7 @@ func (s *Service) ReplayDeadLetter(ctx context.Context, messageID string, req Re
 	switch r.Result {
 	case ReplayReplayed:
 		s.metrics.auditEvents.WithLabelValues(opDeadLetterReplayed, outcomeSuccess).Inc()
-		s.logAudit(eventID, opDeadLetterReplayed, messageID, requestID, outcomeSuccess)
+		s.logAuditAs(actor, eventID, opDeadLetterReplayed, messageID, requestID, outcomeSuccess)
 		fields := []any{"request_id", requestID, "message_id", messageID, "delivery_cycle", r.DeliveryCycle,
 			"queue_position", r.QueuePosition, "deduplication_resolution", r.DeduplicationResolution}
 		fields = append(fields, recipientLogFields(r.RecipientIdentity)...)
@@ -259,7 +260,7 @@ func (s *Service) DeleteDeadLetter(ctx context.Context, messageID string, expect
 	case DeleteDLQDeleted:
 		s.metrics.dlqDeletions.WithLabelValues(dlqDeletionDeleted).Inc()
 		s.metrics.auditEvents.WithLabelValues(opDeadLetterDeleted, outcomeSuccess).Inc()
-		s.logAudit(eventID, opDeadLetterDeleted, messageID, requestID, outcomeSuccess)
+		s.logAuditAs(actor, eventID, opDeadLetterDeleted, messageID, requestID, outcomeSuccess)
 		fields := []any{"request_id", requestID, "message_id", messageID, "actor", actor, "dead_letter_reason", d.Reason}
 		fields = append(fields, recipientLogFields(d.RecipientIdentity)...)
 		observability.LogEvent(s.log, slog.LevelInfo, opDeadLetterDeleted, "dead-letter message permanently deleted", fields...)
@@ -357,7 +358,7 @@ func (s *Service) ViewDeadLetterPayload(ctx context.Context, messageID, requestI
 	case PayloadDisclosed:
 		s.metrics.payloadViews.WithLabelValues(payloadViewDisclosed).Inc()
 		s.metrics.auditEvents.WithLabelValues(opDeadLetterPayloadViewed, outcomeSuccess).Inc()
-		s.logAudit(eventID, opDeadLetterPayloadViewed, messageID, requestID, outcomeSuccess)
+		s.logAuditAs(actor, eventID, opDeadLetterPayloadViewed, messageID, requestID, outcomeSuccess)
 		fields := []any{"request_id", requestID, "message_id", messageID, "actor", actor, "delivery_cycle", p.DeliveryCycle}
 		if rcpt, ok := recipientOf(p.RecipientIdentity); ok {
 			fields = append(fields, "recipient_scope", rcpt.Scope, "bot_platform", rcpt.BotPlatform)

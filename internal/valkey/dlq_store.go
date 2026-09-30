@@ -122,11 +122,11 @@ func (s *deadLetterStore) GetDeadLetter(ctx context.Context, messageID string) (
 	return d, nil
 }
 
-// ReplayDeadLetter runs replay_dlq_v2.
-func (s *deadLetterStore) ReplayDeadLetter(ctx context.Context, messageID, resolution, eventID, requestID string) administration.Replay {
-	res, err := s.a.RunScript(ctx, "replay_dlq_v2",
+// ReplayDeadLetter runs replay_dlq_v3.
+func (s *deadLetterStore) ReplayDeadLetter(ctx context.Context, messageID, resolution, actor, eventID, requestID string) administration.Replay {
+	res, err := s.a.RunScript(ctx, "replay_dlq_v3",
 		[]string{"hr1:dlq", "hr1:ready", "hr1:ready_seq", "hr1:retries", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages", auditKey},
-		[]string{messageID, resolution, eventID, requestID, "hr1"})
+		[]string{messageID, resolution, eventID, requestID, actor, "hr1"})
 	if err != nil {
 		if errors.Is(err, ErrNotDispatched) {
 			return administration.Replay{Result: administration.ReplayUnavailable}
@@ -152,7 +152,7 @@ func parseReplayed(res *Result) (administration.Replay, error) {
 	resolution, err4 := f[3].ToString()
 	rid, err5 := f[4].ToString()
 	if err := errors.Join(err1, err2, err3, err4, err5); err != nil {
-		return administration.Replay{}, fmt.Errorf("valkey: replay_dlq_v2: result shape: %w", err)
+		return administration.Replay{}, fmt.Errorf("valkey: replay_dlq_v3: result shape: %w", err)
 	}
 	return administration.Replay{Result: administration.ReplayReplayed, DeliveryCycle: cycle, QueuePosition: position,
 		ReplayedMs: replayed, DeduplicationResolution: resolution, RecipientIdentity: rid}, nil

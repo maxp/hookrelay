@@ -294,3 +294,123 @@ func TestLogoutContract(t *testing.T) {
 		t.Errorf("unavailable authentication = %d", rec.Code)
 	}
 }
+
+// adminRequest sends one request with optional Bearer, cookie, Origin, and
+// CSRF headers.
+func adminRequest(h http.Handler, method, path, bearer, cookie, origin, csrf string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if cookie != "" {
+		req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: cookie})
+	}
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	if csrf != "" {
+		req.Header.Set("X-CSRF-Token", csrf)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestCookieAuthenticationMatrix pins the route classes and the session
+// checks: operational routes accept a valid session cookie, state-changing
+// ones only with the exact Origin and CSRF token, the audit actor follows
+// the authentication kind, Bearer never falls back to the cookie, and
+// Bearer-only routes ignore the cookie.
+func TestCookieAuthenticationMatrix(t *testing.T) {
+	store := &fakeSessions{auth: SessionAuth{Result: SessionValid, CSRFToken: testCSRF, IdleExpiresMs: 1, AbsoluteExpiresMs: 2}}
+	dl := &fakeDeadLetters{
+		items:    []DeadLetter{},
+		replay:   Replay{Result: ReplayReplayed, DeliveryCycle: 2, QueuePosition: "head", DeduplicationResolution: "not_conflicting"},
+		payload:  Payload{Result: PayloadDisclosed, Message: json.RawMessage(`{}`)},
+		deletion: DeleteDLQ{Result: DeleteDLQDeleted},
+	}
+	audit := &fakeAudit{}
+	reg := prometheus.NewRegistry()
+	svc, err := NewService(ServiceDeps{Repo: newFakeRepo(), DeadLetters: dl, Sessions: store, AdminOrigin: testOrigin,
+		Catalog: fakeCatalog{}, Audit: audit, AdminSecret: "admin-secret-value-016", Gen: fixedGen{}, Registerer: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Handler(svc)
+	const secret = "admin-secret-value-016"
+	replayPath := "/admin/v1/dead-letters/" + dlqID + "/replay"
+
+	// Safe read with the cookie alone.
+	if rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "", testToken, "", ""); rec.Code != http.StatusOK ||
+		rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("cookie read = %d", rec.Code)
+	}
+	// State-changing: Origin, then CSRF.
+	for name, tc := range map[string]struct{ origin, csrf, reason string }{
+		"no origin":    {"", testCSRF, "origin"},
+		"other origin": {"https://evil.example", testCSRF, "origin"},
+		"no csrf":      {testOrigin, "", "token"},
+		"wrong csrf":   {testOrigin, "BBBBBBBBBBBBBBBBBBBBBB", "token"},
+	} {
+		before := len(dl.replays)
+		rec := adminRequest(h, http.MethodPost, replayPath, "", testToken, tc.origin, tc.csrf)
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"code":"forbidden"`) || len(dl.replays) != before {
+			t.Errorf("%s = %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	if got := counterValue(t, reg, "hookrelay_admin_csrf_rejections_total", map[string]string{"reason": "origin"}); got != 2 {
+		t.Errorf("origin rejections = %v", got)
+	}
+	if got := counterValue(t, reg, "hookrelay_admin_csrf_rejections_total", map[string]string{"reason": "token"}); got != 2 {
+		t.Errorf("token rejections = %v", got)
+	}
+	if rec := adminRequest(h, http.MethodPost, replayPath, "", testToken, testOrigin, testCSRF); rec.Code != http.StatusOK ||
+		dl.replays[len(dl.replays)-1].actor != "admin_session" {
+		t.Errorf("cookie replay = %d, calls %+v", rec.Code, dl.replays)
+	}
+	if rec := adminRequest(h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "", testToken, testOrigin, testCSRF); rec.Code != http.StatusOK ||
+		dl.views[len(dl.views)-1].actor != "admin_session" {
+		t.Errorf("cookie payload = %d", rec.Code)
+	}
+	if rec := adminRequest(h, http.MethodDelete, "/admin/v1/dead-letters/"+dlqID, "", testToken, testOrigin, testCSRF); rec.Code != http.StatusNoContent ||
+		dl.deletes[len(dl.deletes)-1].actor != "admin_session" {
+		t.Errorf("cookie delete = %d", rec.Code)
+	}
+	// Bearer needs no CSRF and records its own actor.
+	if rec := adminRequest(h, http.MethodPost, replayPath, secret, "", "", ""); rec.Code != http.StatusOK ||
+		dl.replays[len(dl.replays)-1].actor != "admin_bearer" {
+		t.Errorf("bearer replay = %d", rec.Code)
+	}
+	// An Authorization header is never supplemented by the cookie.
+	auths := len(store.auths)
+	if rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "wrong-secret", testToken, "", ""); rec.Code != http.StatusUnauthorized ||
+		len(store.auths) != auths {
+		t.Errorf("wrong bearer with cookie = %d", rec.Code)
+	}
+	// Bearer-only routes ignore the cookie.
+	if rec := adminRequest(h, http.MethodGet, "/admin/v1/webhooks", "", testToken, testOrigin, testCSRF); rec.Code != http.StatusUnauthorized ||
+		len(store.auths) != auths {
+		t.Errorf("cookie on a bearer-only route = %d", rec.Code)
+	}
+	if rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "", "", "", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("no credentials = %d", rec.Code)
+	}
+
+	// An invalid session: 401, clearing cookie, best-effort audit.
+	store.auth = SessionAuth{Result: SessionInvalid, Reason: SessionReasonGeneration}
+	rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "", testToken, "", "")
+	if rec.Code != http.StatusUnauthorized || sessionCookieOf(rec) == nil || sessionCookieOf(rec).MaxAge >= 0 {
+		t.Errorf("invalid session = %d %+v", rec.Code, sessionCookieOf(rec))
+	}
+	last := audit.events[len(audit.events)-1]
+	if last.Operation != "admin_auth_rejected" || last.Actor != "admin_session" || last.Reason != "session_generation_changed" {
+		t.Errorf("rejection audit = %+v", last)
+	}
+	if rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "", "not-a-token", "", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("malformed cookie = %d", rec.Code)
+	}
+	store.auth = SessionAuth{Result: SessionAuthUnavailable}
+	if rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "", testToken, "", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("unverifiable session = %d", rec.Code)
+	}
+}

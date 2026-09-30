@@ -104,15 +104,11 @@ func sourceAddress(r *http.Request) string {
 	return host
 }
 
-// sessionRoute wraps the session routes, which authenticate themselves:
-// request identifier and no-store caching as for the other API routes.
+// sessionRoute wraps the session routes, which authenticate themselves.
 func (s *Service) sessionRoute(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := s.gen.UUIDv7()
-		w.Header().Set("X-Request-Id", requestID)
-		w.Header().Set("Cache-Control", "no-store")
-		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
-		next(w, r.WithContext(context.WithValue(ctx, actorKey, actorAdminSession)))
+		r = s.startRequest(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), actorKey, actorAdminSession)))
 	})
 }
 

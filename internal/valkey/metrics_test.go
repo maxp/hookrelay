@@ -117,3 +117,18 @@ func value(t *testing.T, reg *prometheus.Registry, name string, labels ...string
 	}
 	return 0
 }
+
+// TestEveryScriptHasAnOperationLabel keeps the bounded operation label in
+// step with the registry: an unmapped script would be counted as "other".
+func TestEveryScriptHasAnOperationLabel(t *testing.T) {
+	for name := range registry {
+		if _, ok := scriptOperations[name]; !ok {
+			t.Errorf("script %s has no operation label", name)
+		}
+	}
+	for name := range scriptOperations {
+		if _, ok := registry[name]; !ok {
+			t.Errorf("operation label for unregistered script %s", name)
+		}
+	}
+}

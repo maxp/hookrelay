@@ -144,7 +144,7 @@ func init() {
 		"due_retry":       3,
 		"unhandled":       3,
 	})
-	register("replay_dlq_v2", 2, map[string]int{
+	register("replay_dlq_v3", 3, map[string]int{
 		// delivery_cycle, queue_position, replayed_ms,
 		// deduplication_resolution, recipient_identity
 		"replayed":               5,
