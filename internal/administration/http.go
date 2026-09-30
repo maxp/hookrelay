@@ -72,6 +72,9 @@ func Handler(svc *Service) http.Handler {
 		mux.Handle("POST /admin/v1/session", svc.sessionRoute(svc.handleLogin))
 		mux.Handle("GET /admin/v1/session", svc.sessionRoute(svc.handleGetSession))
 		mux.Handle("DELETE /admin/v1/session", svc.sessionRoute(svc.handleLogout))
+		// The operational panel needs browser sessions.
+		mux.Handle("GET /ui/", uiHandler())
+		mux.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
 	}
 	if svc.operations != nil {
 		mux.Handle("GET /admin/v1/operations/summary", svc.authAdmin(http.HandlerFunc(svc.handleOperationsSummary)))

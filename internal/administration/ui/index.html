@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>hookrelay operations</title>
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top" id="top" hidden>
+    <span class="brand">hookrelay</span>
+    <nav id="nav"></nav>
+    <span class="spacer"></span>
+    <a id="grafana" class="external" target="_blank" rel="noopener noreferrer" hidden>Grafana</a>
+    <span id="expiry" class="muted"></span>
+    <button id="logout" type="button">Log out</button>
+  </header>
+  <main id="main" aria-live="polite">
+    <p class="muted">Loading…</p>
+  </main>
+  <noscript><p>The operational panel needs JavaScript. The Admin API and CLI remain available.</p></noscript>
+</body>
+</html>
