@@ -22,6 +22,9 @@ type EndpointRepository interface {
 	// SetEndpointEnabled runs the audited enable/disable transition under
 	// the expected entity version (nil when no If-Match was sent).
 	SetEndpointEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult)
+	// DeleteEndpoint runs the audited delete of a disabled endpoint under
+	// the expected entity version (nil when no If-Match was sent).
+	DeleteEndpoint(ctx context.Context, webhookType, identifier, botPlatform string, expected *EntityVersion, eventID, requestID string) (*Endpoint, DeleteResult)
 	// ListEndpoints pages the global listing newest first (descending
 	// created_ms, then descending member), strictly after the cursor.
 	ListEndpoints(ctx context.Context, limit int, after *EndpointCursor) ([]EndpointListing, error)
@@ -47,6 +50,22 @@ const (
 	// SetEnabledUncertain: the transition may have run; neither success nor
 	// failure may be reported.
 	SetEnabledUncertain SetEnabledResult = "uncertain"
+)
+
+// DeleteResult is the bounded outcome of the delete transition.
+type DeleteResult string
+
+const (
+	DeleteDeleted              DeleteResult = "deleted"
+	DeleteAbsent               DeleteResult = "absent"
+	DeletePreconditionRequired DeleteResult = "precondition_required"
+	DeletePreconditionFailed   DeleteResult = "precondition_failed"
+	DeleteMustBeDisabled       DeleteResult = "must_be_disabled"
+	DeleteWrongType            DeleteResult = "wrong_type"
+	DeleteUnavailable          DeleteResult = "dependency_unavailable"
+	// DeleteUncertain: the transition may have run; neither success nor
+	// failure may be reported.
+	DeleteUncertain DeleteResult = "uncertain"
 )
 
 // EndpointCursor is the position after the last listed endpoint.

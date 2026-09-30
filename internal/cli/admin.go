@@ -73,7 +73,7 @@ const adminUsage = `usage:
       [--credential-kind <kind>] [--credential-file <path>] [--disabled] [common flags]
   hookrelay admin webhook get --type <webhook_type> --identifier <id> [common flags]
   hookrelay admin webhook list [--limit <n>] [--cursor <c>] [common flags]
-  hookrelay admin webhook enable|disable --type <webhook_type> --identifier <id> --yes [common flags]
+  hookrelay admin webhook enable|disable|delete --type <webhook_type> --identifier <id> --yes [common flags]
   hookrelay admin recipients list --status <ready|leased|retry_wait|blocked> [--limit <n>] [--cursor <c>] [common flags]
   hookrelay admin recipients inspect-block <recipient> [common flags]
   hookrelay admin recipients clear-block <recipient> --expected-detected-ms <ms>
@@ -120,6 +120,8 @@ func runAdmin(args []string, env adminIO) int {
 		return adminWebhookSetEnabled(args[2:], env, true)
 	case "disable":
 		return adminWebhookSetEnabled(args[2:], env, false)
+	case "delete":
+		return adminWebhookDelete(args[2:], env)
 	default:
 		fmt.Fprintf(env.Stderr, "hookrelay admin: unknown webhook command %q\n", args[1])
 		fmt.Fprint(env.Stderr, adminUsage)

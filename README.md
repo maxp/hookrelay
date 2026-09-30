@@ -387,6 +387,13 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   (same `ETag`, no audit). `428 precondition_required` without `If-Match`,
   `412 precondition_failed` for a stale or earlier-generation tag, `400`
   for a weak, wildcard, or malformed tag, `404` for a missing endpoint.
+- `DELETE /admin/v1/webhooks/{webhook_type}/{webhook_identifier}` with
+  `If-Match` — permanently delete a disabled endpoint (Hash, credential,
+  Bot Identity membership, listing) with its audit event; `204`. An
+  enabled endpoint returns `409 endpoint_must_be_disabled`; an absent one
+  returns `204` without another audit event (which does not prove that an
+  earlier uncertain deletion was audited). Recreating the identifier starts
+  a new generation, so earlier ETags are refused with `412`.
 - `GET /admin/v1/recipient-states?status=ready|leased|retry_wait|blocked&limit&cursor`
   — Recipients in one state as structured Recipient fields with the state's
   time (`ready_sequence`, `lease_expires_ms`, `retry_at_ms`, or `detected_ms`
@@ -454,6 +461,7 @@ hookrelay admin webhook get --type telegram --identifier wh_...
 hookrelay admin webhook list [--limit 50] [--cursor <next_cursor>]
 hookrelay admin webhook disable --type telegram --identifier wh_... --yes
 hookrelay admin webhook enable --type telegram --identifier wh_... --yes
+hookrelay admin webhook delete --type telegram --identifier wh_... --yes
 hookrelay admin recipients list --status blocked
 hookrelay admin recipients inspect-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100
 hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100 \

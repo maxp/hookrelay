@@ -199,3 +199,117 @@ func TestSetEndpointEnabledArgumentsAndReload(t *testing.T) {
 		t.Errorf("after SCRIPT FLUSH = %s", r)
 	}
 }
+
+// TestDeleteEndpointTuples pins endpoint_delete_v1: every key of a deleted
+// endpoint removed with the audit entry written, the Bot Identity Set kept
+// while other endpoints remain, absent as a no-op, and every refusal
+// snapshot-equal.
+func TestDeleteEndpointTuples(t *testing.T) {
+	a, store := adminSetup(t)
+	ctx := context.Background()
+	second := endpointFixture()
+	second.Identifier = "wh_test2"
+	if _, _, r := a.CreateEndpoint(ctx, second, "event-00", "webhook_endpoint_created", "req"); r != CreateOK {
+		t.Fatal(r)
+	}
+	const botKey = "hr1:bot:telegram:123456789:webhooks"
+
+	snap := snapshot(t, a)
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(1), "e", "r"); r != administration.DeleteMustBeDisabled {
+		t.Errorf("enabled = %s", r)
+	}
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", nil, "e", "r"); r != administration.DeletePreconditionRequired {
+		t.Errorf("no precondition = %s", r)
+	}
+	if e, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(7), "e", "r"); r != administration.DeletePreconditionFailed || e.ConfigVersion != 1 {
+		t.Errorf("stale = %s %+v", r, e)
+	}
+	assertUnchanged(t, a, snap, "refusals")
+
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(1), "e-off", "r"); r != administration.SetEnabledUpdated {
+		t.Fatal(r)
+	}
+	e, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(2), "event-del", "req-del")
+	if r != administration.DeleteDeleted || e.BotID != "123456789" || e.CredentialKind != "secret_token" || e.ConfigVersion != 2 ||
+		e.GenerationID != endpointFixture().GenerationID || e.UpdatedMs <= 0 {
+		t.Fatalf("delete = %s %+v", r, e)
+	}
+	if got, _ := a.GetEndpoint(ctx, "telegram", "wh_test1"); got != nil {
+		t.Error("the endpoint Hash survived")
+	}
+	members, _ := a.client.Do(ctx, a.client.B().Smembers().Key(botKey).Build()).AsStrSlice()
+	if len(members) != 1 || members[0] != "telegram:wh_test2" {
+		t.Errorf("bot set = %v", members)
+	}
+	if n, _ := a.client.Do(ctx, a.client.B().Zcard().Key("hr1:webhooks").Build()).AsInt64(); n != 1 {
+		t.Errorf("listing size = %d", n)
+	}
+	audit := lastAudit(t, a)
+	if audit["operation"] != "webhook_endpoint_deleted" || audit["event_id"] != "event-del" || audit["target"] != "telegram:wh_test1" ||
+		audit["timestamp_ms"] != strconv.FormatInt(e.UpdatedMs, 10) {
+		t.Errorf("audit = %v", audit)
+	}
+
+	snap = snapshot(t, a)
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(2), "e", "r"); r != administration.DeleteAbsent {
+		t.Errorf("repeat = %s", r)
+	}
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", nil, "e", "r"); r != administration.DeleteAbsent {
+		t.Errorf("absent without precondition = %s", r)
+	}
+	assertUnchanged(t, a, snap, "absent")
+
+	// Deleting the last endpoint of a bot removes its Set.
+	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test2", false, fixtureVersion(1), "e", "r"); r != administration.SetEnabledUpdated {
+		t.Fatal(r)
+	}
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test2", "telegram", fixtureVersion(2), "e", "r"); r != administration.DeleteDeleted {
+		t.Fatal(r)
+	}
+	if n, _ := a.client.Do(ctx, a.client.B().Exists().Key(botKey).Build()).AsInt64(); n != 0 {
+		t.Error("the empty Bot Identity Set survived")
+	}
+
+	// A recreated identifier gets a new generation; the old ETag is stale.
+	recreated := endpointFixture()
+	recreated.GenerationID = "0195c4d8-0000-7000-8000-000000000002"
+	recreated.Enabled = false
+	if _, _, r := a.CreateEndpoint(ctx, recreated, "e", "webhook_endpoint_created", "r"); r != CreateOK {
+		t.Fatal(r)
+	}
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(1), "e", "r"); r != administration.DeletePreconditionFailed {
+		t.Errorf("earlier generation = %s", r)
+	}
+
+	// Wrong types refuse without writing.
+	a.testDo(t, "DEL", botKey)
+	a.testDo(t, "SET", botKey, "x")
+	snap = snapshot(t, a)
+	v := &administration.EntityVersion{GenerationID: recreated.GenerationID, ConfigVersion: 1}
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", v, "e", "r"); r != administration.DeleteWrongType {
+		t.Errorf("bot set wrong type = %s", r)
+	}
+	assertUnchanged(t, a, snap, "wrong type")
+}
+
+// TestDeleteEndpointArgumentsAndReload pins argument rejection and EVAL
+// reload after SCRIPT FLUSH.
+func TestDeleteEndpointArgumentsAndReload(t *testing.T) {
+	a, store := adminSetup(t)
+	ctx := context.Background()
+	keys := []string{"hr1:wh:telegram:wh_test1", "hr1:webhooks", "hr1:audit"}
+	for name, args := range map[string][]string{
+		"too few":        {"telegram", "wh_test1", "telegram", "", "", "e"},
+		"empty platform": {"telegram", "wh_test1", "", "", "", "e", "r"},
+		"half version":   {"telegram", "wh_test1", "telegram", "", "1", "e", "r"},
+		"key mismatch":   {"telegram", "wh_x", "telegram", "", "", "e", "r"},
+	} {
+		if _, err := a.RunScript(ctx, "endpoint_delete_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	a.testDo(t, "SCRIPT", "FLUSH")
+	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(1), "e", "r"); r != administration.DeleteMustBeDisabled {
+		t.Errorf("after SCRIPT FLUSH = %s", r)
+	}
+}

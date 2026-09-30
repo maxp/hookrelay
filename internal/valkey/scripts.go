@@ -30,6 +30,15 @@ func init() {
 		"precondition_failed":   2, // generation_id, config_version
 		"wrong_type":            0,
 	})
+	register("endpoint_delete_v1", 1, map[string]int{
+		// bot_id, credential_kind, generation_id, config_version, deleted_ms
+		"deleted":               5,
+		"absent":                0,
+		"precondition_required": 0,
+		"precondition_failed":   2, // generation_id, config_version
+		"must_be_disabled":      0,
+		"wrong_type":            0,
+	})
 	register("accept_v3", 3, map[string]int{
 		"accepted":           2, // accepted_ms, early_evicted
 		"duplicate":          1, // original message_id

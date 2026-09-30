@@ -158,3 +158,61 @@ func TestAdminWebhookSetEnabledUncertain(t *testing.T) {
 		}
 	}
 }
+
+// TestAdminWebhookDelete pins delete: --yes required, the read ETag sent as
+// If-Match, a deleted result, the disable hint for an enabled endpoint, and
+// the lost-response reconciliation that never retries.
+func TestAdminWebhookDelete(t *testing.T) {
+	api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+		"GET " + webhookAPath:    tagged(http.StatusOK, etagV1, endpointVersionJSON("wh_a", false, 1)),
+		"DELETE " + webhookAPath: respond(http.StatusNoContent, ""),
+	}}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	if code := newTestRun(srv.URL).run("webhook", "delete", "--type", "telegram", "--identifier", "wh_a"); code != ExitUsage || len(api.requests) != 0 {
+		t.Fatalf("without --yes = %d", code)
+	}
+	r := newTestRun(srv.URL)
+	if code := r.run("webhook", "delete", "--type", "telegram", "--identifier", "wh_a", "--yes"); code != ExitOK {
+		t.Fatalf("delete = %d %s", code, r.stderr.String())
+	}
+	if del := api.calls(http.MethodDelete, webhookAPath); len(del) != 1 || del[0].IfMatch != etagV1 {
+		t.Fatalf("delete calls = %+v", del)
+	}
+	var out uncertainResult
+	if err := json.Unmarshal(r.stdout.Bytes(), &out); err != nil || out.Outcome != outcomeDeleted || out.WebhookIdentifier != "wh_a" {
+		t.Errorf("stdout = %s", r.stdout.String())
+	}
+
+	api.routes["DELETE "+webhookAPath] = respond(http.StatusConflict, `{"error":{"code":"endpoint_must_be_disabled","message":"disable first","request_id":"r"}}`)
+	r = newTestRun(srv.URL)
+	if code := r.run("webhook", "delete", "--type", "telegram", "--identifier", "wh_a", "--yes"); code != ExitError ||
+		!strings.Contains(r.stderr.String(), "webhook disable --type telegram --identifier wh_a --yes") {
+		t.Errorf("enabled = %d %s", code, r.stderr.String())
+	}
+
+	for name, tc := range map[string]struct {
+		reread  http.HandlerFunc
+		outcome string
+	}{
+		"absent":  {respond(http.StatusNotFound, `{"error":{"code":"webhook_endpoint_not_found","message":"no","request_id":"r"}}`), outcomeDesiredStateObserved},
+		"present": {tagged(http.StatusOK, etagV1, endpointVersionJSON("wh_a", false, 1)), outcomeUncertain},
+	} {
+		api := &routedAdminAPI{routes: map[string]http.HandlerFunc{
+			"GET " + webhookAPath:    sequence(tagged(http.StatusOK, etagV1, endpointVersionJSON("wh_a", false, 1)), tc.reread),
+			"DELETE " + webhookAPath: respond(http.StatusServiceUnavailable, `{"error":{"code":"dependency_unavailable","message":"uncertain","request_id":"r"}}`),
+		}}
+		srv := httptest.NewServer(api)
+		r := newTestRun(srv.URL)
+		code := r.run("webhook", "delete", "--type", "telegram", "--identifier", "wh_a", "--yes")
+		srv.Close()
+		var out uncertainResult
+		if err := json.Unmarshal(r.stdout.Bytes(), &out); err != nil || out.Outcome != tc.outcome || code != ExitError {
+			t.Errorf("%s: exit %d stdout %s", name, code, r.stdout.String())
+		}
+		if len(api.calls(http.MethodDelete, webhookAPath)) != 1 {
+			t.Errorf("%s: the deletion was retried", name)
+		}
+	}
+	r.assertNoSecrets(t)
+}

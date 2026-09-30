@@ -14,6 +14,7 @@ const (
 	opDeadLetterReplayed      = "dead_letter_replayed"
 	opWebhookEndpointEnabled  = "webhook_endpoint_enabled"
 	opWebhookEndpointDisabled = "webhook_endpoint_disabled"
+	opWebhookEndpointDeleted  = "webhook_endpoint_deleted"
 
 	outcomeSuccess = "success"
 	outcomeFailure = "failure"

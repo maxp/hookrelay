@@ -239,3 +239,81 @@ func TestPatchWebhookContract(t *testing.T) {
 		}
 	}
 }
+
+// doDelete sends a DELETE with an optional If-Match header.
+func doDelete(t *testing.T, h http.Handler, path, ifMatch string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	req.Header.Set("Authorization", "Bearer "+adminSecret)
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestDeleteWebhookContract pins delete: 204 with the audit copy and the
+// feature event for a disabled endpoint, 204 without any audit for an
+// absent one, and the bounded refusals.
+func TestDeleteWebhookContract(t *testing.T) {
+	repo := newFakeRepo()
+	repo.endpoints["telegram:wh_a"] = storedEndpoint("wh_a", 100, false)
+	repo.endpoints["telegram:wh_on"] = storedEndpoint("wh_on", 100, true)
+	h, logs := webhookService(t, repo)
+	const path = "/admin/v1/webhooks/telegram/wh_a"
+	etag := `"0195c4d8-0000-7000-8000-00000000000a:2"`
+
+	for name, tc := range map[string]struct {
+		path, ifMatch string
+		status        int
+		code          string
+	}{
+		"missing if-match": {path, "", 428, "precondition_required"},
+		"stale":            {path, `"0195c4d8-0000-7000-8000-00000000000a:1"`, 412, "precondition_failed"},
+		"weak":             {path, "W/" + etag, 400, "invalid_request"},
+		"enabled":          {"/admin/v1/webhooks/telegram/wh_on", `"0195c4d8-0000-7000-8000-00000000000n:2"`, 409, "endpoint_must_be_disabled"},
+	} {
+		rec := doDelete(t, h, tc.path, tc.ifMatch)
+		if rec.Code != tc.status || errCode(rec) != tc.code {
+			t.Errorf("%s = %d %s, want %d %s", name, rec.Code, rec.Body, tc.status, tc.code)
+		}
+	}
+	if logs.Len() != 0 {
+		t.Errorf("refusals logged: %s", logs)
+	}
+
+	rec := doDelete(t, h, path, etag)
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("delete = %d %s", rec.Code, rec.Body)
+	}
+	for _, want := range []string{`"event":"webhook_endpoint_deleted"`, `"operation":"webhook_endpoint_deleted"`, `"generation_id":"0195c4d8-0000-7000-8000-00000000000a"`} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs lack %s: %s", want, logs)
+		}
+	}
+	if strings.Contains(logs.String(), "super-secret") {
+		t.Error("the credential leaked into logs")
+	}
+
+	// Absent: 204 again, with or without If-Match, and no audit.
+	logs.Reset()
+	for _, p := range []string{path, "/admin/v1/webhooks/other/wh_a", "/admin/v1/webhooks/telegram/wh.bad"} {
+		if rec := doDelete(t, h, p, ""); rec.Code != http.StatusNoContent {
+			t.Errorf("absent %s = %d %s", p, rec.Code, rec.Body)
+		}
+	}
+	if rec := doDelete(t, h, path, etag); rec.Code != http.StatusNoContent {
+		t.Errorf("repeat = %d", rec.Code)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("absent deletes logged: %s", logs)
+	}
+
+	for _, result := range []DeleteResult{DeleteWrongType, DeleteUncertain, DeleteUnavailable} {
+		repo.deleteResult = result
+		if rec := doDelete(t, h, path, etag); rec.Code != http.StatusServiceUnavailable || errCode(rec) != "dependency_unavailable" {
+			t.Errorf("%s = %d %s", result, rec.Code, rec.Body)
+		}
+	}
+}

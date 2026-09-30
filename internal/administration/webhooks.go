@@ -223,3 +223,63 @@ func (s *Service) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	writeEndpoint(w, http.StatusOK, view)
 }
+
+// DeleteWebhook permanently deletes a disabled endpoint. Deleting an absent
+// endpoint succeeds without another audit event; that proves no earlier
+// uncertain deletion wrote its audit.
+func (s *Service) DeleteWebhook(ctx context.Context, webhookType, identifier string, expected *EntityVersion, requestID string) error {
+	platform, _, ok := s.catalog.Lookup(webhookType)
+	if !ok {
+		// No endpoint of an unregistered type can exist.
+		return nil
+	}
+	eventID := s.gen.UUIDv7()
+	e, result := s.repo.DeleteEndpoint(ctx, webhookType, identifier, platform, expected, eventID, requestID)
+	switch result {
+	case DeleteDeleted:
+		target := webhookType + ":" + identifier
+		s.metrics.auditEvents.WithLabelValues(opWebhookEndpointDeleted, outcomeSuccess).Inc()
+		s.logAudit(eventID, opWebhookEndpointDeleted, target, requestID, outcomeSuccess)
+		observability.LogEvent(s.log, slog.LevelInfo, opWebhookEndpointDeleted, "webhook endpoint deleted",
+			"request_id", requestID, "webhook_type", webhookType, "webhook_identifier", identifier, "bot_platform", platform,
+			"bot_id", e.BotID, "credential_kind", e.CredentialKind, "generation_id", e.GenerationID, "config_version", e.ConfigVersion)
+		return nil
+	case DeleteAbsent:
+		return nil
+	case DeletePreconditionRequired:
+		return preconditionRequired()
+	case DeletePreconditionFailed:
+		return preconditionFailed()
+	case DeleteMustBeDisabled:
+		return ConflictError{msg: "Disable the webhook endpoint before deleting it.", code: "endpoint_must_be_disabled"}
+	case DeleteWrongType:
+		s.logMutationFailure("webhook_endpoint_delete_failed", requestID, webhookType, identifier, "wrong_type")
+		return DependencyError{detail: "stored structure has an unexpected type"}
+	case DeleteUncertain:
+		s.logMutationFailure("webhook_endpoint_delete_failed", requestID, webhookType, identifier, "outcome_uncertain")
+		return DependencyError{detail: "delete outcome is uncertain: read the endpoint and audit before retrying"}
+	default:
+		s.logMutationFailure("webhook_endpoint_delete_failed", requestID, webhookType, identifier, "dependency_unavailable")
+		return DependencyError{}
+	}
+}
+
+func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFrom(r.Context())
+	webhookType, identifier, ok := endpointPath(r)
+	if !ok {
+		// A shape that cannot name an endpoint names an absent one.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	expected, err := parseIfMatch(r)
+	if err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	if err := s.DeleteWebhook(r.Context(), webhookType, identifier, expected, requestID); err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

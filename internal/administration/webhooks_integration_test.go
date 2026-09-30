@@ -167,3 +167,67 @@ func TestWebhookEnableDisableOverRealValkey(t *testing.T) {
 		t.Errorf("audit operations = %s", got)
 	}
 }
+
+// deleteWebhook sends DELETE with an optional If-Match.
+func deleteWebhook(t *testing.T, h http.Handler, id, etag string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, "/admin/v1/webhooks/telegram/"+id, nil)
+	req.Header.Set("Authorization", "Bearer admin-secret-value-016")
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestWebhookDeleteOverRealValkey drives the retirement flow: an enabled
+// endpoint refuses deletion, a disabled one is deleted with one audit entry
+// and disappears from reads, the listing, and the webhook route; a repeat
+// is a 204 without audit; recreating the identifier starts a new
+// generation, so the old ETag is refused.
+func TestWebhookDeleteOverRealValkey(t *testing.T) {
+	a := testAdapter(t, false)
+	flushAll(t, a)
+	admin := composedHandler(t, a)
+	hooks := webhookIngestion(t, a)
+	createWebhook(t, admin, "wh_old", "123456789", true)
+	get := func() *httptest.ResponseRecorder {
+		return doJSON(t, admin, http.MethodGet, "/admin/v1/webhooks/telegram/wh_old", "admin-secret-value-016", "")
+	}
+	etag := get().Header().Get("ETag")
+	if code := deleteWebhook(t, admin, "wh_old", etag); code != http.StatusConflict {
+		t.Fatalf("delete enabled = %d", code)
+	}
+	disabled := patchEnabled(t, admin, "wh_old", etag, false).Header().Get("ETag")
+	if code := deleteWebhook(t, admin, "wh_old", disabled); code != http.StatusNoContent {
+		t.Fatalf("delete = %d", code)
+	}
+	if rec := get(); rec.Code != http.StatusNotFound {
+		t.Errorf("read after delete = %d", rec.Code)
+	}
+	if rec := doJSON(t, admin, http.MethodGet, "/admin/v1/webhooks", "admin-secret-value-016", ""); rec.Body.String() != `{"items":[]}`+"\n" {
+		t.Errorf("listing after delete = %s", rec.Body)
+	}
+	if code := sendUpdate(hooks, "wh_old", 1); code != http.StatusNotFound {
+		t.Errorf("webhook after delete = %d", code)
+	}
+	if code := deleteWebhook(t, admin, "wh_old", ""); code != http.StatusNoContent {
+		t.Errorf("repeat delete = %d", code)
+	}
+	var ops []string
+	for _, e := range auditTail(t, a, 100) {
+		ops = append(ops, e["operation"])
+	}
+	if got := strings.Join(ops, ","); got != "webhook_endpoint_created,webhook_endpoint_disabled,webhook_endpoint_deleted" {
+		t.Errorf("audit operations = %s", got)
+	}
+
+	createWebhook(t, admin, "wh_old", "123456789", false)
+	if code := deleteWebhook(t, admin, "wh_old", disabled); code != http.StatusPreconditionFailed {
+		t.Errorf("earlier-generation ETag = %d, want 412", code)
+	}
+	if code := deleteWebhook(t, admin, "wh_old", get().Header().Get("ETag")); code != http.StatusNoContent {
+		t.Errorf("delete recreated = %d", code)
+	}
+}

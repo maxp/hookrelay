@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -176,6 +177,71 @@ func (c *adminClient) reconcileSetEnabled(name string, read *webhookResponse, en
 	case err == nil:
 		result.Endpoint = w
 		fmt.Fprintf(c.env.Stderr, "WARNING: %s does not show the requested state in the generation that was read; operator reconciliation is required. Do not retry blindly.\n", target)
+	default:
+		fmt.Fprintf(c.env.Stderr, "WARNING: %s could not be read (%v); operator reconciliation is required. Do not retry blindly.\n", target, err)
+	}
+	_ = c.printUncertain(result)
+	return ExitError
+}
+
+// outcomeDeleted is the result of a confirmed deletion.
+const outcomeDeleted = "deleted"
+
+// adminWebhookDelete reads the endpoint and its ETag, then deletes it
+// under If-Match. The server refuses an enabled endpoint.
+func adminWebhookDelete(args []string, env adminIO) int {
+	const name = "hookrelay admin webhook delete"
+	client, webhookType, identifier, code := endpointFlags(name, args, env)
+	if code != ExitOK {
+		return code
+	}
+	_, etag, err := client.getWebhookTagged(webhookType, identifier)
+	if err != nil {
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		return ExitError
+	}
+	status, _, data, err := client.doHeaders(http.MethodDelete, webhookPath(webhookType, identifier), nil, map[string]string{"If-Match": etag})
+	switch {
+	case err != nil:
+		return client.reconcileDelete(name, webhookType, identifier, fmt.Sprintf("the request failed: %v", err))
+	case status == http.StatusNoContent:
+		if client.printUncertain(uncertainResult{Outcome: outcomeDeleted, WebhookType: webhookType, WebhookIdentifier: identifier}) != nil {
+			return ExitError
+		}
+		return ExitOK
+	case status >= 500:
+		return client.reconcileDelete(name, webhookType, identifier, fmt.Sprintf("the server reported %v", decodeAPIError(status, data)))
+	case status == http.StatusPreconditionFailed:
+		fmt.Fprintf(env.Stderr, "%s: %v; the endpoint changed since it was read — not retrying, read it again\n", name, decodeAPIError(status, data))
+		return ExitError
+	default:
+		apiErr := decodeAPIError(status, data)
+		fmt.Fprintf(env.Stderr, "%s: %v\n", name, apiErr)
+		if apiErr.Code == "endpoint_must_be_disabled" {
+			fmt.Fprintf(env.Stderr, "%s: run hookrelay admin webhook disable --type %s --identifier %s --yes first\n", name, webhookType, identifier)
+		}
+		return ExitError
+	}
+}
+
+// reconcileDelete handles a deletion whose outcome is unknown. It never
+// retries: observed absence does not prove that this request deleted the
+// endpoint or that its mandatory audit event was written.
+func (c *adminClient) reconcileDelete(name, webhookType, identifier, cause string) int {
+	target := webhookType + ":" + identifier
+	fmt.Fprintf(c.env.Stderr, "%s: outcome uncertain for %s: %s\n", name, target, cause)
+	fmt.Fprintf(c.env.Stderr, "%s: not retrying; reading %s to reconcile\n", name, target)
+	result := uncertainResult{Outcome: outcomeUncertain, WebhookType: webhookType, WebhookIdentifier: identifier}
+	w, err := c.getWebhook(webhookType, identifier)
+	var ae *apiError
+	switch {
+	case errors.As(err, &ae) && ae.Status == http.StatusNotFound:
+		result.Outcome = outcomeDesiredStateObserved
+		fmt.Fprintf(c.env.Stderr, "WARNING: %s is absent, but this does NOT confirm that this request deleted it or that the mandatory audit event was written. "+
+			"Check the audit before any further mutation.\n", target)
+	case err == nil:
+		result.Endpoint = w
+		fmt.Fprintf(c.env.Stderr, "WARNING: %s still exists; operator reconciliation is required. Do not retry blindly.\n", target)
 	default:
 		fmt.Fprintf(c.env.Stderr, "WARNING: %s could not be read (%v); operator reconciliation is required. Do not retry blindly.\n", target, err)
 	}

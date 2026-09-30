@@ -15,6 +15,7 @@ import (
 var scriptOperations = map[string]string{
 	"endpoint_create_v1":      "endpoint_create",
 	"endpoint_set_enabled_v1": "endpoint_update",
+	"endpoint_delete_v1":      "endpoint_delete",
 	"accept_v3":               "accept",
 	"evict_dedup_v1":          "dedup_eviction",
 	"claim_v3":                "claim",

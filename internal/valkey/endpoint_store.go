@@ -286,6 +286,53 @@ func (s *endpointStore) SetEndpointEnabled(ctx context.Context, webhookType, ide
 	}
 }
 
+// DeleteEndpoint runs endpoint_delete_v1: the endpoint Hash, Bot Identity
+// Set membership, listing member, and the mandatory audit append in one
+// atomic operation. The returned Endpoint carries the deleted record's
+// safe identity (bot, credential kind, generation, version) and, in
+// UpdatedMs, the deletion time.
+func (s *endpointStore) DeleteEndpoint(ctx context.Context, webhookType, identifier, botPlatform string, expected *administration.EntityVersion, eventID, requestID string) (*administration.Endpoint, administration.DeleteResult) {
+	generation, version := expectedArgs(expected)
+	res, err := s.a.RunScript(ctx, "endpoint_delete_v1",
+		[]string{"hr1:wh:" + webhookType + ":" + identifier, "hr1:webhooks", auditKey},
+		[]string{webhookType, identifier, botPlatform, generation, version, eventID, requestID})
+	if err != nil {
+		if errors.Is(err, ErrNotDispatched) {
+			return nil, administration.DeleteUnavailable
+		}
+		return nil, administration.DeleteUncertain
+	}
+	switch administration.DeleteResult(res.Status) {
+	case administration.DeleteDeleted:
+		var f [5]string
+		for i := range f {
+			v, err := res.Fields[i].ToString()
+			if err != nil {
+				return nil, administration.DeleteUncertain
+			}
+			f[i] = v
+		}
+		version, err1 := strconv.ParseInt(f[3], 10, 64)
+		deleted, err2 := strconv.ParseInt(f[4], 10, 64)
+		if err1 != nil || err2 != nil {
+			return nil, administration.DeleteUncertain
+		}
+		return &administration.Endpoint{Type: webhookType, Identifier: identifier, BotPlatform: botPlatform, BotID: f[0],
+			CredentialKind: f[1], GenerationID: f[2], ConfigVersion: version, UpdatedMs: deleted}, administration.DeleteDeleted
+	case administration.DeletePreconditionFailed:
+		current, ok := versionFields(res.Fields)
+		if !ok {
+			return nil, administration.DeleteUncertain
+		}
+		return &administration.Endpoint{Type: webhookType, Identifier: identifier, GenerationID: current.GenerationID, ConfigVersion: current.ConfigVersion},
+			administration.DeletePreconditionFailed
+	case administration.DeleteAbsent, administration.DeletePreconditionRequired, administration.DeleteMustBeDisabled, administration.DeleteWrongType:
+		return nil, administration.DeleteResult(res.Status)
+	default:
+		return nil, administration.DeleteUncertain
+	}
+}
+
 // expectedArgs encodes an optional expected entity version as script
 // arguments ("" and "" when absent).
 func expectedArgs(v *administration.EntityVersion) (generation, version string) {
