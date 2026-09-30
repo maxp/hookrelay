@@ -3,6 +3,7 @@ package valkey
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -79,4 +80,21 @@ func (s *sessionStore) DeleteSession(ctx context.Context, digest, eventID, reque
 		return administration.SessionDeleteUnavailable
 	}
 	return administration.SessionDeleteResult(res.Status)
+}
+
+// ExpireSessions runs expire_sessions_v1.
+func (s *sessionStore) ExpireSessions(ctx context.Context, limit int) (int, int64, error) {
+	res, err := s.a.RunScript(ctx, "expire_sessions_v1", []string{adminSessionsKey}, []string{strconv.Itoa(limit), "hr1"})
+	if err != nil {
+		return 0, 0, err
+	}
+	if res.Status == "wrong_type" {
+		return 0, 0, administration.ErrStoredWrongType
+	}
+	n, err1 := res.Fields[0].AsInt64()
+	indexed, err2 := res.Fields[1].AsInt64()
+	if err := errors.Join(err1, err2); err != nil {
+		return 0, 0, fmt.Errorf("valkey: expire_sessions_v1: result shape: %w", err)
+	}
+	return int(n), indexed, nil
 }

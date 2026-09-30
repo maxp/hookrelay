@@ -40,7 +40,8 @@ type ReconcileReport struct {
 	// dedup_expired_removed, dedup_restored, dedup_orphans_removed,
 	// dedup_skipped, dlq_orphans_removed, dlq_restored, dlq_invalid,
 	// dlq_message_missing, counter_repaired, counter_unverified,
-	// admin_auth_initialized, admin_auth_rotated, and (from
+	// admin_auth_initialized, admin_auth_rotated, session_orphans_removed,
+	// sessions_removed, session_index_restored, and (from
 	// ReconcileAndProcessDue) due_leases_processed, due_retries_processed.
 	Findings map[string]int
 	// BlockReasons counts newly created markers by bounded reason.
@@ -111,6 +112,9 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 					"Admin Secret generation "+out.Result, "revoked_sessions", out.Revoked)
 			}
 		}
+	}
+	if err := a.reconcileSessions(ctx, opts, &rep); err != nil {
+		return rep, fmt.Errorf("valkey: administrative sessions: %w", err)
 	}
 	// Scan administrative records at startup and after loss of readiness, not
 	// on every one-second connectivity probe while the service is healthy.
@@ -565,5 +569,69 @@ func (r ReconcileReport) ConsistencyIssues() []ConsistencyIssue {
 	add("dedup_index_orphan", "removed", f["dedup_orphans_removed"])
 	add("queued_counter_drift", "repaired", f["counter_repaired"])
 	add("queued_counter_unverified", "skipped", f["counter_unverified"])
+	add("session_index_orphan", "removed", f["session_orphans_removed"])
+	add("session_invalid", "removed", f["sessions_removed"])
+	add("session_index_missing", "restored", f["session_index_restored"])
 	return out
+}
+
+// reconcileSessions checks every browser session found in the index or by
+// key, repairing the index from the authoritative Hash and deleting
+// sessions that can no longer be valid. Sessions are disposable, so no
+// finding here holds readiness; a wrong-typed structure does.
+func (a *Adapter) reconcileSessions(ctx context.Context, opts ReconcileOptions, rep *ReconcileReport) error {
+	seen := map[string]struct{}{}
+	visit := func(digest string) error {
+		if _, done := seen[digest]; done {
+			return nil
+		}
+		seen[digest] = struct{}{}
+		if !validSessionDigest(digest) {
+			return fmt.Errorf("valkey: invalid session identifier %q", digest)
+		}
+		res, err := a.RunScript(ctx, "reconcile_session_v1", []string{adminAuthKey, adminSessionsKey}, []string{digest, "hr1"})
+		if err != nil {
+			return err
+		}
+		switch res.Status {
+		case "orphan_removed":
+			rep.Findings["session_orphans_removed"]++
+			a.auditRepair(ctx, opts.Gen, opts.Logger, "session_index_repaired", "session", "session_index_orphan")
+		case "removed":
+			reason, _ := res.Fields[0].ToString()
+			rep.Findings["sessions_removed"]++
+			a.auditRepair(ctx, opts.Gen, opts.Logger, "session_index_repaired", "session", "session_"+reason)
+		case "restored":
+			rep.Findings["session_index_restored"]++
+			a.auditRepair(ctx, opts.Gen, opts.Logger, "session_index_repaired", "session", "session_index_missing")
+		case "wrong_type":
+			return fmt.Errorf("valkey: session %s structures have an unexpected type", digest[:8])
+		}
+		return nil
+	}
+	if err := a.scanMembers(ctx, adminSessionsKey, opts.BatchSize, func(members []string) error {
+		for _, m := range members {
+			if err := visit(m); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return a.scanKeys(ctx, "hr1:admin_session:*", opts.BatchSize, func(key string) error {
+		return visit(strings.TrimPrefix(key, "hr1:admin_session:"))
+	})
+}
+
+func validSessionDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !(s[i] >= '0' && s[i] <= '9' || s[i] >= 'a' && s[i] <= 'f') {
+			return false
+		}
+	}
+	return true
 }

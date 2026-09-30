@@ -258,6 +258,7 @@ func Serve(args []string) int {
 		RoundHooks: []func(context.Context) error{
 			adapter.SampleServer,
 			func(ctx context.Context) error { webhooks.MaintainCapacity(ctx); return nil },
+			svc.MaintainSessions,
 		},
 		Gen:   gen.Crypto{},
 		Clock: gen.SystemClock{},

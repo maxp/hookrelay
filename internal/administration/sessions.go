@@ -270,3 +270,23 @@ func (s *Service) csrfFailure(r *http.Request, auth SessionAuth) string {
 	}
 	return ""
 }
+
+// sessionExpiryBatch bounds the sessions one maintenance round expires.
+const sessionExpiryBatch = 100
+
+// MaintainSessions is the maintenance round hook: it removes expired
+// sessions with their best-effort expiry audit and updates the session
+// gauge. Expiry never waits on audit, and an expired session is invalid
+// whether or not this has run.
+func (s *Service) MaintainSessions(ctx context.Context) error {
+	if s.sessions == nil {
+		return nil
+	}
+	n, indexed, err := s.sessions.ExpireSessions(ctx, sessionExpiryBatch)
+	if err != nil {
+		return err
+	}
+	s.auditExpiredSessions(ctx, n)
+	s.metrics.sessions.Set(float64(indexed))
+	return nil
+}

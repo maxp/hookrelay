@@ -31,6 +31,10 @@ type fakeSessions struct {
 	auths    []string
 	deletes  []string
 	csrfSeen []string
+
+	expired   int
+	indexed   int64
+	expireErr error
 }
 
 func (f *fakeSessions) CreateSession(_ context.Context, digest, csrf, _, _ string) SessionCreate {
@@ -42,6 +46,10 @@ func (f *fakeSessions) CreateSession(_ context.Context, digest, csrf, _, _ strin
 func (f *fakeSessions) AuthenticateSession(_ context.Context, digest string) SessionAuth {
 	f.auths = append(f.auths, digest)
 	return f.auth
+}
+
+func (f *fakeSessions) ExpireSessions(context.Context, int) (int, int64, error) {
+	return f.expired, f.indexed, f.expireErr
 }
 
 func (f *fakeSessions) DeleteSession(_ context.Context, digest, _, _ string) SessionDeleteResult {
@@ -412,5 +420,39 @@ func TestCookieAuthenticationMatrix(t *testing.T) {
 	store.auth = SessionAuth{Result: SessionAuthUnavailable}
 	if rec := adminRequest(h, http.MethodGet, "/admin/v1/dead-letters", "", testToken, "", ""); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("unverifiable session = %d", rec.Code)
+	}
+}
+
+// TestMaintainSessions pins the maintenance hook: one best-effort expiry
+// event per removed session, the session gauge, and a storage failure
+// returned to the maintenance round.
+func TestMaintainSessions(t *testing.T) {
+	store := &fakeSessions{expired: 2, indexed: 7}
+	audit := &fakeAudit{}
+	reg := prometheus.NewRegistry()
+	svc, err := NewService(ServiceDeps{Repo: newFakeRepo(), Sessions: store, Catalog: fakeCatalog{}, Audit: audit,
+		AdminSecret: "admin-secret-value-016", Gen: fixedGen{}, Registerer: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MaintainSessions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.events) != 2 || audit.events[0].Operation != "admin_session_expired" || audit.events[1].EventID == "" {
+		t.Errorf("audit = %+v", audit.events)
+	}
+	families, _ := reg.Gather()
+	var gauge float64 = -1
+	for _, f := range families {
+		if f.GetName() == "hookrelay_admin_sessions" {
+			gauge = f.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	if gauge != 7 {
+		t.Errorf("gauge = %v", gauge)
+	}
+	store.expireErr = ErrStoredWrongType
+	if err := svc.MaintainSessions(context.Background()); err == nil {
+		t.Error("failure swallowed")
 	}
 }

@@ -48,6 +48,7 @@ type metrics struct {
 	dlqDeletions       *prometheus.CounterVec
 	loginAttempts      *prometheus.CounterVec
 	csrfRejections     *prometheus.CounterVec
+	sessions           prometheus.Gauge
 }
 
 func newMetrics(reg prometheus.Registerer) (*metrics, error) {
@@ -80,9 +81,13 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "hookrelay_admin_csrf_rejections_total",
 			Help: "Cookie-authenticated requests refused by the Origin or CSRF check, by reason.",
 		}, []string{"reason"}),
+		sessions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hookrelay_admin_sessions",
+			Help: "Indexed administrative browser sessions after the last expiry pass.",
+		}),
 	}
 	for _, c := range []prometheus.Collector{m.auditEvents, m.auditWriteFailures, m.replays, m.payloadViews, m.dlqDeletions,
-		m.loginAttempts, m.csrfRejections} {
+		m.loginAttempts, m.csrfRejections, m.sessions} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("administration: register metrics: %w", err)
 		}

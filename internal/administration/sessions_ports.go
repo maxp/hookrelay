@@ -87,4 +87,7 @@ type SessionStore interface {
 	AuthenticateSession(ctx context.Context, digest string) SessionAuth
 	// DeleteSession revokes the session, auditing an actual logout.
 	DeleteSession(ctx context.Context, digest, eventID, requestID string) SessionDeleteResult
+	// ExpireSessions removes at most limit expired sessions and reports
+	// how many it removed and how many remain indexed.
+	ExpireSessions(ctx context.Context, limit int) (expired int, indexed int64, err error)
 }
