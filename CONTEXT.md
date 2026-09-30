@@ -181,5 +181,31 @@ A canonical message removed from normal delivery after exhausting its retry poli
 _Avoid_: Duplicate message, rejected webhook
 
 **Dead-letter Replay**:
-An operator-requested return of a dead-letter message before all not-yet-started messages in its recipient's delivery queue. Replay does not interrupt a currently leased or retry-wait head and is inserted immediately after that head; otherwise it becomes the queue head. It preserves the canonical message and message identifier, starts a new delivery cycle, creates new delivery attempts and tokens, and does not pass through ingestion duplicate suppression. If the original deduplication identity now points to another message, replay rejects by default; the explicit `keep_current` resolution permits replay without changing the newer mapping.
+An operator-requested return of a dead-letter message before all not-yet-started messages in its recipient's delivery queue, except earlier replays that are still waiting, which keep replay order (first in, first out). Replay does not interrupt a leased delivery attempt and also waits behind a retry-wait head; it is inserted after that head and any waiting replays. Otherwise it becomes the queue head, preempting a ready head that keeps its attempt. Replay is not limited by queue capacity. It preserves the canonical message and message identifier, starts a new delivery cycle, creates new delivery attempts and tokens, and does not pass through ingestion duplicate suppression. If the original deduplication identity now points to another message, replay rejects by default; the explicit `keep_current` resolution permits replay without changing the newer mapping.
 _Avoid_: Webhook retry, new canonical message, duplicate acceptance
+
+**Dead-letter Retention**:
+The bounded period after which a dead-letter message that was never replayed is permanently deleted by background processing. Each such deletion is audited as a state change. Replay before the period ends removes the message from dead-letter and ends its retention.
+_Avoid_: Deduplication retention, success metadata retention, automatic replay
+
+**Recipient Block**:
+A persistent protective marker placed on a recipient whose authoritative delivery state is ambiguous and cannot be repaired safely. It records only when the ambiguity was detected and a bounded reason code. While the block exists, the recipient's delivery queue cannot be claimed and cannot accept new messages; other recipients continue normally. Only an operator can clear the block, by supplying the exact marker as a precondition after its invariants re-verify. Clearing never repairs state.
+_Avoid_: Retry wait, dead-letter, lock, quarantine
+
+**Delivery State**:
+The current classification of one canonical message: `queued`, `leased`, `retry_wait`, `dead_lettered`, or `acknowledged`, together with its current delivery cycle and, while it is in the delivery queue, whether it is at the head or behind it. It exposes no payload or delivery token. Its purpose is to let an operator reconcile a replay whose response was lost. A message with no retained state is not found. Stored state that cannot be classified is reported as ambiguous and never guessed.
+_Avoid_: Queue position, recipient status, attempt history
+
+### Capacity protection
+
+**Acceptance Stop**:
+The condition in which hookrelay refuses new webhook requests with a retryable response while claims, acknowledgements, retries, and retention continue so stored work can drain. It applies when global queue capacity, deduplication capacity, or the configured share of storage memory is reached. It does not make hookrelay unready.
+_Avoid_: Readiness failure, rate limit, recipient block
+
+**Webhook Rate Limit**:
+A token-bucket bound on accepted webhook requests. One bucket applies globally and one applies per webhook endpoint identity, and each replica enforces them independently. A request is admitted only when both buckets hold a token. A refused request receives a retryable `429`.
+_Avoid_: Acceptance stop, in-flight limit, distributed quota
+
+**Deduplication Early Eviction**:
+Removal of the oldest deduplication records before their normal retention ends, used when the deduplication record limit is reached. It never removes a record younger than the minimum deduplication retention. When no record can be evicted without breaking that minimum, acceptance stops instead. After eviction, a very late repeat of an evicted event can be accepted again as a new message.
+_Avoid_: Deduplication, message deletion, queue eviction
