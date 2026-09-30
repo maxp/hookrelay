@@ -73,15 +73,15 @@ if type_of(sessionKey) == 'none' then
   redis.call('ZREM', indexKey, digest)
   return {'invalid', 'absent'}
 end
-local s = redis.call('HMGET', sessionKey, 'last_seen_ms', 'idle_expires_ms', 'absolute_expires_ms', 'generation_id', 'csrf_token')
+local s = redis.call('HMGET', sessionKey, 'created_ms', 'last_seen_ms', 'idle_expires_ms', 'absolute_expires_ms', 'generation_id', 'csrf_token')
 local function valid_ms(v)
   return v and string.match(v, '^[1-9]%d*$') and #v <= 15
 end
-if not (valid_ms(s[1]) and valid_ms(s[2]) and valid_ms(s[3]) and s[4] and s[4] ~= '' and s[5]
-    and #s[5] == 22 and string.match(s[5], '^[A-Za-z0-9_-]+$')) then
+if not (valid_ms(s[1]) and valid_ms(s[2]) and valid_ms(s[3]) and valid_ms(s[4]) and s[5] and s[5] ~= '' and s[6]
+    and #s[6] == 22 and string.match(s[6], '^[A-Za-z0-9_-]+$')) then
   return drop('malformed')
 end
-local lastSeen, idleExpires, absoluteExpires = tonumber(s[1]), tonumber(s[2]), tonumber(s[3])
+local lastSeen, idleExpires, absoluteExpires = tonumber(s[2]), tonumber(s[3]), tonumber(s[4])
 
 local time = redis.call('TIME')
 local now_ms = time[1] * 1000 + math.floor(time[2] / 1000)
@@ -89,7 +89,7 @@ if now_ms >= idleExpires or now_ms >= absoluteExpires then
   return drop('expired')
 end
 local generation = redis.call('HGET', authKey, 'generation_id')
-if not generation or generation ~= s[4] then
+if not generation or generation ~= s[5] then
   return drop('generation_changed')
 end
 
@@ -101,4 +101,4 @@ if now_ms - lastSeen >= refreshMs then
   redis.call('HSET', sessionKey, 'last_seen_ms', now_ms, 'idle_expires_ms', idleExpires)
   redis.call('ZADD', indexKey, idleExpires, digest)
 end
-return {'valid', s[5], idleExpires, absoluteExpires}
+return {'valid', s[6], idleExpires, absoluteExpires}

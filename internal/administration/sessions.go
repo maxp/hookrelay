@@ -214,9 +214,7 @@ func (s *Service) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, SessionView{Authenticated: true, IdleExpiresMs: auth.IdleExpiresMs,
 			AbsoluteExpiresMs: auth.AbsoluteExpiresMs, CSRFToken: auth.CSRFToken})
 	case !present || auth.Result == SessionInvalid:
-		if present {
-			s.clearSessionCookie(w)
-		}
+		s.clearSessionCookie(w)
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no valid administrative session", requestID)
 	default:
 		writeAPIError(w, DependencyError{}, requestID)
@@ -242,11 +240,10 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.forbidden(w, reason, requestID)
 		return
 	}
-	eventID := s.gen.UUIDv7()
-	switch s.sessions.DeleteSession(r.Context(), digest, eventID, requestID) {
+	switch s.sessions.DeleteSession(r.Context(), digest) {
 	case SessionDeleted:
-		s.metrics.auditEvents.WithLabelValues(opAdminLogout, outcomeSuccess).Inc()
-		s.logAuditAs(actorAdminSession, eventID, opAdminLogout, "session", requestID, outcomeSuccess)
+		s.appendBestEffort(r.Context(), AuditEvent{Actor: actorAdminSession, Operation: opAdminLogout, Target: "session",
+			RequestID: requestID, Outcome: outcomeSuccess})
 		fallthrough
 	case SessionDeleteAbsent:
 		s.clearSessionCookie(w)

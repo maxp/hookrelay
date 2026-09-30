@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +27,7 @@ type fakeDeadLetters struct {
 	listAfter []*DeadLetterCursor
 	listLimit []int
 	record    *DeadLetter
+	getErr    error
 	replay    Replay
 	replays   []replayCall
 	payload   Payload
@@ -48,6 +50,9 @@ func (f *fakeDeadLetters) ListDeadLetters(_ context.Context, limit int, after *D
 }
 
 func (f *fakeDeadLetters) GetDeadLetter(_ context.Context, messageID string) (*DeadLetter, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	if f.record == nil || f.record.MessageID != messageID {
 		return nil, nil
 	}
@@ -239,9 +244,9 @@ func TestDeadLetterPayloadContract(t *testing.T) {
 	f := &fakeDeadLetters{payload: Payload{Result: PayloadDisclosed, Message: json.RawMessage(msg), DeliveryCycle: 2,
 		DeadLetteredMs: 1740000000000, RecipientIdentity: "telegram:42:chat:-100"}}
 	h, logs, reg := deadLetterService(t, f)
+	want := `{"message_id":"` + dlqID + `","delivery_cycle":2,"dead_lettered_ms":1740000000000,"message":` + msg + "}\n"
 	for _, body := range []string{"", "{}"} {
 		rec := doJSON(t, h, http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", "admin-secret-value-016", body)
-		want := `{"message_id":"` + dlqID + `","delivery_cycle":2,"dead_lettered_ms":1740000000000,"message":` + msg + "}\n"
 		if rec.Code != http.StatusOK || rec.Body.String() != want {
 			t.Fatalf("payload (body %q) = %d %s", body, rec.Code, rec.Body.String())
 		}
@@ -249,13 +254,22 @@ func TestDeadLetterPayloadContract(t *testing.T) {
 			t.Errorf("Cache-Control = %q", rec.Header().Get("Cache-Control"))
 		}
 	}
+	// An empty chunked/unknown-length body is the same accepted empty body.
+	req := httptest.NewRequest(http.MethodPost, "/admin/v1/dead-letters/"+dlqID+"/payload", strings.NewReader(""))
+	req.ContentLength = -1
+	req.Header.Set("Authorization", "Bearer admin-secret-value-016")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != want {
+		t.Fatalf("payload (empty unknown length) = %d %s", rec.Code, rec.Body.String())
+	}
 	if c := f.views[0]; c.messageID != dlqID || c.resolution != "admin_bearer" || c.eventID == "" || c.requestID == "" {
 		t.Errorf("view call = %+v", c)
 	}
-	if got := counterValue(t, reg, "hookrelay_dlq_payload_inspections_total", map[string]string{"outcome": "disclosed"}); got != 2 {
+	if got := counterValue(t, reg, "hookrelay_dlq_payload_inspections_total", map[string]string{"outcome": "disclosed"}); got != 3 {
 		t.Errorf("views = %v", got)
 	}
-	if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "dead_letter_payload_viewed", "outcome": "success"}); got != 2 {
+	if got := counterValue(t, reg, "hookrelay_audit_events_total", map[string]string{"operation": "dead_letter_payload_viewed", "outcome": "success"}); got != 3 {
 		t.Errorf("audit events = %v", got)
 	}
 	if !strings.Contains(logs.String(), `"event":"dead_letter_payload_viewed"`) || !strings.Contains(logs.String(), `"recipient_scope":"chat"`) {
@@ -270,7 +284,7 @@ func TestDeadLetterPayloadContract(t *testing.T) {
 			t.Errorf("%s: %d %s", name, rec.Code, rec.Body.String())
 		}
 	}
-	if len(f.views) != 2 {
+	if len(f.views) != 3 {
 		t.Error("an invalid request reached the store")
 	}
 
@@ -396,6 +410,11 @@ func TestDeleteDeadLetterContract(t *testing.T) {
 		if rec := doDLQDelete(t, h, "/admin/v1/dead-letters/"+dlqID, bad...); rec.Code != http.StatusNoContent || len(f.deletes) != 1 || f.deletes[0].expected != nil {
 			t.Errorf("If-Match %q on an absent entry = %d, calls %+v", bad, rec.Code, f.deletes)
 		}
+	}
+	f = &fakeDeadLetters{getErr: errors.New("valkey unavailable")}
+	h, _, _ = deadLetterService(t, f)
+	if rec := doDLQDelete(t, h, "/admin/v1/dead-letters/"+dlqID, "*"); rec.Code != http.StatusServiceUnavailable || len(f.deletes) != 0 {
+		t.Errorf("malformed If-Match with read failure = %d, calls %d", rec.Code, len(f.deletes))
 	}
 	f = &fakeDeadLetters{}
 	h, _, reg = deadLetterService(t, f)

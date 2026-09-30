@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/google/uuid"
 
@@ -84,7 +85,11 @@ func (a *Adapter) EnsureAdminAuth(ctx context.Context, secret string, g gen.Gen)
 		}
 		salt, err := base64.RawURLEncoding.DecodeString(rec["generation_salt"])
 		id, idErr := uuid.Parse(rec["generation_id"])
-		if err != nil || len(salt) != adminSaltBytes || len(rec["generation_tag"]) != 64 || idErr != nil || id.Version() != 7 {
+		updated, updatedErr := strconv.ParseInt(rec["updated_ms"], 10, 64)
+		tagBytes, tagErr := hex.DecodeString(rec["generation_tag"])
+		if err != nil || len(salt) != adminSaltBytes || tagErr != nil || len(tagBytes) != sha256.Size ||
+			hex.EncodeToString(tagBytes) != rec["generation_tag"] || idErr != nil || id.Version() != 7 ||
+			updatedErr != nil || updated <= 0 || strconv.FormatInt(updated, 10) != rec["updated_ms"] {
 			return AdminAuthOutcome{}, fmt.Errorf("%w: malformed record", errAdminAuthInconsistent)
 		}
 		tag := adminGenerationTag(secret, salt)

@@ -52,7 +52,7 @@ func (f *fakeSessions) ExpireSessions(context.Context, int) (int, int64, error) 
 	return f.expired, f.indexed, f.expireErr
 }
 
-func (f *fakeSessions) DeleteSession(_ context.Context, digest, _, _ string) SessionDeleteResult {
+func (f *fakeSessions) DeleteSession(_ context.Context, digest string) SessionDeleteResult {
 	f.deletes = append(f.deletes, digest)
 	return f.del
 }
@@ -234,8 +234,8 @@ func TestGetSessionContract(t *testing.T) {
 	if hs.store.auths[0] != sessionDigest(testToken) {
 		t.Errorf("auth digest = %s", hs.store.auths[0])
 	}
-	if rec := hs.request(http.MethodGet, "", "", "", ""); rec.Code != http.StatusUnauthorized || sessionCookieOf(rec) != nil {
-		t.Errorf("no cookie = %d", rec.Code)
+	if rec := hs.request(http.MethodGet, "", "", "", ""); rec.Code != http.StatusUnauthorized || sessionCookieOf(rec) == nil || sessionCookieOf(rec).MaxAge >= 0 {
+		t.Errorf("no cookie = %d, cookie %+v", rec.Code, sessionCookieOf(rec))
 	}
 	if rec := hs.request(http.MethodGet, "", "", "short", ""); rec.Code != http.StatusUnauthorized || sessionCookieOf(rec).MaxAge >= 0 || len(hs.store.auths) != 1 {
 		t.Errorf("malformed cookie = %d, auths %d", rec.Code, len(hs.store.auths))
@@ -278,6 +278,15 @@ func TestLogoutContract(t *testing.T) {
 		len(hs.store.deletes) != 1 || hs.store.deletes[0] != sessionDigest(testToken) {
 		t.Fatalf("logout = %d, deletes %v", rec.Code, hs.store.deletes)
 	}
+	if len(hs.audit.events) != 1 || hs.audit.events[0].Operation != opAdminLogout || hs.audit.events[0].Actor != actorAdminSession ||
+		hs.audit.events[0].RequestID == "" || hs.audit.events[0].Outcome != outcomeSuccess {
+		t.Errorf("logout audit = %+v", hs.audit.events)
+	}
+	hs.audit.fail = true
+	if rec := hs.request(http.MethodDelete, "", testOrigin, testToken, testCSRF); rec.Code != http.StatusNoContent || sessionCookieOf(rec) == nil {
+		t.Errorf("audit failure blocked logout = %d", rec.Code)
+	}
+	hs.audit.fail = false
 	hs.store.del = SessionDeleteAbsent
 	if rec := hs.request(http.MethodDelete, "", testOrigin, testToken, testCSRF); rec.Code != http.StatusNoContent {
 		t.Errorf("absent = %d", rec.Code)

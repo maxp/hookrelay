@@ -73,9 +73,10 @@ func (s *sessionStore) AuthenticateSession(ctx context.Context, digest string) a
 	}
 }
 
-// DeleteSession runs session_delete_v1.
-func (s *sessionStore) DeleteSession(ctx context.Context, digest, eventID, requestID string) administration.SessionDeleteResult {
-	res, err := s.a.RunScript(ctx, "session_delete_v1", []string{adminSessionsKey, auditKey}, []string{digest, eventID, requestID, "hr1"})
+// DeleteSession runs session_delete_v2. Logout audit is appended by the
+// service after confirmed deletion so audit failure cannot prevent revocation.
+func (s *sessionStore) DeleteSession(ctx context.Context, digest string) administration.SessionDeleteResult {
+	res, err := s.a.RunScript(ctx, "session_delete_v2", []string{adminSessionsKey}, []string{digest, "hr1"})
 	if err != nil {
 		return administration.SessionDeleteUnavailable
 	}

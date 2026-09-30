@@ -216,6 +216,11 @@ func init() {
 		"absent":     0,
 		"wrong_type": 0,
 	})
+	register("session_delete_v2", 2, map[string]int{
+		"deleted":    0,
+		"absent":     0,
+		"wrong_type": 0,
+	})
 	register("expire_sessions_v1", 1, map[string]int{
 		"expired":    2, // removed_count, remaining_indexed
 		"wrong_type": 0,

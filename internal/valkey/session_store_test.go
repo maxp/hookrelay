@@ -148,8 +148,9 @@ func TestSessionAuthenticate(t *testing.T) {
 		"malformed csrf": {func(t *testing.T, a *Adapter, d string) {
 			a.testDo(t, "HSET", "hr1:admin_session:"+d, "csrf_token", "x")
 		}, "malformed"},
-		"malformed time": {func(t *testing.T, a *Adapter, d string) { a.testDo(t, "HDEL", "hr1:admin_session:"+d, "last_seen_ms") }, "malformed"},
-		"absent":         {func(t *testing.T, a *Adapter, d string) { a.testDo(t, "DEL", "hr1:admin_session:"+d) }, "absent"},
+		"malformed created": {func(t *testing.T, a *Adapter, d string) { a.testDo(t, "HDEL", "hr1:admin_session:"+d, "created_ms") }, "malformed"},
+		"malformed time":    {func(t *testing.T, a *Adapter, d string) { a.testDo(t, "HDEL", "hr1:admin_session:"+d, "last_seen_ms") }, "malformed"},
+		"absent":            {func(t *testing.T, a *Adapter, d string) { a.testDo(t, "DEL", "hr1:admin_session:"+d) }, "absent"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			a, s := sessionSetup(t)
@@ -194,35 +195,35 @@ func TestSessionAuthenticate(t *testing.T) {
 	}
 }
 
-// TestSessionDelete pins logout: deletion with its audit event, a repeated
-// logout as absent without audit, and wrong types refused unchanged.
+// TestSessionDelete pins logout: deletion despite unavailable audit storage,
+// a repeated logout as absent, and authoritative wrong types refused unchanged.
 func TestSessionDelete(t *testing.T) {
 	ctx := context.Background()
 	a, s := sessionSetup(t)
 	d := digestOf(1)
 	createSession(t, s, d)
-	a.testDo(t, "DEL", "hr1:audit")
-	if r := s.DeleteSession(ctx, d, "evt-out", "req-out"); r != administration.SessionDeleted {
+	a.testDo(t, "SET", "hr1:audit", "x")
+	if r := s.DeleteSession(ctx, d); r != administration.SessionDeleted {
 		t.Fatalf("delete = %s", r)
 	}
 	if exists(t, a, "hr1:admin_session:"+d) || exists(t, a, adminSessionsKey) {
 		t.Error("session or index member kept")
 	}
-	events := auditOps(t, a)
-	if len(events) != 1 || events[0]["operation"] != "admin_logout" || events[0]["event_id"] != "evt-out" || events[0]["request_id"] != "req-out" {
-		t.Errorf("audit = %v", events)
-	}
 	a.testDo(t, "ZADD", adminSessionsKey, "1", d)
-	if r := s.DeleteSession(ctx, d, "evt-2", "req-2"); r != administration.SessionDeleteAbsent {
+	if r := s.DeleteSession(ctx, d); r != administration.SessionDeleteAbsent {
 		t.Errorf("repeat = %s", r)
 	}
-	if _, ok := score(t, a, adminSessionsKey, d); ok || len(auditOps(t, a)) != 1 {
-		t.Error("absent logout kept the stale member or audited")
+	if _, ok := score(t, a, adminSessionsKey, d); ok {
+		t.Error("absent logout kept the stale member")
 	}
-	a.testDo(t, "SET", "hr1:audit", "x")
-	createSession(t, s, digestOf(2))
+
+	d2 := digestOf(2)
+	a.testDo(t, "DEL", "hr1:audit")
+	createSession(t, s, d2)
+	a.testDo(t, "DEL", adminSessionsKey)
+	a.testDo(t, "SET", adminSessionsKey, "x")
 	before := snapshot(t, a)
-	if r := s.DeleteSession(ctx, digestOf(2), "e", "r"); r != administration.SessionDeleteWrongType {
+	if r := s.DeleteSession(ctx, d2); r != administration.SessionDeleteWrongType {
 		t.Errorf("wrong type = %s", r)
 	}
 	assertUnchanged(t, a, before, "wrong_type")
@@ -256,7 +257,7 @@ func TestSessionScriptArguments(t *testing.T) {
 	if _, err := a.RunScript(ctx, "session_authenticate_v1", keys[:2], []string{"abc", "1", "1", "hr1"}); err == nil {
 		t.Error("authenticate short digest accepted")
 	}
-	if _, err := a.RunScript(ctx, "session_delete_v1", []string{adminSessionsKey, "other:audit"}, []string{digestOf(1), "e", "r", "hr1"}); err == nil {
+	if _, err := a.RunScript(ctx, "session_delete_v2", []string{"other:admin_sessions"}, []string{digestOf(1), "hr1"}); err == nil {
 		t.Error("delete foreign key accepted")
 	}
 	if _, err := a.EnsureAdminAuth(ctx, testAdminSecret, gen.Crypto{}); err != nil {
@@ -271,7 +272,7 @@ func TestSessionScriptArguments(t *testing.T) {
 		t.Errorf("authenticate after SCRIPT FLUSH = %+v", auth)
 	}
 	a.testDo(t, "SCRIPT", "FLUSH")
-	if r := store.DeleteSession(ctx, digestOf(1), "e", "r"); r != administration.SessionDeleted {
+	if r := store.DeleteSession(ctx, digestOf(1)); r != administration.SessionDeleted {
 		t.Errorf("delete after SCRIPT FLUSH = %s", r)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -304,11 +305,17 @@ func (s *Service) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request)
 		// absent entry answers 204 with or without If-Match, so the
 		// deletion below runs without a tag and reports the absence.
 		var se StatusError
-		if _, getErr := s.GetDeadLetter(r.Context(), messageID); !errors.As(getErr, &se) || se.Code != "dead_letter_not_found" {
+		_, getErr := s.GetDeadLetter(r.Context(), messageID)
+		switch {
+		case getErr == nil:
 			writeAPIError(w, err, requestID)
 			return
+		case errors.As(getErr, &se) && se.Code == "dead_letter_not_found":
+			expected = nil
+		default:
+			writeAPIError(w, getErr, requestID)
+			return
 		}
-		expected = nil
 	}
 	if err := s.DeleteDeadLetter(r.Context(), messageID, expected, requestID); err != nil {
 		writeAPIError(w, err, requestID)
@@ -386,11 +393,21 @@ func (s *Service) ViewDeadLetterPayload(ctx context.Context, messageID, requestI
 func (s *Service) handleDeadLetterPayload(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r.Context())
 	if r.ContentLength != 0 {
-		// The only accepted body is an empty JSON object.
-		var empty struct{}
-		if err := decodeBody(r, &empty); err != nil {
-			writeAPIError(w, err, requestID)
+		// The only accepted body is empty or exactly an empty JSON object. Peek
+		// one byte so an empty body with unknown/chunked length remains valid.
+		var first [1]byte
+		n, readErr := r.Body.Read(first[:])
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			writeAPIError(w, BadRequestError{msg: "request body could not be read"}, requestID)
 			return
+		}
+		if n != 0 {
+			r.Body = io.NopCloser(io.MultiReader(strings.NewReader(string(first[:n])), r.Body))
+			var empty struct{}
+			if err := decodeBody(r, &empty); err != nil {
+				writeAPIError(w, err, requestID)
+				return
+			}
 		}
 	}
 	v, err := s.ViewDeadLetterPayload(r.Context(), r.PathValue("message_id"), requestID)

@@ -132,10 +132,18 @@ func TestAdminAuthRefusals(t *testing.T) {
 			a.testDo(t, "DEL", adminAuthKey)
 			a.testDo(t, "SET", adminAuthKey, "x")
 		},
-		"salt missing":       func(t *testing.T, a *Adapter) { a.testDo(t, "HDEL", adminAuthKey, "generation_salt") },
-		"salt short":         func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", adminAuthKey, "generation_salt", "c2hvcnQ") },
-		"tag malformed":      func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", adminAuthKey, "generation_tag", "abc") },
+		"salt missing":  func(t *testing.T, a *Adapter) { a.testDo(t, "HDEL", adminAuthKey, "generation_salt") },
+		"salt short":    func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", adminAuthKey, "generation_salt", "c2hvcnQ") },
+		"tag malformed": func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", adminAuthKey, "generation_tag", "abc") },
+		"tag not hex": func(t *testing.T, a *Adapter) {
+			a.testDo(t, "HSET", adminAuthKey, "generation_tag", strings.Repeat("z", 64))
+		},
+		"tag uppercase": func(t *testing.T, a *Adapter) {
+			a.testDo(t, "HSET", adminAuthKey, "generation_tag", strings.Repeat("A", 64))
+		},
 		"generation not v7":  func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", adminAuthKey, "generation_id", uuid.NewString()) },
+		"updated missing":    func(t *testing.T, a *Adapter) { a.testDo(t, "HDEL", adminAuthKey, "updated_ms") },
+		"updated malformed":  func(t *testing.T, a *Adapter) { a.testDo(t, "HSET", adminAuthKey, "updated_ms", "01") },
 		"index not a zset":   func(t *testing.T, a *Adapter) { a.testDo(t, "SET", adminSessionsKey, "x") },
 		"audit not a stream": func(t *testing.T, a *Adapter) { a.testDo(t, "DEL", "hr1:audit"); a.testDo(t, "SET", "hr1:audit", "x") },
 		"too many sessions": func(t *testing.T, a *Adapter) {

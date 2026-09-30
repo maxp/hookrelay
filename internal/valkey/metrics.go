@@ -33,6 +33,7 @@ var scriptOperations = map[string]string{
 	"session_create_v1":       "session_create",
 	"session_authenticate_v1": "session_authenticate",
 	"session_delete_v1":       "session_delete",
+	"session_delete_v2":       "session_delete",
 	"expire_sessions_v1":      "session_expiry",
 	"reconcile_session_v1":    "reconciliation",
 	"delivery_state_v1":       "delivery_state_read",
