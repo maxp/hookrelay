@@ -122,7 +122,7 @@ HOOKRELAY_WEBHOOK_ENDPOINT_BURST
 HOOKRELAY_MAX_INFLIGHT_WEBHOOKS
 ```
 
-Rates are positive decimal requests per second, and bursts are nonnegative integer token capacities. Zero disables a limit in development. Production requires nonzero global and endpoint limits. These configure process-local token buckets rather than a distributed quota. Milestone 1 parses and validates the rates and bursts (including the production nonzero rule) but does not yet enforce them; token-bucket enforcement arrives with the Milestone 2 maintenance slice. Maximum in-flight webhooks defaults to 100 and is enforced independently of rate from Milestone 1.
+Rates are positive decimal requests per second, and bursts are nonnegative integer token capacities. Zero disables a limit in development. Production requires nonzero global and endpoint limits. These configure process-local token buckets rather than a distributed quota. Milestone 2 enforces them: a refused request receives `429` with `Retry-After` in whole seconds until a token (at least 1); a burst below one holds one token; the per-endpoint buckets are a bounded LRU of 10,000 endpoints. Maximum in-flight webhooks defaults to 100 and is enforced independently of rate from Milestone 1.
 
 ## Valkey client resources
 

@@ -26,7 +26,7 @@ func claimReq(op, args, token string) delivery.ClaimRequest {
 	return delivery.ClaimRequest{OperationID: op, ArgsDigest: args, Token: token, TokenDigest: hex.EncodeToString(sum[:]), RecordEmpty: true}
 }
 
-// enqueue accepts one message for a recipient through accept_v2.
+// enqueue accepts one message for a recipient through accept_v3.
 func enqueue(t *testing.T, a *Adapter, messageID, rid string) {
 	t.Helper()
 	r := acceptReq(messageID, "d-"+messageID, "b-"+messageID)

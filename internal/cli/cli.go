@@ -161,6 +161,8 @@ func Serve(args []string) int {
 	svc, err := administration.NewService(administration.ServiceDeps{
 		Repo:        valkey.NewEndpointStore(adapter),
 		Recipients:  valkey.NewRecipientStore(adapter, cfg.MaxQueuedMessagesPerRecipient),
+		DeadLetters: valkey.NewDeadLetterStore(adapter),
+		Messages:    valkey.NewMessageStateStore(adapter),
 		Catalog:     typeCatalog{registry: webhookTypes},
 		Audit:       valkey.NewAuditSink(adapter),
 		AdminSecret: adminSecret,
@@ -179,6 +181,8 @@ func Serve(args []string) int {
 		MaxQueuedMessagesPerRecipient: cfg.MaxQueuedMessagesPerRecipient,
 		MaxDedupRecords:               cfg.MaxDedupRecords,
 		DedupRetention:                cfg.DedupRetention,
+		DedupMinRetention:             cfg.DedupMinRetention,
+		EvictionBatch:                 cfg.MaintenanceBatchSize,
 	})
 	webhooks, err := ingestion.NewHandler(ingestion.HandlerDeps{
 		Registry:         webhookTypes,
@@ -186,12 +190,20 @@ func Serve(args []string) int {
 		Acceptor:         acceptor,
 		Capacity:         acceptor,
 		OnAcceptanceStop: func() { readiness.SetAcceptingWebhooks(false) },
-		MaxInflight:      cfg.MaxInflightWebhooks,
-		Gen:              gen.Crypto{},
-		Clock:            gen.SystemClock{},
-		TrustedProxies:   cfg.TrustedProxyCIDRs,
-		Logger:           log,
-		Registerer:       registry,
+		RateLimits: ingestion.RateLimits{
+			GlobalRate: cfg.WebhookGlobalRate, GlobalBurst: cfg.WebhookGlobalBurst,
+			EndpointRate: cfg.WebhookEndpointRate, EndpointBurst: cfg.WebhookEndpointBurst,
+		},
+		MemoryStopPercent: cfg.MemoryAcceptanceStopPercent,
+		DedupRetention:    cfg.DedupRetention,
+		DedupMinRetention: cfg.DedupMinRetention,
+		DedupEvictor:      acceptor,
+		MaxInflight:       cfg.MaxInflightWebhooks,
+		Gen:               gen.Crypto{},
+		Clock:             gen.SystemClock{},
+		TrustedProxies:    cfg.TrustedProxyCIDRs,
+		Logger:            log,
+		Registerer:        registry,
 	})
 	if err != nil {
 		log.Error("ingestion wiring failed", "event", "startup_failed", "error_code", "internal_error")
@@ -216,11 +228,18 @@ func Serve(args []string) int {
 		JitterMax:   cfg.RetryJitterMax,
 	}
 	maintenance, err := delivery.NewMaintenance(delivery.MaintenanceDeps{
-		Retries:     deliveryStore,
-		Leases:      deliveryStore,
-		RetryPolicy: retryPolicy,
-		Attempts:    attempts,
-		Clock:       gen.SystemClock{},
+		Retries:      deliveryStore,
+		Leases:       deliveryStore,
+		RetryPolicy:  retryPolicy,
+		Attempts:     attempts,
+		DeadLetters:  deliveryStore,
+		DLQRetention: cfg.DLQRetention,
+		RoundHooks: []func(context.Context) error{
+			adapter.SampleServer,
+			func(ctx context.Context) error { webhooks.MaintainCapacity(ctx); return nil },
+		},
+		Gen:   gen.Crypto{},
+		Clock: gen.SystemClock{},
 		Config: delivery.MaintenanceConfig{
 			Interval:             cfg.MaintenanceInterval,
 			IntervalJitter:       cfg.MaintenanceIntervalJitter,

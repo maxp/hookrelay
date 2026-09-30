@@ -302,10 +302,10 @@ func (a *Adapter) ReconcileAndProcessDue(ctx context.Context, opts ReconcileOpti
 	return merged, nil
 }
 
-// reconcileRecipient runs reconcile_recipient_v2 and returns the counted
+// reconcileRecipient runs reconcile_recipient_v3 and returns the counted
 // queue length (-1 when uncountable).
 func (a *Adapter) reconcileRecipient(ctx context.Context, g gen.Gen, log *slog.Logger, rid string, bound int, rep *ReconcileReport) (int64, error) {
-	res, err := a.RunScript(ctx, "reconcile_recipient_v2",
+	res, err := a.RunScript(ctx, "reconcile_recipient_v3",
 		[]string{"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:retries"},
 		[]string{rid, strconv.Itoa(bound), "hr1"})
 	if err != nil {

@@ -20,8 +20,8 @@ func init() {
 		"bot_endpoint_limit": 0,
 		"wrong_type":         0,
 	})
-	register("accept_v2", 2, map[string]int{
-		"accepted":           1, // accepted_ms
+	register("accept_v3", 3, map[string]int{
+		"accepted":           2, // accepted_ms, early_evicted
 		"duplicate":          1, // original message_id
 		"duplicate_conflict": 1, // original message_id
 		"recipient_blocked":  0,
@@ -43,7 +43,7 @@ func init() {
 		"empty":                  1, // blocked_detected
 		"wrong_type":             0,
 	})
-	register("ack_v3", 3, map[string]int{
+	register("ack_v4", 4, map[string]int{
 		// message_id, acknowledged_ms, recipient_identity, delivery_cycle,
 		// attempt, claimed_ms (the last four are empty/zero for a repeat)
 		"acknowledged":         6,
@@ -54,7 +54,7 @@ func init() {
 		"recipient_blocked":    0,
 		"wrong_type":           0,
 	})
-	register("nack_v2", 2, map[string]int{
+	register("nack_v3", 3, map[string]int{
 		// message_id, attempt, retry_at_ms, recipient_identity,
 		// delivery_cycle, claimed_ms, completed_ms
 		"retry_scheduled": 7,
@@ -70,14 +70,14 @@ func init() {
 		"recipient_blocked":    0,
 		"wrong_type":           0,
 	})
-	register("inspect_block_v1", 1, map[string]int{
+	register("inspect_block_v2", 2, map[string]int{
 		// marker, detected_ms, reason_code, queue_length, head_message_id,
 		// status, delivery_cycle, attempt, lease_expires_ms, retry_at_ms,
 		// head_message_present, in_ready, in_leases, in_retries, in_blocked,
 		// invariants
 		"inspected": 16,
 	})
-	register("clear_block_v1", 1, map[string]int{
+	register("clear_block_v2", 2, map[string]int{
 		"cleared":             1, // restored index: ready | leases | retries | none
 		"not_found":           0,
 		"precondition_failed": 0,
@@ -103,7 +103,7 @@ func init() {
 		"recipient_blocked": 0,
 		"wrong_type":        0,
 	})
-	register("expire_lease_v2", 2, map[string]int{
+	register("expire_lease_v3", 3, map[string]int{
 		// message_id, attempt, retry_at_ms, delivery_cycle, claimed_ms,
 		// expired_ms, consumer_instance_id (empty when absent)
 		"retry_scheduled": 7,
@@ -114,7 +114,7 @@ func init() {
 		"recipient_blocked": 0,
 		"wrong_type":        0,
 	})
-	register("reconcile_recipient_v2", 2, map[string]int{
+	register("reconcile_recipient_v3", 3, map[string]int{
 		// repairs, queue_length, reason
 		"consistent":      3,
 		"repaired":        3,
@@ -124,6 +124,33 @@ func init() {
 		"due_lease":       3,
 		"due_retry":       3,
 		"unhandled":       3,
+	})
+	register("replay_dlq_v2", 2, map[string]int{
+		// delivery_cycle, queue_position, replayed_ms,
+		// deduplication_resolution, recipient_identity
+		"replayed":               5,
+		"not_found":              0,
+		"message_missing":        0,
+		"recipient_blocked":      0,
+		"deduplication_conflict": 0,
+		"wrong_type":             0,
+	})
+	register("delivery_state_v1", 1, map[string]int{
+		"found":        3, // state, delivery_cycle, queue_position
+		"not_found":    0,
+		"inconsistent": 1, // reason
+	})
+	register("expire_dlq_v1", 1, map[string]int{
+		// dead_lettered_ms, recipient_identity, dead_letter_reason, expired_ms
+		"expired":    4,
+		"not_due":    0,
+		"stale":      0,
+		"wrong_type": 0,
+	})
+	register("evict_dedup_v1", 1, map[string]int{
+		// count, oldest_accepted_ms, live_records, stop
+		"evicted":    4,
+		"wrong_type": 0,
 	})
 	register("reconcile_dlq_v1", 1, map[string]int{
 		// message id lists: orphans removed, restored, invalid, missing

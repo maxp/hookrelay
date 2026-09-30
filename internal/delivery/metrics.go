@@ -53,6 +53,7 @@ type metrics struct {
 	claims             *prometheus.CounterVec
 	retriesWaiting     prometheus.Gauge
 	deadLetterMessages prometheus.Gauge
+	oldestReadyAge     prometheus.Gauge
 	activeLeases       prometheus.Gauge
 	readyRecipients    prometheus.Gauge
 	blockedRecipients  prometheus.Gauge
@@ -68,6 +69,10 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 		retriesWaiting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "hookrelay_retries_waiting",
 			Help: "Recipients whose head message waits for a retry.",
+		}),
+		oldestReadyAge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hookrelay_oldest_ready_message_age_seconds",
+			Help: "Age of the head message of the Recipient ready longest, from its received_ms.",
 		}),
 		deadLetterMessages: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "hookrelay_dead_letter_messages",
@@ -90,7 +95,7 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 			Help: "Messages queued across all Recipients.",
 		}),
 	}
-	collectors := []prometheus.Collector{m.claims, m.retriesWaiting, m.deadLetterMessages, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
+	collectors := []prometheus.Collector{m.claims, m.retriesWaiting, m.deadLetterMessages, m.oldestReadyAge, m.activeLeases, m.readyRecipients, m.blockedRecipients, m.queueMessages,
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "hookrelay_waiting_claims",
 			Help: "Claim requests waiting for work in this process.",

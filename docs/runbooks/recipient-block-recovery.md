@@ -57,6 +57,7 @@ The general invariants include:
 - an existing head state references `LINDEX(queue, 0)`;
 - every queued `message_id` has its required Canonical Message;
 - only the queue head has active delivery state;
+- every queued non-head message with attempt history carries a complete saved replay pair (`pending_delivery_cycle`, `pending_attempt`) in its message metadata; `queued_delivery_state_missing` or `queued_delivery_state_invalid` means that pair must be reconstructed from the audit and attempt history, never reset to cycle 1, attempt 1;
 - status and deadline fields agree;
 - no active Delivery Token is invented, copied, or replaced;
 - a Dead-letter Message is not simultaneously present as a normal queued position except during the defined atomic replay transition;

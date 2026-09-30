@@ -455,6 +455,7 @@ func (h *Handler) RefreshGauges(ctx context.Context) {
 	h.metrics.queueMessages.Set(float64(s.QueuedMessages))
 	h.metrics.retriesWaiting.Set(float64(s.RetriesWaiting))
 	h.metrics.deadLetterMessages.Set(float64(s.DeadLetterMessages))
+	h.metrics.oldestReadyAge.Set(float64(s.OldestReadyAgeMs) / 1000)
 }
 
 type ackRequest struct {

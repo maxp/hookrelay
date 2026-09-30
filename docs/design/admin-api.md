@@ -293,7 +293,7 @@ It returns the marker, bounded queue-head and state metadata, presence of the re
 
 It succeeds with `204 No Content` only if those preconditions and all authoritative-state invariants match; it never repairs authoritative state. As for endpoint preconditions, missing `expected_*` values return `428 precondition_required` and a changed marker `412 precondition_failed`; a missing marker returns `404 recipient_block_not_found` and failed invariants `409 recipient_state_ambiguous` naming the first violated invariant. One Lua operation removes the marker, restores exactly the derived index implied by the verified state, and appends the mandatory audit event. See the [Recipient block recovery runbook](../runbooks/recipient-block-recovery.md).
 
-`GET /admin/v1/messages/{message_id}/delivery-state` returns only `message_id`, `delivery_cycle`, the bounded state `queued`, `leased`, `retry_wait`, `dead_lettered`, or `acknowledged`, and safe queue-position classification. It exists in Milestone 2 so a replay with a lost response can be reconciled without exposing payloads or Delivery Tokens.
+`GET /admin/v1/messages/{message_id}/delivery-state` returns only `message_id`, `delivery_cycle`, the bounded state `queued`, `leased`, `retry_wait`, `dead_lettered`, or `acknowledged`, and safe queue-position classification. It exists in Milestone 2 so a replay with a lost response can be reconciled without exposing payloads or Delivery Tokens. `queue_position` is `head` or `behind_head` for a queued, leased, or retry-waiting message and absent otherwise; the Delivery Cycle of a message queued behind the head is its saved pending cycle (1 without replay history). `acknowledged` is reported only while the 24-hour compact success metadata is retained. A message with no retained state returns `404 message_not_found`; stored state that cannot be classified (for example attempt history without a saved pending pair) returns `409 recipient_state_ambiguous` naming the reason.
 
 Payload inspection is deliberately `POST`, because it appends the mandatory access audit before returning the Canonical Message and therefore is not a safe read. Replay and permanent deletion use the mandatory state-change-plus-audit transitions. A missing Dead-letter Message returns `404 dead_letter_not_found`; an existing Recipient block returns `409 recipient_blocked`. Permanent deletion is idempotent for an absent message and returns `204` without another audit event, subject to the same uncertain-outcome warning as other administrative deletion.
 
@@ -318,7 +318,7 @@ The field defaults to `reject`. If the original Deduplication Identity points to
 }
 ```
 
-`queue_position` is `head` or `after_active_head`; `deduplication_resolution` is `not_conflicting` or `kept_current`. Before replay, the CLI reads the current Delivery Cycle. After a lost response it never retries blindly: it reads the DLQ entry and delivery-state route. A newer cycle outside the DLQ is reported as desired state observed with audit confirmation still required; every other inconclusive combination is an uncertain outcome handled by the reconciliation runbook. The remaining operational views, payload command, permanent deletion, and audit UI contracts are completed with their later milestone rather than guessed by the storage adapter.
+`queue_position` is `head`, `after_active_head`, or `after_pending_replay` (behind earlier replays still waiting, which keep replay order); `deduplication_resolution` is `not_conflicting` or `kept_current`. The dead-letter list returns safe metadata (`message_id`, structured `recipient`, `dead_lettered_ms`, `dead_letter_reason`, `delivery_cycle`) newest first with an opaque cursor over the DLQ score and member; the single read adds the retained attempt history. A dead letter whose Canonical Message is missing, or whose stored structures have an unexpected type, refuses replay with `503 dependency_unavailable` (a definite refusal; reconciliation holds readiness for the missing message). Before replay, the CLI reads the current Delivery Cycle. After a lost response it never retries blindly: it reads the delivery-state route, which also reports a dead-lettered message with its cycle. A newer cycle in any state, including dead-lettered again, is reported as desired state observed (only replay advances the cycle) with audit confirmation still required; every other inconclusive combination is an uncertain outcome handled by the reconciliation runbook. The remaining operational views, payload command, permanent deletion, and audit UI contracts are completed with their later milestone rather than guessed by the storage adapter.
 
 ## Error envelope
 
@@ -352,6 +352,7 @@ unsupported_webhook_type
 unsupported_credential_kind
 endpoint_must_be_disabled
 dead_letter_not_found
+message_not_found
 deduplication_conflict
 recipient_blocked
 recipient_block_not_found

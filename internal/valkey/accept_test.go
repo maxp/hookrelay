@@ -296,18 +296,19 @@ func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {
 
 	keys := []string{"hr1:d:d1", "hr1:dedup_age", "hr1:m:m1", "hr1:r:" + testRecipient + ":q", "hr1:r:" + testRecipient + ":s",
 		"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:q:" + testRecipient, "hr1:stats:queued_messages", "hr1:mi:m1"}
-	valid := []string{"m1", "d1", "b1", "1740000000000", "", "{}", testRecipient, "100", "10", "100", "3600000"}
+	valid := []string{"m1", "d1", "b1", "1740000000000", "", "{}", testRecipient, "100", "10", "100", "3600000", "60000"}
 	with := func(i int, v string) []string {
 		args := append([]string(nil), valid...)
 		args[i] = v
 		return args
 	}
-	if _, err := a.RunScript(ctx, "accept_v2", keys, valid); err != nil {
+	if _, err := a.RunScript(ctx, "accept_v3", keys, valid); err != nil {
 		t.Fatalf("valid call failed: %v", err)
 	}
 	flushAll(t, a)
 	for name, args := range map[string][]string{
-		"too few arguments":      valid[:10],
+		"too few arguments":      valid[:11],
+		"zero min retention":     with(11, "0"),
 		"empty message_id":       with(0, ""),
 		"non-numeric limit":      with(7, "many"),
 		"zero retention":         with(10, "0"),
@@ -315,7 +316,7 @@ func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {
 		"recipient key mismatch": with(6, "telegram:42:chat:other"),
 		"message key mismatch":   with(0, "m2"),
 	} {
-		_, err := a.RunScript(ctx, "accept_v2", keys, args)
+		_, err := a.RunScript(ctx, "accept_v3", keys, args)
 		if err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v, want a script error", name, err)
 		}
@@ -329,7 +330,7 @@ func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {
 		"too few keys":          keys[:11],
 		"metadata key mismatch": withKey(11, "hr1:mi:other"),
 	} {
-		if _, err := a.RunScript(ctx, "accept_v2", k, valid); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "accept_v3", k, valid); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v, want a script error", name, err)
 		}
 	}
@@ -341,7 +342,7 @@ func TestAcceptScriptRejectsInvalidArguments(t *testing.T) {
 	// like an existing blob: an error reply and no writes.
 	a.testDo(t, "HSET", "hr1:mi:m1", "dedup_identity_digest", "other")
 	before := snapshot(t, a)
-	if _, err := a.RunScript(ctx, "accept_v2", keys, valid); err == nil || errors.Is(err, ErrNotDispatched) {
+	if _, err := a.RunScript(ctx, "accept_v3", keys, valid); err == nil || errors.Is(err, ErrNotDispatched) {
 		t.Errorf("existing metadata: err = %v, want a script error", err)
 	}
 	assertUnchanged(t, a, before, "existing metadata")

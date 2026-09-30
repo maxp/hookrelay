@@ -134,7 +134,7 @@ func TestReconcileRetryIndex(t *testing.T) {
 	}
 }
 
-// deadLetterOne dead-letters the head of rid through nack_v2 with a
+// deadLetterOne dead-letters the head of rid through nack_v3 with a
 // single-attempt policy and returns its dead_lettered_ms.
 func deadLetterOne(t *testing.T, s *DeliveryStore, op, token string) int64 {
 	t.Helper()

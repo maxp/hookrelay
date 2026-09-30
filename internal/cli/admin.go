@@ -76,6 +76,11 @@ const adminUsage = `usage:
   hookrelay admin recipients inspect-block <recipient> [common flags]
   hookrelay admin recipients clear-block <recipient> --expected-detected-ms <ms>
       --expected-reason-code <code> --yes [common flags]
+  hookrelay admin dlq list [--limit <n>] [--cursor <c>] [common flags]
+  hookrelay admin dlq get --message-id <id> [common flags]
+  hookrelay admin dlq replay --message-id <id> [--deduplication-conflict-resolution reject|keep_current]
+      --yes [common flags]
+  hookrelay admin message delivery-state --message-id <id> [common flags]
 
 recipient: --bot-platform <p> --bot-id <id> --scope <chat|user|bot|relay> [--chat-id <id> | --user-id <id>]
 
@@ -91,6 +96,12 @@ The webhook credential comes from --credential-file or HOOKRELAY_WEBHOOK_CREDENT
 func runAdmin(args []string, env adminIO) int {
 	if len(args) >= 1 && args[0] == "recipients" {
 		return runRecipients(args[1:], env)
+	}
+	if len(args) >= 1 && args[0] == "dlq" {
+		return runDLQ(args[1:], env)
+	}
+	if len(args) >= 1 && args[0] == "message" {
+		return runMessage(args[1:], env)
 	}
 	if len(args) < 2 || args[0] != "webhook" {
 		fmt.Fprint(env.Stderr, adminUsage)

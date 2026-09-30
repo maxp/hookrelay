@@ -87,11 +87,11 @@ func (s *recipientStore) ListRecipientStates(ctx context.Context, status adminis
 	return out, nil
 }
 
-// InspectBlock runs inspect_block_v1: one atomic read that applies the
-// checks and order of clear_block_v1, so the first violated invariant is
+// InspectBlock runs inspect_block_v2: one atomic read that applies the
+// checks and order of clear_block_v2, so the first violated invariant is
 // the one a clear would refuse with. It never returns a token or payload.
 func (s *recipientStore) InspectBlock(ctx context.Context, rid string) (administration.BlockInspection, error) {
-	res, err := s.a.RunScript(ctx, "inspect_block_v1",
+	res, err := s.a.RunScript(ctx, "inspect_block_v2",
 		[]string{"hr1:ready", "hr1:leases", "hr1:retries", "hr1:blocked"},
 		[]string{rid, strconv.Itoa(s.bound), "hr1"})
 	if err != nil {
@@ -125,14 +125,14 @@ func (s *recipientStore) InspectBlock(ctx context.Context, rid string) (administ
 		}
 	}
 	if out.ViolatedInvariants, err = f[15].AsStrSlice(); err != nil {
-		return administration.BlockInspection{}, fmt.Errorf("valkey: inspect_block_v1: invariants shape: %w", err)
+		return administration.BlockInspection{}, fmt.Errorf("valkey: inspect_block_v2: invariants shape: %w", err)
 	}
 	return out, nil
 }
 
-// ClearBlock runs clear_block_v1.
+// ClearBlock runs clear_block_v2.
 func (s *recipientStore) ClearBlock(ctx context.Context, rid string, expectedDetectedMs int64, expectedReasonCode, eventID, requestID string) (administration.ClearBlockResult, string) {
-	res, err := s.a.RunScript(ctx, "clear_block_v1",
+	res, err := s.a.RunScript(ctx, "clear_block_v2",
 		[]string{"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", auditKey},
 		[]string{rid, strconv.FormatInt(expectedDetectedMs, 10), expectedReasonCode, eventID, requestID, strconv.Itoa(s.bound), "hr1"})
 	if err != nil {

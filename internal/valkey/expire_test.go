@@ -310,11 +310,11 @@ func TestExpireLeaseArgumentsAndReload(t *testing.T) {
 		"zero tombstone ttl": with(3, "0"),
 		"prefix mismatch":    with(4, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "expire_lease_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "expire_lease_v3", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}
-	if _, err := a.RunScript(ctx, "expire_lease_v2", keys[:6], valid); err == nil || errors.Is(err, ErrNotDispatched) {
+	if _, err := a.RunScript(ctx, "expire_lease_v3", keys[:6], valid); err == nil || errors.Is(err, ErrNotDispatched) {
 		t.Errorf("too few keys: err = %v", err)
 	}
 

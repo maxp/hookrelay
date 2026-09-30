@@ -4,7 +4,10 @@
 // here; callers never see Valkey keys or scripts.
 package delivery
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ClaimRequest is one atomic claim check.
 type ClaimRequest struct {
@@ -69,6 +72,10 @@ type Stats struct {
 	QueuedMessages     int64
 	RetriesWaiting     int64
 	DeadLetterMessages int64
+	// OldestReadyAgeMs is the age of the head message of the Recipient
+	// ready longest (lowest ready sequence), from its received_ms; 0 when
+	// nothing is ready.
+	OldestReadyAgeMs int64
 }
 
 // StatsReader reads the delivery gauges' sources.
@@ -174,7 +181,10 @@ type NegativeAcknowledger interface {
 // deadline (retry_at_ms or lease_expires_ms) it is due at.
 type DueEntry struct {
 	RecipientIdentity string
-	DueMs             int64
+	// MessageID locates a dead letter (DLQ retention entries carry no
+	// Recipient identity).
+	MessageID string
+	DueMs     int64
 }
 
 // DueBatch is one bounded, oldest-first read of due entries. NowMs is the
@@ -242,6 +252,37 @@ type ExpiryResult struct {
 type LeaseExpirer interface {
 	DueLeases(ctx context.Context, limit int) (DueBatch, error)
 	ExpireLease(ctx context.Context, recipientIdentity string, retryDelaysMs []int64, maxAttempts int) ExpiryResult
+}
+
+// DLQExpiryOutcome is the bounded result of one dead-letter retention
+// expiry.
+type DLQExpiryOutcome string
+
+const (
+	DLQExpiryExpired               DLQExpiryOutcome = "expired"
+	DLQExpiryNotDue                DLQExpiryOutcome = "not_due"
+	DLQExpiryStale                 DLQExpiryOutcome = "stale"
+	DLQExpiryDependencyUnavailable DLQExpiryOutcome = "dependency_unavailable"
+	DLQExpiryInternalFailure       DLQExpiryOutcome = "internal_failure"
+)
+
+// DLQExpiryResult carries the deleted dead letter's safe metadata.
+type DLQExpiryResult struct {
+	Outcome           DLQExpiryOutcome
+	RecipientIdentity string
+	Reason            string
+	DeadLetteredMs    int64
+	ExpiredMs         int64
+}
+
+// DeadLetterExpirer reads dead letters past their retention and runs the
+// atomic, audited deletion, which re-validates the record and Valkey time.
+type DeadLetterExpirer interface {
+	// DueDeadLetters returns at most limit DLQ members whose
+	// dead_lettered_ms + retention has passed, oldest first; DueMs is
+	// that retention deadline.
+	DueDeadLetters(ctx context.Context, limit int, retention time.Duration) (DueBatch, error)
+	ExpireDeadLetter(ctx context.Context, messageID string, retention time.Duration, eventID string) DLQExpiryResult
 }
 
 // ExtendRequest extends one lease by its token, idempotent by OperationID.

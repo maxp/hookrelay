@@ -3,6 +3,7 @@ package valkey
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,16 +14,20 @@ import (
 // label; non-script reads use endpoint_read.
 var scriptOperations = map[string]string{
 	"endpoint_create_v1":     "endpoint_create",
-	"accept_v2":              "accept",
+	"accept_v3":              "accept",
+	"evict_dedup_v1":         "dedup_eviction",
 	"claim_v3":               "claim",
-	"ack_v3":                 "acknowledgement",
-	"nack_v2":                "negative_acknowledgement",
+	"ack_v4":                 "acknowledgement",
+	"nack_v3":                "negative_acknowledgement",
 	"activate_retry_v1":      "retry_activation",
 	"extend_v1":              "extension",
-	"clear_block_v1":         "recipient_block_clear",
-	"inspect_block_v1":       "recipient_block_inspect",
-	"expire_lease_v2":        "lease_expiry",
-	"reconcile_recipient_v2": "reconciliation",
+	"clear_block_v2":         "recipient_block_clear",
+	"inspect_block_v2":       "recipient_block_inspect",
+	"replay_dlq_v2":          "dead_letter_replay",
+	"delivery_state_v1":      "delivery_state_read",
+	"expire_dlq_v1":          "dlq_retention",
+	"expire_lease_v3":        "lease_expiry",
+	"reconcile_recipient_v3": "reconciliation",
 	"reconcile_dlq_v1":       "reconciliation",
 	"reconcile_dedup_v1":     "reconciliation",
 	"reconcile_counter_v1":   "reconciliation",
@@ -38,6 +43,11 @@ type adapterMetrics struct {
 	duration     *prometheus.HistogramVec
 	scriptErrors *prometheus.CounterVec
 	connected    prometheus.Gauge
+	// Server samples (SampleServer).
+	memoryUsed      prometheus.Gauge
+	memoryMax       prometheus.Gauge
+	aofEnabled      prometheus.Gauge
+	aofDelayedFsync atomic.Int64
 }
 
 // Instrument registers the Valkey metrics and starts recording them.
@@ -61,7 +71,23 @@ func (a *Adapter) Instrument(reg prometheus.Registerer) error {
 			Help: "1 while the readiness gate's PING succeeds, 0 otherwise.",
 		}),
 	}
-	for _, c := range []prometheus.Collector{m.operations, m.duration, m.scriptErrors, m.connected} {
+	m.memoryUsed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "hookrelay_valkey_memory_used_bytes",
+		Help: "Valkey used_memory, sampled by maintenance.",
+	})
+	m.memoryMax = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "hookrelay_valkey_memory_max_bytes",
+		Help: "Valkey maxmemory (0 without a limit), sampled by maintenance.",
+	})
+	m.aofEnabled = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "hookrelay_valkey_aof_enabled",
+		Help: "1 while Valkey reports AOF enabled, sampled by maintenance.",
+	})
+	delayed := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "hookrelay_valkey_aof_delayed_fsync_total",
+		Help: "Valkey aof_delayed_fsync: AOF fsyncs delayed because the disk was busy, as last sampled.",
+	}, func() float64 { return float64(m.aofDelayedFsync.Load()) })
+	for _, c := range []prometheus.Collector{m.operations, m.duration, m.scriptErrors, m.connected, m.memoryUsed, m.memoryMax, m.aofEnabled, delayed} {
 		if err := reg.Register(c); err != nil {
 			return fmt.Errorf("valkey: register metrics: %w", err)
 		}
@@ -115,4 +141,18 @@ func (m *adapterMetrics) setConnected(ok bool) {
 	} else {
 		m.connected.Set(0)
 	}
+}
+
+func (m *adapterMetrics) setServer(mem memoryInfo, aof bool, delayedFsync int64) {
+	if m == nil {
+		return
+	}
+	m.memoryUsed.Set(float64(mem.used))
+	m.memoryMax.Set(float64(mem.max))
+	if aof {
+		m.aofEnabled.Set(1)
+	} else {
+		m.aofEnabled.Set(0)
+	}
+	m.aofDelayedFsync.Store(delayedFsync)
 }

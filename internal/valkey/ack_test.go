@@ -273,7 +273,7 @@ func TestAckArguments(t *testing.T) {
 		"zero ttl":        with(3, "0"),
 		"digest mismatch": with(1, "other"),
 	} {
-		if _, err := a.RunScript(ctx, "ack_v3", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "ack_v4", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

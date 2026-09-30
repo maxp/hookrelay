@@ -18,7 +18,9 @@ const (
 	OutcomeRequestTimeout       Outcome = "request_timeout"
 	OutcomeBodyReadFailed       Outcome = "body_read_failed"
 	// OutcomeOverloaded: the in-flight webhook limit is reached.
-	OutcomeOverloaded            Outcome = "overloaded"
+	OutcomeOverloaded Outcome = "overloaded"
+	// OutcomeRateLimited: the global or per-endpoint token bucket is empty.
+	OutcomeRateLimited           Outcome = "rate_limited"
 	OutcomeRecipientBlocked      Outcome = "recipient_blocked"
 	OutcomeCapacityRejection     Outcome = "capacity_rejection"
 	OutcomeDependencyUnavailable Outcome = "dependency_unavailable"
@@ -53,6 +55,8 @@ func (DefaultResponses) Status(o Outcome) (int, bool) {
 		return http.StatusRequestEntityTooLarge, false
 	case OutcomeUnsupportedMediaType:
 		return http.StatusUnsupportedMediaType, false
+	case OutcomeRateLimited:
+		return http.StatusTooManyRequests, true
 	case OutcomeRecipientBlocked, OutcomeCapacityRejection, OutcomeOverloaded, OutcomeDependencyUnavailable:
 		return http.StatusServiceUnavailable, true
 	default:

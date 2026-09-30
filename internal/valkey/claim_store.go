@@ -2,6 +2,7 @@ package valkey
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -129,7 +130,40 @@ func (s *DeliveryStore) Stats(ctx context.Context) (delivery.Stats, error) {
 		}
 		*targets[i] = v
 	}
-	return st, nil
+	st.OldestReadyAgeMs, err = s.oldestReadyAge(ctx, now)
+	return st, err
+}
+
+// oldestReadyAge reads the head message of the lowest-sequence ready
+// Recipient and returns its age from received_ms (0 when nothing is
+// ready or the blob carries no received_ms).
+func (s *DeliveryStore) oldestReadyAge(ctx context.Context, now int64) (int64, error) {
+	c := s.a.client
+	first, err := c.Do(ctx, c.B().Zrange().Key("hr1:ready").Min("0").Max("0").Build()).AsStrSlice()
+	if err != nil || len(first) == 0 {
+		return 0, err
+	}
+	head, err := c.Do(ctx, c.B().Hget().Key("hr1:r:"+first[0]+":s").Field("head_message_id").Build()).ToString()
+	if err != nil {
+		if isNil(err) || isWrongType(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	blob, err := c.Do(ctx, c.B().Get().Key("hr1:m:"+head).Build()).ToString()
+	if err != nil {
+		if isNil(err) || isWrongType(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var m struct {
+		ReceivedMs int64 `json:"received_ms"`
+	}
+	if json.Unmarshal([]byte(blob), &m) != nil || m.ReceivedMs <= 0 || m.ReceivedMs > now {
+		return 0, nil
+	}
+	return now - m.ReceivedMs, nil
 }
 
 func itoa64(v int64) string { return strconv.FormatInt(v, 10) }
@@ -142,9 +176,9 @@ const (
 	TombstoneTTL = time.Hour
 )
 
-// Ack runs ack_v3.
+// Ack runs ack_v4.
 func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delivery.AckResult {
-	res, err := s.a.RunScript(ctx, "ack_v3",
+	res, err := s.a.RunScript(ctx, "ack_v4",
 		[]string{"hr1:t:" + req.TokenDigest, "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:blocked", "hr1:stats:queued_messages"},
 		[]string{req.Token, req.TokenDigest, itoa64(SuccessTTL.Milliseconds()), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {
@@ -178,13 +212,13 @@ func (s *DeliveryStore) Ack(ctx context.Context, req delivery.AckRequest) delive
 	}
 }
 
-// Nack runs nack_v2.
+// Nack runs nack_v3.
 func (s *DeliveryStore) Nack(ctx context.Context, req delivery.NackRequest) delivery.NackResult {
 	delays := make([]string, len(req.RetryDelaysMs))
 	for i, d := range req.RetryDelaysMs {
 		delays[i] = itoa64(d)
 	}
-	res, err := s.a.RunScript(ctx, "nack_v2",
+	res, err := s.a.RunScript(ctx, "nack_v3",
 		[]string{"hr1:t:" + req.TokenDigest, "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"},
 		[]string{req.Token, req.TokenDigest, req.ReasonCode, strings.Join(delays, ","), itoa64(int64(req.MaxAttempts)), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {

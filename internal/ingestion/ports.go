@@ -46,6 +46,9 @@ const (
 	AcceptRecipientCapacity AcceptOutcome = "recipient_capacity"
 	AcceptGlobalCapacity    AcceptOutcome = "global_capacity"
 	AcceptDedupCapacity     AcceptOutcome = "dedup_capacity"
+	// AcceptMemoryStop: acceptance is stopped because Valkey memory reached
+	// the configured share of maxmemory; set by the handler, never stored.
+	AcceptMemoryStop AcceptOutcome = "memory_stop"
 	// AcceptDependencyUnavailable covers Valkey failures and uncertain
 	// script outcomes. The platform retries; a retry of an already accepted
 	// message is proven duplicate.
@@ -56,11 +59,20 @@ const (
 )
 
 // AcceptResult carries the outcome; MessageID is the original message for
-// duplicates, AcceptedMs the Valkey acceptance time.
+// duplicates, AcceptedMs the Valkey acceptance time, and EarlyEvicted the
+// deduplication records evicted early by this acceptance (0 or 1).
 type AcceptResult struct {
-	Outcome    AcceptOutcome
-	MessageID  string
-	AcceptedMs int64
+	Outcome      AcceptOutcome
+	MessageID    string
+	AcceptedMs   int64
+	EarlyEvicted int
+}
+
+// DedupEvictor runs one bounded batch of proactive early eviction of the
+// oldest deduplication records while the cap is reached, never below the
+// minimum retention. It returns the number of records evicted.
+type DedupEvictor interface {
+	EvictDedup(ctx context.Context) (int, error)
 }
 
 // MessageAcceptor atomically accepts a message or proves it duplicate. It

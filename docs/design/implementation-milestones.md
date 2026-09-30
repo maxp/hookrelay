@@ -63,7 +63,7 @@ The smoke test:
 
 Integration tests also cover safe repair of first-slice derived indexes/counters and refusal to become ready when a discovered inconsistency cannot be safely handled.
 
-Milestone 1 is an internal tracer-bullet checkpoint, not a production-ready release. In particular, if an active lease reaches its deadline or survives a process restart, Milestone 1 does not invent temporary expiry or retry semantics: it detects the due `hr1:leases` entry, marks readiness false, and leaves state unchanged for diagnosis. The smoke path acknowledges its lease before restart. Milestone 2, which adds the accepted expiry and retry transitions, is the first deployable release candidate.
+Milestone 1 is an internal tracer-bullet checkpoint, not a production-ready release. In particular, if an active lease reaches its deadline or survives a process restart, Milestone 1 does not invent temporary expiry or retry semantics: it detects the due `hr1:leases` entry, marks readiness false, and leaves state unchanged for diagnosis. The smoke path acknowledges its lease before restart. Milestone 2, which adds the accepted expiry and retry transitions, is the first deployable release candidate; its Compose smoke extends the Milestone 1 path with nacks and observed retries, dead-lettering, CLI DLQ listing, replay, and delivery-state reads, a claim in the new Delivery Cycle, and a lease left claimed across a restart that startup reconciliation expires before readiness.
 
 ## Milestone 2 — complete delivery failure path
 

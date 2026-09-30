@@ -233,7 +233,7 @@ func TestClearBlockArgumentsAndReload(t *testing.T) {
 		"zero bound":      with(5, "0"),
 		"prefix mismatch": with(6, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "clear_block_v1", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "clear_block_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}

@@ -4,7 +4,9 @@ Webhook relay that distributes incoming events to recipients through ordered del
 
 ## Status
 
-Milestone 1 (the tracer-bullet vertical slice) is implemented; its exit criterion is a green CI pipeline including the Compose smoke. Done: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey — the Admin CLI (`hookrelay admin webhook create|get`) on top of that API, and the webhook ingestion happy path: signed Telegram updates are verified, converted into Canonical Messages, deduplicated, and atomically queued per Recipient in Valkey. The ingestion rejection matrix, process protections, and the complete Telegram classification surface (every event-to-Recipient row, routing issues, fallback deduplication) are in place, and consumers can claim and acknowledge queued messages through the Consumer API (`POST /v1/deliveries/claim`, `POST /v1/deliveries/ack`). Claims long-poll for up to 30 seconds, startup reconciliation validates and safely repairs persisted state before readiness, and an automated Compose smoke test proves the whole slice. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/).
+Milestone 1 (the tracer-bullet vertical slice) is implemented; its exit criterion is a green CI pipeline including the Compose smoke. Done: the application scaffold (listeners, configuration, observability, graceful shutdown) and the Admin endpoint API vertical — operators can create and read Telegram Webhook Endpoints through the Admin API, with each state change and its mandatory audit append committed as one atomic Lua operation in Valkey — the Admin CLI (`hookrelay admin webhook create|get`) on top of that API, and the webhook ingestion happy path: signed Telegram updates are verified, converted into Canonical Messages, deduplicated, and atomically queued per Recipient in Valkey. The ingestion rejection matrix, process protections, and the complete Telegram classification surface (every event-to-Recipient row, routing issues, fallback deduplication) are in place, and consumers can claim and acknowledge queued messages through the Consumer API (`POST /v1/deliveries/claim`, `POST /v1/deliveries/ack`). Claims long-poll for up to 30 seconds, startup reconciliation validates and safely repairs persisted state before readiness, and an automated Compose smoke test proves the whole slice.
+
+Milestone 2 (the complete delivery failure path, the first deployable release candidate) is implemented; its exit criterion is a green CI pipeline including the extended Compose smoke. It adds negative acknowledgement, lease extension and expiry, bounded retries with jitter, the global DLQ after the fourth failed attempt, audited DLQ replay with deduplication-conflict protection, the delivery-state read, DLQ retention, cooperative background and inline maintenance, Recipient block listing, inspection, and preconditioned clearing, startup reconciliation that executes overdue expiries and retries before readiness, webhook rate limits, the Valkey memory acceptance stop, and deduplication early eviction. Work is tracked as Markdown issues under [`.scratch/milestone-1/`](.scratch/milestone-1/) and [`.scratch/milestone-2/`](.scratch/milestone-2/).
 
 ## Goals
 
@@ -60,7 +62,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - [`docs/design/telegram-adapter.md`](docs/design/telegram-adapter.md) defines Telegram verification, update identity, and recipient extraction policy.
 - [`docs/design/storage.md`](docs/design/storage.md) defines the accepted internal Valkey data structures and key namespace.
 - [`docs/design/open-questions.md`](docs/design/open-questions.md) lists decisions that remain open.
-- [`docs/runbooks/recipient-block-recovery.md`](docs/runbooks/recipient-block-recovery.md) defines safe diagnosis and clearing of an ambiguous Recipient block (its `inspect-block`/`clear-block` operations arrive after Milestone 1).
+- [`docs/runbooks/recipient-block-recovery.md`](docs/runbooks/recipient-block-recovery.md) defines safe diagnosis and clearing of an ambiguous Recipient block with `hookrelay admin recipients inspect-block`/`clear-block`.
 
 ## Repository layout
 
@@ -74,7 +76,7 @@ Privileged DLQ payload inspection requires a confirmed audit append before conte
 - `internal/ingestion` — webhook pipeline and the Telegram adapter;
 - `internal/delivery` — Consumer API transport and delivery use cases;
 - `internal/jsonbody` — strict JSON request-body discipline shared by the Admin and Consumer APIs;
-- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v2`, `claim_v3`, `ack_v3`, `nack_v2`, `expire_lease_v2`, `activate_retry_v1`, `extend_v1`, `reconcile_recipient_v2`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`), readiness gate, endpoint store, message acceptance;
+- `internal/valkey` — Valkey adapter: embedded versioned Lua scripts (`endpoint_create_v1`, `accept_v3`, `claim_v3`, `ack_v4`, `nack_v3`, `expire_lease_v3`, `activate_retry_v1`, `extend_v1`, `replay_dlq_v2`, `delivery_state_v1`, `expire_dlq_v1`, `evict_dedup_v1`, `inspect_block_v2`, `clear_block_v2`, `reconcile_recipient_v3`, `reconcile_dlq_v1`, `reconcile_dedup_v1`, `reconcile_counter_v1`), readiness gate, endpoint, Recipient, DLQ, and delivery-state stores, message acceptance;
 - `internal/gen` — identifier and secret generation;
 - `spike/` — the throwaway valkey-go client spike (see [ADR 0006](docs/adr/0006-valkey-go-client.md));
 - `docs/design/` — accepted design documents; `docs/adr/` — architecture decision records.
@@ -107,11 +109,16 @@ chmod 600 .secrets/consumer .secrets/admin
 docker compose up --build
 ```
 
-The Compose smoke test proves the whole Milestone 1 slice against that stack
-in production mode (endpoint via the Admin CLI → signed webhook and its
-duplicate → claim → ack and repeated ack → empty queue → metrics and health →
-restart keeping the Valkey volume → persisted endpoint and continued
-deduplication). It uses its own Compose project, generated secrets, and free
+The Compose smoke test proves the Milestone 1 slice and the Milestone 2
+failure path against that stack in production mode (endpoint via the Admin
+CLI → signed webhook and its duplicate → claim → ack and repeated ack →
+empty queue → metrics and health → three nacks with observed retries →
+fourth nack dead-letters → `admin dlq list|get|replay` → `admin message
+delivery-state` → claim in `delivery_cycle=2` → ack → a lease left claimed
+→ restart keeping the Valkey volume after the lease expired → the expiry is
+processed by startup reconciliation before readiness → persisted endpoint
+and continued deduplication). It shortens retry delays to 300 ms and the
+initial lease to 5 s. It uses its own Compose project, generated secrets, and free
 loopback ports, and cleans up after itself; CI runs it as the `smoke` job:
 
 ```sh
@@ -133,7 +140,10 @@ malformed live deduplication records, repairs derived ready, lease, retry,
 blocked, DLQ, and deduplication indexes and (at startup) the queued-message
 counter, and isolates any Recipient whose queue or head state is ambiguous
 behind a persistent block marker (`hr1:q:<recipient>`) while every other
-Recipient serves normally. Authoritative state is never rewritten. Leases
+Recipient serves normally — including a queued message whose attempt
+history has no valid saved replay cycle/attempt
+(`queued_delivery_state_missing` / `queued_delivery_state_invalid`), which
+is never silently reset to attempt 1. Authoritative state is never rewritten. Leases
 already past their deadline are expired and due retries activated through
 the normal transitions (with their events and metrics) before readiness,
 followed by a verifying pass. State that cannot be isolated holds readiness
@@ -161,7 +171,7 @@ with the endpoint's `secret_token`). The pipeline resolves the route,
 verifies the `X-Telegram-Bot-Api-Secret-Token` header (and the optional
 `HOOKRELAY_TELEGRAM_SOURCE_CIDRS` allowlist), converts the update into a
 Canonical Message for its chat, user, bot, or relay Recipient, and runs one
-atomic `accept_v2` transition that deduplicates and queues it.
+atomic `accept_v3` transition that deduplicates and queues it.
 
 - Accepted and duplicate updates both receive an empty `200`, returned only
   after Valkey commits or proves the duplicate. A repeated `update_id` with
@@ -175,12 +185,31 @@ atomic `accept_v2` transition that deduplicates and queues it.
   `HOOKRELAY_MAX_INFLIGHT_WEBHOOKS` (default 100) requests in flight: `503`
   with `Retry-After: 1`; corrupt storage state: `500`. Bodies are always
   empty; every response carries `X-Request-Id`.
+- Rate limits: one global and one per-Webhook-Endpoint token bucket
+  (`HOOKRELAY_WEBHOOK_GLOBAL_RATE`/`_BURST`,
+  `HOOKRELAY_WEBHOOK_ENDPOINT_RATE`/`_BURST`; a zero rate disables a limit
+  in development) are checked after the endpoint resolves and before the
+  in-flight slot and the body read. An empty bucket answers `429` with
+  `Retry-After` in whole seconds until a token (at least 1), counted as
+  `outcome=rate_limited`. Endpoint buckets are process-local and bounded to
+  the 10,000 most recently used endpoints.
+- Memory stop: when Valkey `used_memory` reaches
+  `HOOKRELAY_MEMORY_ACCEPTANCE_STOP_PERCENT` (default 90) of `maxmemory`
+  (no stop without `maxmemory`), new messages are refused with `503` (no
+  writes) while consumers keep draining; `/health/ready` is unaffected.
+- Deduplication early eviction: when the live deduplication records reach
+  `HOOKRELAY_MAX_DEDUP_RECORDS`, the oldest record is evicted early inside
+  the acceptance itself (`accept_v3`), and maintenance evicts proactively
+  (`evict_dedup_v1`) — but never a record younger than
+  `HOOKRELAY_DEDUP_MIN_RETENTION`. Only then does acceptance refuse with
+  `dedup_capacity`.
 - `/health/accepting-webhooks` (and `hookrelay_accepting_webhooks`) reports
-  `503`/`0` when Valkey is unavailable or the global queue
-  (`HOOKRELAY_MAX_QUEUED_MESSAGES`) or live deduplication records
-  (`HOOKRELAY_MAX_DEDUP_RECORDS`) are at capacity; it is re-evaluated every
-  second. `/health/ready` stays `200` under capacity pressure so consumers
-  can drain, and a single full Recipient only rejects its own messages.
+  `503`/`0` when Valkey is unavailable, the global queue
+  (`HOOKRELAY_MAX_QUEUED_MESSAGES`) is full, the live deduplication records
+  are at capacity with no record old enough to evict, or the memory stop
+  applies; it is re-evaluated every second (and by each maintenance round).
+  `/health/ready` stays `200` under capacity pressure so consumers can
+  drain, and a single full Recipient only rejects its own messages.
 - Feature events `webhook_accepted` and `webhook_duplicate`; metrics
   `hookrelay_webhook_requests_total{webhook_type,outcome}`,
   `hookrelay_webhook_request_duration_seconds`,
@@ -191,7 +220,12 @@ atomic `accept_v2` transition that deduplicates and queues it.
   `hookrelay_routing_issues_total{bot_platform,reason}`,
   `hookrelay_event_time_issues_total{bot_platform,reason}`,
   `hookrelay_webhook_inflight`, `hookrelay_dedup_records`,
-  `hookrelay_dedup_record_capacity`, and `hookrelay_accepting_webhooks`.
+  `hookrelay_dedup_record_capacity`, `hookrelay_dedup_early_evictions_total`,
+  `hookrelay_dedup_oldest_record_age_seconds`,
+  `hookrelay_dedup_effective_retention_seconds`,
+  `hookrelay_valkey_memory_used_bytes`, `hookrelay_valkey_memory_max_bytes`,
+  `hookrelay_valkey_aof_enabled`, `hookrelay_valkey_aof_delayed_fsync_total`
+  (sampled by each maintenance round), and `hookrelay_accepting_webhooks`.
 
 Storage keys and capacity limits are specified in
 [`.scratch/milestone-1/spec.md`](.scratch/milestone-1/spec.md) (the v1
@@ -201,7 +235,10 @@ amendments and failure-path scripts: `accept_v2` and `ack_v2`/`ack_v3`
 maintain the `hr1:mi:<message_id>` message metadata; `claim_v2` records
 `attempt_started_ms` and `claim_v3` the token digest; `nack_v2` and
 `expire_lease_v2` schedule retries or dead-letter the fourth failure, and
-`activate_retry_v1` activates retries);
+`activate_retry_v1` activates retries; `replay_dlq_v1` replays a dead
+letter and `replay_dlq_v2` keeps waiting replays in replay order, and `ack_v4`, `nack_v3`, and `expire_lease_v3` restore the
+cycle/attempt that replay saves as `pending_delivery_cycle` /
+`pending_attempt` in `hr1:mi` when they expose the next head);
 see also
 [`docs/design/storage.md`](docs/design/storage.md).
 
@@ -298,16 +335,23 @@ curl -X POST http://<public>/v1/deliveries/claim \
   `hookrelay_retries_waiting`, `hookrelay_dead_letter_messages`,
   `hookrelay_dead_letters_total{recipient_scope,reason}`,
   `hookrelay_maintenance_processed_total{kind,result}` (`kind` =
-  `lease_expiry` | `retry_activation` | `inline_lease_expiry` |
+  `lease_expiry` | `retry_activation` | `dlq_retention` | `inline_lease_expiry` |
   `inline_retry_activation`; `result` = `applied` | `stale` |
   `blocked` | `failed`),
   `hookrelay_maintenance_due_lag_seconds{kind}`,
   `hookrelay_maintenance_batch_size{kind}`,
   `hookrelay_maintenance_duration_seconds{kind}`, `hookrelay_active_leases`, `hookrelay_waiting_claims`,
   `hookrelay_queue_messages`, `hookrelay_ready_recipients`,
-  `hookrelay_blocked_recipients`; feature event `delivery_claimed` (tokens
+  `hookrelay_blocked_recipients`, `hookrelay_oldest_ready_message_age_seconds`
+  (the head of the Recipient ready longest, from its `received_ms`); feature event `delivery_claimed` (tokens
   are never logged), `delivery_acknowledged`, `delivery_nacked`,
-  `delivery_lease_expired`, `delivery_dead_lettered`, `delivery_lease_extended`.
+  `delivery_lease_expired`, `delivery_dead_lettered`, `delivery_lease_extended`,
+  `dead_letter_expired`.
+- Dead letters are kept for `HOOKRELAY_DLQ_RETENTION` (default `720h`).
+  Background maintenance then deletes each one — record, Canonical Message,
+  metadata, and attempt history — and appends the `dead_letter_expired`
+  audit event (actor `maintenance`, no payload) in the same atomic operation
+  (`expire_dlq_v1`).
 
 ## Admin API
 
@@ -342,10 +386,43 @@ are audited best effort. Health and metrics endpoints stay unauthenticated.
   without the expected values, `412 precondition_failed` for a changed
   marker, `404 recipient_block_not_found`, `409 recipient_state_ambiguous`
   (with the violated invariant); a `503` may be an uncertain outcome.
+- `GET /admin/v1/dead-letters?limit&cursor` — dead letters newest first by
+  safe metadata (`message_id`, structured `recipient`, `dead_lettered_ms`,
+  `dead_letter_reason`, `delivery_cycle`), 50 per page by default (1–200),
+  with an opaque `next_cursor`. Payloads are never returned.
+- `GET /admin/v1/dead-letters/{message_id}` — one dead letter with its
+  retained attempt history (and any `archived_cycles_summary`);
+  `404 dead_letter_not_found`.
+- `POST /admin/v1/dead-letters/{message_id}/replay` with an optional
+  `{"deduplication_conflict_resolution": "reject" | "keep_current"}`
+  (default `reject`) — `200 {"status":"replayed","message_id",
+  "delivery_cycle","queue_position","replayed_ms",
+  "deduplication_resolution"}`. The message returns to its Recipient in a
+  new Delivery Cycle (attempt 1) ahead of every not-yet-started message
+  other than earlier replays still waiting, which keep replay order (first
+  in, first out): as the head (`queue_position=head`), right behind a
+  leased or retry-waiting head that is never interrupted
+  (`after_active_head`), or behind the earlier waiting replays
+  (`after_pending_replay`). Replaying several dead letters of one
+  Recipient oldest first therefore restores their original order, whatever
+  a Consumer claims in between. A preempted ready head keeps its cycle and
+  attempt. Replay is not limited by the queue capacity limits. `404
+  dead_letter_not_found`, `409 deduplication_conflict` when the original
+  Deduplication Identity now maps to another message (`keep_current`
+  replays and leaves that newer mapping unchanged), `409 recipient_blocked`;
+  a `503` may be an uncertain outcome.
+- `GET /admin/v1/messages/{message_id}/delivery-state` —
+  `{"message_id","delivery_cycle","state","queue_position"?}` with `state`
+  `queued` | `leased` | `retry_wait` | `dead_lettered` | `acknowledged`
+  (while the 24-hour success metadata is retained) and `queue_position`
+  `head` | `behind_head` for a message in its queue; never a payload or
+  token. `404 message_not_found`, `409 recipient_state_ambiguous` for state
+  that cannot be classified.
 
 Every mutation commits the state change and the audit append as one atomic
-Lua operation, logs a feature event such as `webhook_endpoint_created`, and
-is counted in `hookrelay_audit_events_total`; failed best-effort audit
+Lua operation, logs a feature event such as `webhook_endpoint_created` or
+`delivery_replayed`, and is counted in `hookrelay_audit_events_total`
+(replays also in `hookrelay_dead_letter_replays_total{outcome}`); failed best-effort audit
 appends are counted in `hookrelay_audit_write_failures_total`. The full contract lives in
 [`docs/design/admin-api.md`](docs/design/admin-api.md).
 
@@ -362,6 +439,10 @@ hookrelay admin recipients list --status blocked
 hookrelay admin recipients inspect-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100
 hookrelay admin recipients clear-block --bot-platform telegram --bot-id 123456 --scope chat --chat-id -100 \
   --expected-detected-ms <ms> --expected-reason-code <code> --yes
+hookrelay admin dlq list
+hookrelay admin dlq get --message-id <message_id>
+hookrelay admin dlq replay --message-id <message_id> [--deduplication-conflict-resolution keep_current] --yes
+hookrelay admin message delivery-state --message-id <message_id>
 ```
 
 - Admin URL: `--admin-url`, then `HOOKRELAY_ADMIN_URL`, then
@@ -387,7 +468,12 @@ audit event; check the audit before any further mutation, and reuse the same
 `--identifier` if a retry is ever needed. `clear-block` follows the same
 discipline: after a lost response or `5xx` it never retries, inspects the
 Recipient once, and reports `desired_state_observed` (marker gone, audit not
-confirmed) or `uncertain`, always exiting `1`.
+confirmed) or `uncertain`, always exiting `1`. `dlq replay` reads the
+current Delivery Cycle first; after a lost response or `5xx` it never
+retries, reads the message's delivery state once, and reports
+`desired_state_observed` when it is in a newer Delivery Cycle (queued,
+active, acknowledged, or dead-lettered again; the audit is still
+unconfirmed), otherwise `uncertain` — always exiting `1`.
 
 Development and contribution conventions are documented in [`AGENTS.md`](AGENTS.md).
 

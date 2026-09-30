@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Compose smoke test: the Milestone 1 vertical slice end to end against the
-# pinned Compose stack, in production mode (AOF + noeviction gate).
+# Compose smoke test: the Milestone 1 vertical slice and the Milestone 2
+# failure path end to end against the pinned Compose stack, in production
+# mode (AOF + noeviction gate).
 #
 #   start stack → create Telegram endpoint (CLI) → send signed fixture →
 #   repeat and prove exactly one stored message → claim (wait_ms=0) → ack →
 #   repeat ack and receive the recorded result → prove the queue empty →
-#   check metrics and health → restart keeping the Valkey volume → verify
-#   readiness, the persisted endpoint, and continued deduplication.
+#   check metrics and health → failure path: nack three times with observed
+#   retries → fourth nack dead-letters → DLQ via CLI → replay via CLI →
+#   delivery state via CLI → claim delivery_cycle=2 → ack → leave a lease
+#   claimed → restart keeping the Valkey volume after the lease expired →
+#   verify readiness (the expiry ran in startup reconciliation), the
+#   persisted endpoint, and continued deduplication.
 #
 # The run uses its own Compose project, generated secrets, and free loopback
 # ports, so it never touches a developer's .secrets/ or running stack.
@@ -47,6 +52,10 @@ services:
       HOOKRELAY_WEBHOOK_ENDPOINT_RATE: "10"
       HOOKRELAY_WEBHOOK_ENDPOINT_BURST: "10"
       HOOKRELAY_EXPECTED_PEAK_RATE: "1"
+      # Short failure-path timing: retries become due quickly and a lease
+      # left claimed expires while the process is down.
+      HOOKRELAY_RETRY_DELAYS: "300ms,300ms,300ms"
+      HOOKRELAY_INITIAL_LEASE_DURATION: "5s"
     ports: !override
       - "127.0.0.1:${public_port}:8080"
       - "127.0.0.1:${admin_port}:8081"
@@ -114,10 +123,11 @@ expect "stored messages" "$(vk --scan --pattern 'hr1:m:*' | wc -l | tr -d ' ')" 
 expect "queue length" "$(vk LLEN "hr1:r:${recipient}:q")" 1
 
 step "claim with wait_ms=0"
-claim() {
+claim() { # claim <operation_id> [wait_ms]
   curl_ -X POST "$public/v1/deliveries/claim" -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer $consumer_secret" -d "{\"operation_id\":\"$1\",\"wait_ms\":0}" -w '\n%{http_code}'
+    -H "Authorization: Bearer $consumer_secret" -d "{\"operation_id\":\"$1\",\"wait_ms\":${2:-0}}" -w '\n%{http_code}'
 }
+json() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(eval(sys.argv[2], {"d": d}))' "$1" "$2"; }
 out="$(claim 0195c4d8-0000-7000-8000-00000000a001)"
 expect "claim status" "$(tail -n1 <<<"$out")" 200
 body="$(head -n -1 <<<"$out")"
@@ -157,14 +167,93 @@ expect "valkey accept operations" "$(metric 'hookrelay_valkey_operations_total\{
 expect "live" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/health/live")" 200
 expect "accepting webhooks" "$(curl_ -o /dev/null -w '%{http_code}' "$admin/health/accepting-webhooks")" 200
 
+step "failure path: three nacks with observed retries"
+fixture2='{"update_id":778,"message":{"message_id":2,"date":1700000000,"chat":{"id":-100888,"type":"group"},"text":"fail"}}'
+send_fixture() {
+  curl_ -o /dev/null -w '%{http_code}' -X POST "$public/webhook/telegram/wh_smoke" \
+    -H 'Content-Type: application/json' -H "X-Telegram-Bot-Api-Secret-Token: $credential" -d "$1"
+}
+expect "failing webhook" "$(send_fixture "$fixture2")" 200
+recipient2='telegram:424242:chat:-100888'
+nack() {
+  curl_ -X POST "$public/v1/deliveries/nack" -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $consumer_secret" -d "{\"delivery_token\":\"$1\",\"reason_code\":\"smoke_failure\"}" -w '\n%{http_code}'
+}
+for attempt in 1 2 3 4; do
+  # A waiting claim picks the retry up once it is due (inline maintenance).
+  out="$(claim "0195c4d8-0000-7000-8000-00000000b00${attempt}" 5000)"
+  expect "claim attempt $attempt status" "$(tail -n1 <<<"$out")" 200
+  body="$(head -n -1 <<<"$out")"
+  expect "claimed cycle/attempt" "$(json "$body" 'd["delivery"]["delivery_cycle"], d["delivery"]["attempt"]')" "(1, $attempt)"
+  failed_id="$(json "$body" 'd["message"]["message_id"]')"
+  out="$(nack "$(json "$body" 'd["delivery"]["delivery_token"]')")"
+  expect "nack $attempt status" "$(tail -n1 <<<"$out")" 200
+  if [[ $attempt -lt 4 ]]; then
+    expect "nack $attempt result" "$(json "$(head -n -1 <<<"$out")" 'd["status"], d["attempt"]')" "('retry_scheduled', $attempt)"
+    expect "head state after nack $attempt" "$(vk HGET "hr1:r:${recipient2}:s" status)" retry_wait
+  else
+    expect "fourth nack result" "$(json "$(head -n -1 <<<"$out")" 'd["status"], d["delivery_cycle"]')" "('dead_lettered', 1)"
+  fi
+done
+expect "attempt history" "$(vk LLEN "hr1:a:${failed_id}")" 4
+expect "queue drained" "$(vk EXISTS "hr1:r:${recipient2}:q")" 0
+
+step "dead letter through the Admin CLI"
+admin_cli() { compose exec -T hookrelay /hookrelay admin "$@" --output json; }
+dlq="$(admin_cli dlq list)"
+expect "DLQ entry" "$(json "$dlq" '[(i["message_id"], i["delivery_cycle"], i["dead_letter_reason"], i["recipient"]["chat_id"]) for i in d["items"]]')" \
+  "[('${failed_id}', 1, 'nack_exhausted', '-100888')]"
+got="$(admin_cli dlq get --message-id "$failed_id")"
+expect "DLQ history outcomes" "$(json "$got" '[a["outcome"] for a in d["attempts"]]')" "['nack', 'nack', 'nack', 'nack']"
+replayed="$(admin_cli dlq replay --message-id "$failed_id" --yes)"
+expect "replay" "$(json "$replayed" 'd["outcome"], d["delivery_cycle"], d["queue_position"], d["previous_delivery_cycle"]')" "('replayed', 2, 'head', 1)"
+state="$(admin_cli message delivery-state --message-id "$failed_id")"
+expect "delivery state" "$(json "$state" 'd["state"], d["delivery_cycle"], d["queue_position"]')" "('queued', 2, 'head')"
+expect "DLQ after replay" "$(json "$(admin_cli dlq list)" 'len(d["items"])')" 0
+
+step "claim the replayed message in delivery cycle 2 and acknowledge it"
+out="$(claim 0195c4d8-0000-7000-8000-00000000b005)"
+expect "replayed claim status" "$(tail -n1 <<<"$out")" 200
+body="$(head -n -1 <<<"$out")"
+expect "replayed claim" "$(json "$body" 'd["message"]["message_id"], d["delivery"]["delivery_cycle"], d["delivery"]["attempt"]')" "('${failed_id}', 2, 1)"
+token="$(json "$body" 'd["delivery"]["delivery_token"]')"
+expect "replayed ack" "$(tail -n1 <<<"$(ack)")" 200
+expect "acknowledged state" "$(json "$(admin_cli message delivery-state --message-id "$failed_id")" 'd["state"], d["delivery_cycle"]')" "('acknowledged', 2)"
+
+step "check failure-path metrics"
+metrics="$(curl_ "$admin/metrics")"
+expect "nack attempts" "$(metric 'hookrelay_delivery_attempts_total\{outcome="nack",recipient_scope="chat"\}')" 3
+expect "dead-lettered attempts" "$(metric 'hookrelay_delivery_attempts_total\{outcome="dead_lettered",recipient_scope="chat"\}')" 1
+expect "dead letters" "$(metric 'hookrelay_dead_letters_total\{reason="nack_exhausted",recipient_scope="chat"\}')" 1
+expect "replays" "$(metric 'hookrelay_dead_letter_replays_total\{outcome="replayed"\}')" 1
+expect "replay audit" "$(metric 'hookrelay_audit_events_total\{operation="dead_letter_replayed",outcome="success"\}')" 1
+
+step "leave a lease claimed across a restart"
+fixture3='{"update_id":779,"message":{"message_id":3,"date":1700000000,"chat":{"id":-100999,"type":"group"},"text":"stall"}}'
+expect "stalled webhook" "$(send_fixture "$fixture3")" 200
+recipient3='telegram:424242:chat:-100999'
+out="$(claim 0195c4d8-0000-7000-8000-00000000b006)"
+expect "stalled claim status" "$(tail -n1 <<<"$out")" 200
+stalled_id="$(json "$(head -n -1 <<<"$out")" 'd["message"]["message_id"]')"
+claimed_at="$(date +%s)"
+
 step "restart the stack keeping the Valkey volume"
 compose down
+# The 5 s lease must pass while the process is down.
+sleep $(( 7 - ($(date +%s) - claimed_at) > 0 ? 7 - ($(date +%s) - claimed_at) : 0 ))
 compose up -d --wait
 wait_ready
+expect "due lease processed before readiness" \
+  "$(compose logs --no-color hookrelay | grep '"event":"reconciliation_completed"' | tail -n1 | grep -o '"due_leases_processed":[0-9]*')" \
+  '"due_leases_processed":1'
+# Background maintenance may already have activated the retry (300 ms).
+expect "expired lease became a retry" "$(vk HGET "hr1:r:${recipient3}:s" attempt) $(vk HGET "hr1:r:${recipient3}:s" delivery_token)" "2 "
+expect "expired attempt recorded" "$(vk LINDEX "hr1:a:${stalled_id}" 0 | python3 -c 'import json,sys; print(json.load(sys.stdin)["outcome"])')" expired
 compose exec -T hookrelay /hookrelay admin webhook get --type telegram --identifier wh_smoke --output json >"$work/got.json"
 expect "persisted endpoint" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["bot_id"], d["enabled"])' "$work/got.json")" "424242 True"
 expect "webhook after restart" "$(send_webhook)" 200
-expect "stored messages after repeat" "$(vk --scan --pattern 'hr1:m:*' | wc -l | tr -d ' ')" 0
+# Only the stalled message remains stored; the repeat created nothing.
+expect "stored messages after repeat" "$(vk --scan --pattern 'hr1:m:*' | wc -l | tr -d ' ')" 1
 metrics="$(curl_ "$admin/metrics")"
 expect "deduplicated after restart" "$(metric 'hookrelay_messages_duplicate_total\{webhook_type="telegram"\}')" 1
 expect "consistency issues" "$(grep -c '^hookrelay_consistency_issues_total' <<<"$metrics" || true)" 0

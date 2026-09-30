@@ -22,6 +22,10 @@ type metrics struct {
 	dedupRecords        prometheus.Gauge
 	eventTimeIssues     *prometheus.CounterVec
 	dedupRecordCapacity prometheus.Gauge
+	// Early eviction and effective retention.
+	dedupEarlyEvictions     prometheus.Counter
+	dedupOldestAge          prometheus.Gauge
+	dedupEffectiveRetention prometheus.Gauge
 }
 
 func newMetrics(reg prometheus.Registerer) (*metrics, error) {
@@ -72,8 +76,21 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "hookrelay_dedup_record_capacity",
 			Help: "Configured maximum number of deduplication records.",
 		}),
+		dedupEarlyEvictions: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hookrelay_dedup_early_evictions_total",
+			Help: "Deduplication records evicted before their retention under capacity pressure (acceptance-time and maintenance).",
+		}),
+		dedupOldestAge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hookrelay_dedup_oldest_record_age_seconds",
+			Help: "Age of the oldest live deduplication record, refreshed by the acceptance probe.",
+		}),
+		dedupEffectiveRetention: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hookrelay_dedup_effective_retention_seconds",
+			Help: "How far back duplicates are detected: the configured retention, or the oldest record's age while the cap is reached.",
+		}),
 	}
-	for _, c := range []prometheus.Collector{m.requests, m.duration, m.bodyBytes, m.accepted, m.duplicates, m.dedupConflicts, m.dedupCapacity, m.routingIssues, m.eventTimeIssues, m.dedupRecords, m.dedupRecordCapacity} {
+	for _, c := range []prometheus.Collector{m.requests, m.duration, m.bodyBytes, m.accepted, m.duplicates, m.dedupConflicts, m.dedupCapacity, m.routingIssues, m.eventTimeIssues, m.dedupRecords, m.dedupRecordCapacity,
+		m.dedupEarlyEvictions, m.dedupOldestAge, m.dedupEffectiveRetention} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("ingestion: register metrics: %w", err)
 		}

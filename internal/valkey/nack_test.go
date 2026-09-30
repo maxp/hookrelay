@@ -451,7 +451,7 @@ func TestNackArguments(t *testing.T) {
 	ctx := context.Background()
 	keys := []string{"hr1:t:d", "hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"}
 	valid := []string{"dlv_t", "d", "", "1000,5000,30000", "4", "3600000", "hr1"}
-	if _, err := a.RunScript(ctx, "nack_v2", keys, valid); err != nil {
+	if _, err := a.RunScript(ctx, "nack_v3", keys, valid); err != nil {
 		t.Fatalf("valid call failed: %v", err)
 	}
 	with := func(i int, v string) []string {
@@ -472,16 +472,16 @@ func TestNackArguments(t *testing.T) {
 		"zero tombstone ttl": with(5, "0"),
 		"prefix mismatch":    with(6, "hr2"),
 	} {
-		if _, err := a.RunScript(ctx, "nack_v2", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
+		if _, err := a.RunScript(ctx, "nack_v3", keys, args); err == nil || errors.Is(err, ErrNotDispatched) {
 			t.Errorf("%s: err = %v", name, err)
 		}
 	}
-	if _, err := a.RunScript(ctx, "nack_v2", keys[:7], valid); err == nil || errors.Is(err, ErrNotDispatched) {
+	if _, err := a.RunScript(ctx, "nack_v3", keys[:7], valid); err == nil || errors.Is(err, ErrNotDispatched) {
 		t.Errorf("too few keys: err = %v", err)
 	}
 }
 
-// TestNackAfterScriptFlush pins the EVAL reload path for nack_v2.
+// TestNackAfterScriptFlush pins the EVAL reload path for nack_v3.
 func TestNackAfterScriptFlush(t *testing.T) {
 	a, s := claimSetup(t)
 	ctx := context.Background()

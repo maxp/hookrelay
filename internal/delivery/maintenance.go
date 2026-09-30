@@ -25,6 +25,7 @@ const (
 	kindRetryActivation       = "retry_activation"
 	kindInlineLeaseExpiry     = "inline_lease_expiry"
 	kindInlineRetryActivation = "inline_retry_activation"
+	kindDLQRetention          = "dlq_retention"
 )
 
 // inlinePassLimit bounds the due entries one claim processes before it
@@ -61,7 +62,17 @@ type MaintenanceDeps struct {
 	RetryPolicy RetryPolicy
 	// Attempts counts expired attempts; share the Consumer API's instance.
 	Attempts *AttemptMetrics
-	Config   MaintenanceConfig
+	// DeadLetters deletes dead letters past DLQRetention; nil skips DLQ
+	// retention.
+	DeadLetters  DeadLetterExpirer
+	DLQRetention time.Duration
+	// Gen supplies audit event identifiers (gen.Crypto when nil).
+	Gen gen.Gen
+	// RoundHooks run once at the end of every background round, each with
+	// its own deadline (the Valkey server sample and the ingestion capacity
+	// maintenance); a failure is logged and never stops the round.
+	RoundHooks []func(context.Context) error
+	Config     MaintenanceConfig
 	// Uniform draws the interval and retry-delay jitter in [0, 1)
 	// (rand.Float64 when nil).
 	Uniform func() float64
@@ -97,6 +108,9 @@ func NewMaintenance(d MaintenanceDeps) (*Maintenance, error) {
 	if err := d.RetryPolicy.Validate(); err != nil {
 		return nil, err
 	}
+	if d.DeadLetters != nil && d.DLQRetention <= 0 {
+		return nil, errors.New("delivery: DLQ retention must be positive")
+	}
 	if c := d.Config; c.Interval <= 0 || c.IntervalJitter < 0 || c.BatchSize <= 0 || c.MaxContinuousBatches <= 0 {
 		return nil, fmt.Errorf("delivery: invalid maintenance configuration %+v", c)
 	}
@@ -108,6 +122,9 @@ func NewMaintenance(d MaintenanceDeps) (*Maintenance, error) {
 	}
 	if d.Clock == nil {
 		d.Clock = gen.SystemClock{}
+	}
+	if d.Gen == nil {
+		d.Gen = gen.Crypto{}
 	}
 	reg := d.Registerer
 	if reg == nil {
@@ -158,13 +175,31 @@ func (m *Maintenance) Run(ctx context.Context) {
 	}
 }
 
-// RunRound processes due leases, then due retries, each kind in its own
-// batches of at most BatchSize; a full batch triggers another, up to
-// MaxContinuousBatches, then the kind yields. A cancelled ctx stops new
-// batches; the batch in progress completes (its transitions are atomic).
+// RunRound processes due leases, then due retries, then dead letters past
+// their retention, each kind in its own batches of at most BatchSize; a
+// full batch triggers another, up to MaxContinuousBatches, then the kind
+// yields. A cancelled ctx stops new batches; the batch in progress
+// completes (its transitions are atomic).
 func (m *Maintenance) RunRound(ctx context.Context) {
 	m.runKind(ctx, kindLeaseExpiry, m.d.Leases.DueLeases, m.expireLease)
 	m.runKind(ctx, kindRetryActivation, m.d.Retries.DueRetries, m.activateRetry)
+	if m.d.DeadLetters != nil {
+		m.runKind(ctx, kindDLQRetention, func(ctx context.Context, limit int) (DueBatch, error) {
+			return m.d.DeadLetters.DueDeadLetters(ctx, limit, m.d.DLQRetention)
+		}, m.expireDeadLetter)
+	}
+	for _, hook := range m.d.RoundHooks {
+		if ctx.Err() != nil {
+			return
+		}
+		hookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), maintenanceOpTimeout)
+		err := hook(hookCtx)
+		cancel()
+		if err != nil {
+			observability.LogEvent(m.log, slog.LevelWarn, "maintenance_hook_failed", "maintenance sampling failed",
+				"error_code", "dependency_unavailable")
+		}
+	}
 }
 
 // transition applies one maintenance transition and returns its bounded
@@ -324,6 +359,25 @@ func (m *Maintenance) expireLease(ctx context.Context, kind string, e DueEntry) 
 		return resultStale
 	case ExpiryRecipientBlocked:
 		return resultBlocked
+	default:
+		m.transitionFailed(kind, string(res.Outcome))
+		return resultFailed
+	}
+}
+
+// expireDeadLetter deletes one dead letter past its retention; the audit
+// event is appended by the same atomic transition.
+func (m *Maintenance) expireDeadLetter(ctx context.Context, kind string, e DueEntry) maintenanceResult {
+	res := m.d.DeadLetters.ExpireDeadLetter(ctx, e.MessageID, m.d.DLQRetention, m.d.Gen.UUIDv7())
+	switch res.Outcome {
+	case DLQExpiryExpired:
+		fields, _ := recipientEventFields(res.RecipientIdentity, []any{
+			"message_id", e.MessageID, "dead_letter_reason", res.Reason, "dead_lettered_ms", res.DeadLetteredMs, "expired_ms", res.ExpiredMs,
+		})
+		observability.LogEvent(m.log, slog.LevelInfo, "dead_letter_expired", "dead-letter retention ended; message deleted", fields...)
+		return resultApplied
+	case DLQExpiryNotDue, DLQExpiryStale:
+		return resultStale
 	default:
 		m.transitionFailed(kind, string(res.Outcome))
 		return resultFailed

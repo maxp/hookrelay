@@ -99,7 +99,7 @@ maintenance_max_continuous_batches = 5
 
 Lease expiries and retry activations use separate batches of at most 100 entries. A full batch may trigger another immediate batch, but a process yields after at most five continuous batches so maintenance does not monopolize Valkey or application capacity.
 
-Maintenance metrics must expose applied, stale, and failed transitions, batch size and duration, and lag between Valkey time and the oldest due deadline. The `result` label of `hookrelay_maintenance_processed_total` is bounded to `applied`, `stale` (the index entry no longer matched state), `blocked` (the Recipient is blocked), and `failed`; `kind` is `lease_expiry`, `retry_activation`, the claim-path `inline_lease_expiry` and `inline_retry_activation` (counted in `hookrelay_maintenance_processed_total` only; the batch size, duration, and due-lag series describe background rounds), and later `dlq_retention`.
+Maintenance metrics must expose applied, stale, and failed transitions, batch size and duration, and lag between Valkey time and the oldest due deadline. The `result` label of `hookrelay_maintenance_processed_total` is bounded to `applied`, `stale` (the index entry no longer matched state), `blocked` (the Recipient is blocked), and `failed`; `kind` is `lease_expiry`, `retry_activation`, `dlq_retention` (background rounds only; its due lag is measured from `dead_lettered_ms` plus the retention), and the claim-path `inline_lease_expiry` and `inline_retry_activation` (counted in `hookrelay_maintenance_processed_total` only; the batch size, duration, and due-lag series describe background rounds).
 
 Before a claim enters long polling with an empty ready index, it performs one inline maintenance pass over at most 10 due lease or retry entries, rechecks the ready index, and only then waits. This is a bounded self-healing path, not a replacement for background maintenance.
 
@@ -150,8 +150,10 @@ After attempt four fails, the message moves atomically to the Recipient's dead-l
 
 Operator replay:
 
-- returns the same Canonical Message before all not-yet-started messages for its Recipient;
-- does not interrupt an already leased head or a head waiting for retry, and in that case inserts the replayed message immediately after the current head;
+- returns the same Canonical Message before all not-yet-started messages for its Recipient, except earlier replays that are still waiting: those keep replay order (first in, first out), so replaying several dead letters of one Recipient oldest first restores their original order regardless of claims made between the replays;
+- does not interrupt an already leased head, and in that case inserts the replayed message after the current head and any waiting replays behind it;
+- also waits behind a head waiting for retry; a retry that has already become ready again is preempted, keeping its attempt (the protected case is the in-flight lease, not the failed message itself, which originally followed the dead letter);
+- is not limited by the global or per-Recipient queue capacity: the Canonical Message is already stored, and refusing replay at capacity would block recovery exactly when it is needed. A replay can therefore take a queue temporarily over a limit; acceptance of new messages stays refused until it drains below the limit;
 - preserves `message_id` and payload;
 - starts a new Delivery Cycle with attempt one; a replay inserted behind an active or retrying head retains its new cycle while waiting, and a ready retry preempted by replay retains its existing attempt until it becomes head again;
 - issues a new Delivery Token;

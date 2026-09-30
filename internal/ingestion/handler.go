@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,9 +50,21 @@ type HandlerDeps struct {
 	// Capacity reads the global acceptance capacity; nil disables the
 	// capacity stop conditions.
 	Capacity CapacityReader
-	// OnAcceptanceStop is called when an acceptance hits a global queue or
-	// deduplication stop condition.
+	// OnAcceptanceStop is called when an acceptance hits a global queue,
+	// deduplication, or memory stop condition.
 	OnAcceptanceStop func()
+	// RateLimits are the process-local token buckets (zero rates disable).
+	RateLimits RateLimits
+	// MemoryStopPercent stops new acceptance at this share of Valkey
+	// maxmemory (0, or maxmemory 0, disables the stop).
+	MemoryStopPercent int
+	// DedupRetention and DedupMinRetention describe deduplication
+	// retention: records younger than the minimum are never evicted early.
+	DedupRetention    time.Duration
+	DedupMinRetention time.Duration
+	// DedupEvictor runs proactive early eviction in MaintainCapacity; nil
+	// disables it (acceptance-time eviction is in the acceptor).
+	DedupEvictor DedupEvictor
 	// MaxInflight bounds concurrent webhook requests past route resolution
 	// (DefaultMaxInflight when zero).
 	MaxInflight int
@@ -69,6 +83,9 @@ type Handler struct {
 	log      *slog.Logger
 	metrics  *metrics
 	inflight chan struct{}
+	limiter  *rateLimiter
+	// memoryStopped is the last evaluated memory stop condition.
+	memoryStopped atomic.Bool
 }
 
 // NewHandler composes the webhook pipeline.
@@ -94,7 +111,7 @@ func NewHandler(d HandlerDeps) (*Handler, error) {
 	if d.RequestTimeout <= 0 {
 		d.RequestTimeout = DefaultRequestTimeout
 	}
-	h := &Handler{d: d, log: log, metrics: m, inflight: make(chan struct{}, d.MaxInflight)}
+	h := &Handler{d: d, log: log, metrics: m, inflight: make(chan struct{}, d.MaxInflight), limiter: newRateLimiter(d.RateLimits, d.Clock.Now())}
 	if err := m.registerInflight(reg, func() float64 { return float64(len(h.inflight)) }); err != nil {
 		return nil, err
 	}
@@ -161,6 +178,12 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, req *request) Ou
 		return h.respond(w, def.ResponseMapper, OutcomeUnknownEndpoint)
 	}
 	req.endpoint = endpoint
+
+	// Rate limits: checked before the in-flight slot and the body read.
+	if ok, retryAfter := h.limiter.allow(req.webhookType+":"+req.identifier, h.d.Clock.Now()); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		return h.reject(w, req, OutcomeRateLimited)
+	}
 
 	// Process protection: bounded in-flight requests past route resolution,
 	// acquired before the body is read.
@@ -237,15 +260,25 @@ func (h *Handler) accept(w http.ResponseWriter, ctx context.Context, req *reques
 		return h.respond(w, req.def.ResponseMapper, OutcomeInternalError)
 	}
 
-	result := h.d.Acceptor.Accept(ctx, AcceptRequest{
-		MessageID:           msg.MessageID,
-		DedupIdentityDigest: dedupIdentityDigest(req.webhookType, string(req.def.Platform), req.endpoint.BotID, conv.DedupKey),
-		BodyDigest:          hex.EncodeToString(sum[:]),
-		ReceivedMs:          msg.ReceivedMs,
-		OccurredMs:          msg.OccurredMs,
-		MessageJSON:         data,
-		RecipientIdentity:   msg.Recipient.Identity(),
-	})
+	var result AcceptResult
+	if h.memoryStopped.Load() {
+		// Valkey memory reached the stop share: no new message is written;
+		// the platform retries once draining frees memory.
+		result = AcceptResult{Outcome: AcceptMemoryStop}
+	} else {
+		result = h.d.Acceptor.Accept(ctx, AcceptRequest{
+			MessageID:           msg.MessageID,
+			DedupIdentityDigest: dedupIdentityDigest(req.webhookType, string(req.def.Platform), req.endpoint.BotID, conv.DedupKey),
+			BodyDigest:          hex.EncodeToString(sum[:]),
+			ReceivedMs:          msg.ReceivedMs,
+			OccurredMs:          msg.OccurredMs,
+			MessageJSON:         data,
+			RecipientIdentity:   msg.Recipient.Identity(),
+		})
+	}
+	if result.EarlyEvicted > 0 {
+		h.metrics.dedupEarlyEvictions.Add(float64(result.EarlyEvicted))
+	}
 
 	fields := append(req.logFields(),
 		"recipient_scope", string(msg.Recipient.Scope),
@@ -316,7 +349,7 @@ func outcomeOf(a AcceptOutcome) Outcome {
 		return OutcomeDuplicate
 	case AcceptRecipientBlocked:
 		return OutcomeRecipientBlocked
-	case AcceptRecipientCapacity, AcceptGlobalCapacity, AcceptDedupCapacity:
+	case AcceptRecipientCapacity, AcceptGlobalCapacity, AcceptDedupCapacity, AcceptMemoryStop:
 		return OutcomeCapacityRejection
 	case AcceptInternalFailure:
 		return OutcomeInternalError
@@ -352,7 +385,7 @@ func (h *Handler) logFailure(req *request, o Outcome, message string) {
 // respond writes the empty platform response.
 func (h *Handler) respond(w http.ResponseWriter, mapper ResponseMapper, o Outcome) Outcome {
 	status, retryAfter := mapper.Status(o)
-	if retryAfter {
+	if retryAfter && w.Header().Get("Retry-After") == "" {
 		w.Header().Set("Retry-After", "1")
 	}
 	w.WriteHeader(status)
@@ -415,12 +448,19 @@ func acceptableEncoding(values []string) bool {
 	return true
 }
 
-// Capacity is the global acceptance capacity snapshot.
+// Capacity is the global acceptance capacity snapshot. NowMs is Valkey
+// time; OldestDedupAcceptedMs is the oldest live deduplication record's
+// acceptance time (0 without live records); MaxMemoryBytes 0 means Valkey
+// has no maxmemory.
 type Capacity struct {
-	QueuedMessages    int64
-	MaxQueuedMessages int64
-	DedupRecords      int64
-	MaxDedupRecords   int64
+	NowMs                 int64
+	QueuedMessages        int64
+	MaxQueuedMessages     int64
+	DedupRecords          int64
+	MaxDedupRecords       int64
+	OldestDedupAcceptedMs int64
+	UsedMemoryBytes       int64
+	MaxMemoryBytes        int64
 }
 
 // CapacityReader reads the global acceptance capacity.
@@ -429,9 +469,12 @@ type CapacityReader interface {
 }
 
 // AcceptingWebhooks evaluates the global stop conditions: new messages are
-// accepted only while the global queue and the live deduplication records
-// are below their caps and Valkey answers. It refreshes the deduplication
-// capacity gauges. A full individual Recipient does not stop acceptance.
+// accepted only while the global queue is below its cap, the live
+// deduplication records are below theirs or the oldest can be evicted
+// early (it is at least the minimum retention old), Valkey memory is below
+// the stop share of maxmemory, and Valkey answers. It refreshes the
+// deduplication gauges and the memory stop the handler enforces. A full
+// individual Recipient does not stop acceptance.
 func (h *Handler) AcceptingWebhooks(ctx context.Context) bool {
 	if h.d.Capacity == nil {
 		return true
@@ -440,7 +483,55 @@ func (h *Handler) AcceptingWebhooks(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
+	memoryStop := h.d.MemoryStopPercent > 0 && c.MaxMemoryBytes > 0 &&
+		c.UsedMemoryBytes*100 >= int64(h.d.MemoryStopPercent)*c.MaxMemoryBytes
+	if h.memoryStopped.Swap(memoryStop) != memoryStop {
+		level, message := slog.LevelInfo, "valkey memory below the acceptance stop; acceptance resumes"
+		if memoryStop {
+			level, message = slog.LevelWarn, "valkey memory reached the acceptance stop; new messages are refused while draining continues"
+		}
+		observability.LogEvent(h.log, level, "memory_acceptance_stop", message,
+			"stopped", memoryStop, "used_memory_bytes", c.UsedMemoryBytes, "max_memory_bytes", c.MaxMemoryBytes)
+	}
 	h.metrics.dedupRecords.Set(float64(c.DedupRecords))
 	h.metrics.dedupRecordCapacity.Set(float64(c.MaxDedupRecords))
-	return c.QueuedMessages < c.MaxQueuedMessages && c.DedupRecords < c.MaxDedupRecords
+	full := c.DedupRecords >= c.MaxDedupRecords
+	oldestAge := time.Duration(0)
+	if c.OldestDedupAcceptedMs > 0 {
+		oldestAge = time.Duration(c.NowMs-c.OldestDedupAcceptedMs) * time.Millisecond
+	}
+	h.metrics.dedupOldestAge.Set(oldestAge.Seconds())
+	effective := h.d.DedupRetention
+	if full && c.OldestDedupAcceptedMs > 0 {
+		// At the cap, the oldest live record bounds how far back
+		// duplicates are still detected.
+		effective = min(effective, oldestAge)
+	}
+	h.metrics.dedupEffectiveRetention.Set(effective.Seconds())
+	minRetention := h.d.DedupMinRetention
+	if minRetention <= 0 {
+		// Without a minimum, nothing is evicted early (as in the acceptor).
+		minRetention = h.d.DedupRetention
+	}
+	dedupStop := full && (c.OldestDedupAcceptedMs == 0 || minRetention <= 0 || oldestAge < minRetention)
+	return c.QueuedMessages < c.MaxQueuedMessages && !dedupStop && !memoryStop
+}
+
+// MaintainCapacity is the ingestion part of a maintenance round: it
+// re-evaluates the stop conditions (the memory sample) and, while the
+// deduplication cap is reached, runs one bounded early-eviction batch.
+func (h *Handler) MaintainCapacity(ctx context.Context) {
+	h.AcceptingWebhooks(ctx)
+	if h.d.DedupEvictor == nil {
+		return
+	}
+	// Evictions made before a failure still count.
+	n, err := h.d.DedupEvictor.EvictDedup(ctx)
+	if n > 0 {
+		h.metrics.dedupEarlyEvictions.Add(float64(n))
+	}
+	if err != nil {
+		observability.LogEvent(h.log, slog.LevelWarn, "dedup_eviction_failed", "deduplication early eviction stopped",
+			"error_code", "dependency_unavailable", "evicted", n)
+	}
 }

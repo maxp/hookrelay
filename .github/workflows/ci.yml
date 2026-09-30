@@ -123,9 +123,10 @@ jobs:
           test -n "$user" && test "$user" != "root" && test "$user" != "0"
 
   smoke:
-    # The Compose smoke is the Milestone 1 exit criterion: the full vertical
-    # slice against the pinned stack in production mode, including a restart
-    # that keeps the Valkey volume.
+    # The Compose smoke is the Milestone 1 and Milestone 2 exit criterion: the
+    # vertical slice and the failure path (retries, DLQ, CLI replay) against
+    # the pinned stack in production mode, including a restart that keeps the
+    # Valkey volume and expires a lease left claimed.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

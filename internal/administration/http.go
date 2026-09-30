@@ -38,6 +38,14 @@ func Handler(svc *Service) http.Handler {
 		mux.Handle("POST /admin/v1/recipient-blocks/inspect", svc.auth(http.HandlerFunc(svc.handleInspectBlock)))
 		mux.Handle("POST /admin/v1/recipient-blocks/clear", svc.auth(http.HandlerFunc(svc.handleClearBlock)))
 	}
+	if svc.deadLetters != nil {
+		mux.Handle("GET /admin/v1/dead-letters", svc.auth(http.HandlerFunc(svc.handleListDeadLetters)))
+		mux.Handle("GET /admin/v1/dead-letters/{message_id}", svc.auth(http.HandlerFunc(svc.handleGetDeadLetter)))
+		mux.Handle("POST /admin/v1/dead-letters/{message_id}/replay", svc.auth(http.HandlerFunc(svc.handleReplayDeadLetter)))
+	}
+	if svc.messages != nil {
+		mux.Handle("GET /admin/v1/messages/{message_id}/delivery-state", svc.auth(http.HandlerFunc(svc.handleDeliveryState)))
+	}
 	return mux
 }
 

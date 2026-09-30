@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/maxp/hookrelay/internal/delivery"
 )
@@ -61,13 +62,13 @@ func (s *DeliveryStore) DueLeases(ctx context.Context, limit int) (delivery.DueB
 	return s.dueEntries(ctx, "hr1:leases", limit)
 }
 
-// ExpireLease runs expire_lease_v2 for one Recipient.
+// ExpireLease runs expire_lease_v3 for one Recipient.
 func (s *DeliveryStore) ExpireLease(ctx context.Context, recipientIdentity string, retryDelaysMs []int64, maxAttempts int) delivery.ExpiryResult {
 	delays := make([]string, len(retryDelaysMs))
 	for i, d := range retryDelaysMs {
 		delays[i] = itoa64(d)
 	}
-	res, err := s.a.RunScript(ctx, "expire_lease_v2",
+	res, err := s.a.RunScript(ctx, "expire_lease_v3",
 		[]string{"hr1:ready", "hr1:ready_seq", "hr1:leases", "hr1:retries", "hr1:blocked", "hr1:dlq", "hr1:stats:queued_messages"},
 		[]string{recipientIdentity, strings.Join(delays, ","), itoa64(int64(maxAttempts)), itoa64(TombstoneTTL.Milliseconds()), "hr1"})
 	if err != nil {
@@ -113,5 +114,50 @@ func (s *DeliveryStore) ExpireLease(ctx context.Context, recipientIdentity strin
 		return delivery.ExpiryResult{Outcome: delivery.ExpiryInternalFailure}
 	default:
 		return delivery.ExpiryResult{Outcome: delivery.ExpiryOutcome(res.Status)}
+	}
+}
+
+// DueDeadLetters reads at most limit hr1:dlq members whose retention has
+// passed against Valkey time, oldest first; DueMs is the retention deadline.
+func (s *DeliveryStore) DueDeadLetters(ctx context.Context, limit int, retention time.Duration) (delivery.DueBatch, error) {
+	now, err := s.a.serverTimeMs(ctx)
+	if err != nil {
+		return delivery.DueBatch{}, err
+	}
+	ret := retention.Milliseconds()
+	c := s.a.client
+	scored, err := c.Do(ctx, c.B().Zrange().Key("hr1:dlq").Min("-inf").Max(itoa64(now-ret)).Byscore().Limit(0, int64(limit)).Withscores().Build()).AsZScores()
+	if err != nil {
+		return delivery.DueBatch{}, err
+	}
+	batch := delivery.DueBatch{NowMs: now, Entries: make([]delivery.DueEntry, 0, len(scored))}
+	for _, z := range scored {
+		batch.Entries = append(batch.Entries, delivery.DueEntry{MessageID: z.Member, DueMs: int64(z.Score) + ret})
+	}
+	return batch, nil
+}
+
+// ExpireDeadLetter runs expire_dlq_v1 for one dead letter.
+func (s *DeliveryStore) ExpireDeadLetter(ctx context.Context, messageID string, retention time.Duration, eventID string) delivery.DLQExpiryResult {
+	res, err := s.a.RunScript(ctx, "expire_dlq_v1", []string{"hr1:dlq", auditKey},
+		[]string{messageID, itoa64(retention.Milliseconds()), eventID, "hr1"})
+	if err != nil {
+		// A lost response is safe: a repeat re-validates the record.
+		return delivery.DLQExpiryResult{Outcome: delivery.DLQExpiryDependencyUnavailable}
+	}
+	switch res.Status {
+	case "expired":
+		dead, err1 := res.Fields[0].AsInt64()
+		rid, err2 := res.Fields[1].ToString()
+		reason, err3 := res.Fields[2].ToString()
+		expired, err4 := res.Fields[3].AsInt64()
+		if err := errors.Join(err1, err2, err3, err4); err != nil {
+			return delivery.DLQExpiryResult{Outcome: delivery.DLQExpiryInternalFailure}
+		}
+		return delivery.DLQExpiryResult{Outcome: delivery.DLQExpiryExpired, RecipientIdentity: rid, Reason: reason, DeadLetteredMs: dead, ExpiredMs: expired}
+	case "wrong_type":
+		return delivery.DLQExpiryResult{Outcome: delivery.DLQExpiryInternalFailure}
+	default:
+		return delivery.DLQExpiryResult{Outcome: delivery.DLQExpiryOutcome(res.Status)}
 	}
 }

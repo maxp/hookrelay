@@ -72,8 +72,12 @@ type ServiceDeps struct {
 	// Recipients serves the Recipient-state and block routes; nil leaves
 	// them unregistered.
 	Recipients RecipientRepository
-	Catalog    TypeCatalog
-	Audit      AuditSink
+	// DeadLetters serves the DLQ routes; nil leaves them unregistered.
+	DeadLetters DeadLetterRepository
+	// Messages serves the delivery-state route; nil leaves it unregistered.
+	Messages MessageStateRepository
+	Catalog  TypeCatalog
+	Audit    AuditSink
 	// AdminSecret must already be resolved and validated by the
 	// configuration layer.
 	AdminSecret string
@@ -87,10 +91,12 @@ type ServiceDeps struct {
 
 // Service implements the administrative use cases.
 type Service struct {
-	repo       EndpointRepository
-	recipients RecipientRepository
-	catalog    TypeCatalog
-	audit      AuditSink
+	repo        EndpointRepository
+	recipients  RecipientRepository
+	deadLetters DeadLetterRepository
+	messages    MessageStateRepository
+	catalog     TypeCatalog
+	audit       AuditSink
 	// adminSecretDigest is the SHA-256 of the Admin Secret: comparing
 	// fixed-size digests keeps the check constant-time in the secret length.
 	adminSecretDigest [sha256.Size]byte
@@ -116,6 +122,8 @@ func NewService(d ServiceDeps) (*Service, error) {
 	return &Service{
 		repo:              d.Repo,
 		recipients:        d.Recipients,
+		deadLetters:       d.DeadLetters,
+		messages:          d.Messages,
 		catalog:           d.Catalog,
 		audit:             d.Audit,
 		adminSecretDigest: sha256.Sum256([]byte(d.AdminSecret)),
