@@ -2,8 +2,6 @@ package administration
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -22,22 +20,13 @@ type WebhookPage struct {
 
 // ListWebhooks pages all Webhook Endpoints newest first by safe metadata.
 func (s *Service) ListWebhooks(ctx context.Context, limit, cursor, requestID string) (WebhookPage, error) {
-	n := defaultListLimit
-	if limit != "" {
-		v, err := strconv.Atoi(limit)
-		if err != nil || v < 1 || v > maxListLimit {
-			return WebhookPage{}, BadRequestError{msg: "limit must be between 1 and 200"}
-		}
-		n = v
+	n, err := parseListLimit(limit)
+	if err != nil {
+		return WebhookPage{}, err
 	}
-	var after *EndpointCursor
-	if cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(cursor)
-		var c EndpointCursor
-		if err != nil || json.Unmarshal(raw, &c) != nil || c.ID == "" {
-			return WebhookPage{}, BadRequestError{msg: "cursor is malformed", code: "invalid_cursor"}
-		}
-		after = &c
+	after, err := decodeCursor(cursor, func(c EndpointCursor) bool { return c.ID != "" })
+	if err != nil {
+		return WebhookPage{}, err
 	}
 	items, err := s.repo.ListEndpoints(ctx, n+1, after)
 	if err != nil {
@@ -46,8 +35,7 @@ func (s *Service) ListWebhooks(ctx context.Context, limit, cursor, requestID str
 	page := WebhookPage{Items: []endpointResponse{}}
 	if len(items) > n {
 		last := items[n-1]
-		raw, _ := json.Marshal(EndpointCursor{CreatedMs: last.CreatedMs, ID: last.Member})
-		page.NextCursor = base64.RawURLEncoding.EncodeToString(raw)
+		page.NextCursor = encodeCursor(EndpointCursor{CreatedMs: last.CreatedMs, ID: last.Member})
 		items = items[:n]
 	}
 	page.Items = s.endpointViews(items, "webhook_listing", requestID)
@@ -67,7 +55,7 @@ func (s *Service) endpointViews(items []EndpointListing, index, requestID string
 		if why == "" {
 			var ok bool
 			if platform, _, ok = s.catalog.Lookup(it.Endpoint.Type); !ok {
-				why = "unknown_webhook_type"
+				why = OrphanUnknownType
 			}
 		}
 		if why != "" {
@@ -138,31 +126,25 @@ type PatchRequest struct {
 
 // SetWebhookEnabled runs the audited enable/disable transition. Setting the
 // current value is a no-op that returns the unchanged representation.
-func (s *Service) SetWebhookEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, requestID string) (EndpointView, error) {
-	platform, _, ok := s.catalog.Lookup(webhookType)
+func (s *Service) SetWebhookEnabled(ctx context.Context, ref EndpointRef, enabled bool, expected *EntityVersion, requestID string) (EndpointView, error) {
+	platform, _, ok := s.catalog.Lookup(ref.Type)
 	if !ok {
 		return EndpointView{}, NotFoundError{}
 	}
 	eventID := s.gen.UUIDv7()
-	e, result := s.repo.SetEndpointEnabled(ctx, webhookType, identifier, enabled, expected, eventID, requestID)
+	e, result := s.repo.SetEndpointEnabled(ctx, ref, enabled, expected, eventID, requestID)
 	switch result {
 	case SetEnabledUpdated, SetEnabledUnchanged:
 		e.BotPlatform = platform
-		view := viewOf(e)
-		if result == SetEnabledUnchanged {
-			return view, nil
+		if result == SetEnabledUpdated {
+			op := opWebhookEndpointDisabled
+			if enabled {
+				op = opWebhookEndpointEnabled
+			}
+			s.endpointMutated(op, ref, platform, eventID, requestID,
+				"bot_id", e.BotID, "credential_kind", e.CredentialKind, "generation_id", e.GenerationID, "config_version", e.ConfigVersion)
 		}
-		op := opWebhookEndpointDisabled
-		if enabled {
-			op = opWebhookEndpointEnabled
-		}
-		target := webhookType + ":" + identifier
-		s.metrics.auditEvents.WithLabelValues(op, outcomeSuccess).Inc()
-		s.logAudit(eventID, op, target, requestID, outcomeSuccess)
-		observability.LogEvent(s.log, slog.LevelInfo, op, "webhook endpoint "+map[bool]string{true: "enabled", false: "disabled"}[enabled],
-			"request_id", requestID, "webhook_type", webhookType, "webhook_identifier", identifier, "bot_platform", platform,
-			"bot_id", e.BotID, "credential_kind", e.CredentialKind, "generation_id", e.GenerationID, "config_version", e.ConfigVersion)
-		return view, nil
+		return viewOf(e), nil
 	case SetEnabledNotFound:
 		return EndpointView{}, NotFoundError{}
 	case SetEnabledPreconditionRequired:
@@ -170,80 +152,29 @@ func (s *Service) SetWebhookEnabled(ctx context.Context, webhookType, identifier
 	case SetEnabledPreconditionFailed:
 		return EndpointView{}, preconditionFailed()
 	case SetEnabledWrongType:
-		s.logMutationFailure("webhook_endpoint_update_failed", requestID, webhookType, identifier, "wrong_type")
-		return EndpointView{}, DependencyError{detail: "stored structure has an unexpected type"}
+		return EndpointView{}, s.mutationNotConfirmed("webhook_endpoint_update_failed", ref, requestID, reasonWrongType)
 	case SetEnabledUncertain:
-		s.logMutationFailure("webhook_endpoint_update_failed", requestID, webhookType, identifier, "outcome_uncertain")
-		return EndpointView{}, DependencyError{detail: "update outcome is uncertain: read the endpoint and audit before retrying"}
+		return EndpointView{}, s.mutationNotConfirmed("webhook_endpoint_update_failed", ref, requestID, reasonUncertain)
 	default:
-		s.logMutationFailure("webhook_endpoint_update_failed", requestID, webhookType, identifier, "dependency_unavailable")
-		return EndpointView{}, DependencyError{}
+		return EndpointView{}, s.mutationNotConfirmed("webhook_endpoint_update_failed", ref, requestID, reasonUnavailable)
 	}
-}
-
-// logMutationFailure records a bounded error event for an endpoint
-// mutation that could not be confirmed.
-func (s *Service) logMutationFailure(event, requestID, webhookType, identifier, reason string) {
-	observability.LogEvent(s.log, slog.LevelError, event, "webhook endpoint mutation not confirmed",
-		"request_id", requestID, "webhook_type", webhookType, "webhook_identifier", identifier,
-		"error_code", "dependency_unavailable", "reason_code", reason)
-}
-
-// endpointPath validates the endpoint route values; unknown shapes are
-// indistinguishable from unknown endpoints.
-func endpointPath(r *http.Request) (webhookType, identifier string, ok bool) {
-	webhookType, identifier = r.PathValue("webhook_type"), r.PathValue("webhook_identifier")
-	return webhookType, identifier, webhookTypePattern.MatchString(webhookType) && identifierPattern.MatchString(identifier)
-}
-
-func (s *Service) handlePatch(w http.ResponseWriter, r *http.Request) {
-	requestID := requestIDFrom(r.Context())
-	webhookType, identifier, ok := endpointPath(r)
-	if !ok {
-		writeAPIError(w, NotFoundError{}, requestID)
-		return
-	}
-	var req PatchRequest
-	if err := decodeBody(r, &req); err != nil {
-		writeAPIError(w, err, requestID)
-		return
-	}
-	if req.Enabled == nil {
-		writeAPIError(w, BadRequestError{msg: "enabled is required"}, requestID)
-		return
-	}
-	expected, err := parseIfMatch(r)
-	if err != nil {
-		writeAPIError(w, err, requestID)
-		return
-	}
-	view, err := s.SetWebhookEnabled(r.Context(), webhookType, identifier, *req.Enabled, expected, requestID)
-	if err != nil {
-		writeAPIError(w, err, requestID)
-		return
-	}
-	writeEndpoint(w, http.StatusOK, view)
 }
 
 // DeleteWebhook permanently deletes a disabled endpoint. Deleting an absent
 // endpoint succeeds without another audit event; that proves no earlier
 // uncertain deletion wrote its audit.
-func (s *Service) DeleteWebhook(ctx context.Context, webhookType, identifier string, expected *EntityVersion, requestID string) error {
-	platform, _, ok := s.catalog.Lookup(webhookType)
+func (s *Service) DeleteWebhook(ctx context.Context, ref EndpointRef, expected *EntityVersion, requestID string) error {
+	platform, _, ok := s.catalog.Lookup(ref.Type)
 	if !ok {
 		// No endpoint of an unregistered type can exist.
 		return nil
 	}
 	eventID := s.gen.UUIDv7()
-	e, result := s.repo.DeleteEndpoint(ctx, webhookType, identifier, platform, expected, eventID, requestID)
+	d, result := s.repo.DeleteEndpoint(ctx, ref, platform, expected, eventID, requestID)
 	switch result {
 	case DeleteDeleted:
-		target := webhookType + ":" + identifier
-		s.metrics.auditEvents.WithLabelValues(opWebhookEndpointDeleted, outcomeSuccess).Inc()
-		s.logAudit(eventID, opWebhookEndpointDeleted, target, requestID, outcomeSuccess)
-		observability.LogEvent(s.log, slog.LevelInfo, opWebhookEndpointDeleted, "webhook endpoint deleted",
-			"request_id", requestID, "webhook_type", webhookType, "webhook_identifier", identifier, "bot_platform", platform,
-			"bot_id", e.BotID, "credential_kind", e.CredentialKind, "generation_id", e.GenerationID, "config_version", e.ConfigVersion)
+		s.endpointMutated(opWebhookEndpointDeleted, ref, platform, eventID, requestID,
+			"bot_id", d.BotID, "credential_kind", d.CredentialKind, "generation_id", d.GenerationID, "config_version", d.ConfigVersion)
 		return nil
 	case DeleteAbsent:
 		return nil
@@ -254,31 +185,111 @@ func (s *Service) DeleteWebhook(ctx context.Context, webhookType, identifier str
 	case DeleteMustBeDisabled:
 		return ConflictError{msg: "Disable the webhook endpoint before deleting it.", code: "endpoint_must_be_disabled"}
 	case DeleteWrongType:
-		s.logMutationFailure("webhook_endpoint_delete_failed", requestID, webhookType, identifier, "wrong_type")
-		return DependencyError{detail: "stored structure has an unexpected type"}
+		return s.mutationNotConfirmed("webhook_endpoint_delete_failed", ref, requestID, reasonWrongType)
 	case DeleteUncertain:
-		s.logMutationFailure("webhook_endpoint_delete_failed", requestID, webhookType, identifier, "outcome_uncertain")
-		return DependencyError{detail: "delete outcome is uncertain: read the endpoint and audit before retrying"}
+		return s.mutationNotConfirmed("webhook_endpoint_delete_failed", ref, requestID, reasonUncertain)
 	default:
-		s.logMutationFailure("webhook_endpoint_delete_failed", requestID, webhookType, identifier, "dependency_unavailable")
-		return DependencyError{}
+		return s.mutationNotConfirmed("webhook_endpoint_delete_failed", ref, requestID, reasonUnavailable)
 	}
+}
+
+// endpointMutated records a confirmed endpoint mutation whose audit entry
+// the transition already appended: the audit metric, the best-effort audit
+// copy, and the feature event named after the operation, with safe fields.
+func (s *Service) endpointMutated(op string, ref EndpointRef, platform, eventID, requestID string, fields ...any) {
+	s.metrics.auditEvents.WithLabelValues(op, outcomeSuccess).Inc()
+	s.logAudit(eventID, op, ref.String(), requestID, outcomeSuccess)
+	fields = append([]any{"request_id", requestID, "webhook_type", ref.Type, "webhook_identifier", ref.Identifier, "bot_platform", platform}, fields...)
+	observability.LogEvent(s.log, slog.LevelInfo, op, strings.ReplaceAll(op, "_", " "), fields...)
+}
+
+// Reasons an endpoint mutation could not be confirmed.
+const (
+	reasonWrongType   = "wrong_type"
+	reasonUncertain   = "outcome_uncertain"
+	reasonUnavailable = "dependency_unavailable"
+)
+
+var mutationFailureDetail = map[string]string{
+	reasonWrongType: "stored structure has an unexpected type",
+	reasonUncertain: "outcome is uncertain: read the endpoint and audit before retrying",
+}
+
+// mutationNotConfirmed logs a bounded error event for an endpoint mutation
+// that could not be confirmed and returns its 503.
+func (s *Service) mutationNotConfirmed(event string, ref EndpointRef, requestID, reason string) error {
+	observability.LogEvent(s.log, slog.LevelError, event, "webhook endpoint mutation not confirmed",
+		"request_id", requestID, "webhook_type", ref.Type, "webhook_identifier", ref.Identifier,
+		"error_code", "dependency_unavailable", "reason_code", reason)
+	return DependencyError{detail: mutationFailureDetail[reason]}
+}
+
+// endpointPath validates the endpoint route values; unknown shapes are
+// indistinguishable from unknown endpoints.
+func endpointPath(r *http.Request) (EndpointRef, bool) {
+	ref := EndpointRef{Type: r.PathValue("webhook_type"), Identifier: r.PathValue("webhook_identifier")}
+	return ref, webhookTypePattern.MatchString(ref.Type) && identifierPattern.MatchString(ref.Identifier)
+}
+
+// ifMatchFor parses If-Match for a mutation of ref. A malformed tag is 400
+// only for an existing endpoint: the contract answers a missing endpoint
+// the same way with or without If-Match, so absent reports that instead.
+func (s *Service) ifMatchFor(r *http.Request, ref EndpointRef) (expected *EntityVersion, absent bool, err error) {
+	expected, err = parseIfMatch(r)
+	if err == nil {
+		return expected, false, nil
+	}
+	if _, getErr := s.GetWebhook(r.Context(), ref.Type, ref.Identifier); errors.As(getErr, new(NotFoundError)) {
+		return nil, true, nil
+	}
+	return nil, false, err
+}
+
+func (s *Service) handlePatch(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFrom(r.Context())
+	ref, ok := endpointPath(r)
+	if !ok {
+		writeAPIError(w, NotFoundError{}, requestID)
+		return
+	}
+	// The body is validated first: a malformed request is refused before
+	// any storage access.
+	var req PatchRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeAPIError(w, err, requestID)
+		return
+	}
+	if req.Enabled == nil {
+		writeAPIError(w, BadRequestError{msg: "enabled is required"}, requestID)
+		return
+	}
+	expected, absent, err := s.ifMatchFor(r, ref)
+	switch {
+	case absent:
+		err = NotFoundError{}
+	case err == nil:
+		var view EndpointView
+		if view, err = s.SetWebhookEnabled(r.Context(), ref, *req.Enabled, expected, requestID); err == nil {
+			writeEndpoint(w, http.StatusOK, view)
+			return
+		}
+	}
+	writeAPIError(w, err, requestID)
 }
 
 func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r.Context())
-	webhookType, identifier, ok := endpointPath(r)
+	ref, ok := endpointPath(r)
 	if !ok {
 		// A shape that cannot name an endpoint names an absent one.
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	expected, err := parseIfMatch(r)
-	if err != nil {
-		writeAPIError(w, err, requestID)
-		return
+	expected, absent, err := s.ifMatchFor(r, ref)
+	if err == nil && !absent {
+		err = s.DeleteWebhook(r.Context(), ref, expected, requestID)
 	}
-	if err := s.DeleteWebhook(r.Context(), webhookType, identifier, expected, requestID); err != nil {
+	if err != nil {
 		writeAPIError(w, err, requestID)
 		return
 	}
@@ -305,6 +316,13 @@ func (s *Service) ListBotWebhooks(ctx context.Context, botPlatform, botID, reque
 			return BotWebhooks{}, DependencyError{detail: ErrStoredWrongType.Error()}
 		}
 		return BotWebhooks{}, DependencyError{}
+	}
+	if len(items) > maxEndpointsPerBot {
+		// Creation enforces the cap; more members mean an inconsistent
+		// index, so the response keeps the contract's bound.
+		observability.LogEvent(s.log, slog.LevelWarn, "webhook_bot_endpoint_limit_exceeded", "bot endpoint index exceeds its cap; the list is truncated",
+			"request_id", requestID, "bot_platform", botPlatform, "bot_id", botID, "member_count", len(items))
+		items = items[:maxEndpointsPerBot]
 	}
 	return BotWebhooks{Items: s.endpointViews(items, "bot_webhooks", requestID)}, nil
 }

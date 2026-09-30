@@ -62,7 +62,7 @@ func (a *Adapter) CreateEndpoint(ctx context.Context, e Endpoint, eventID, opera
 		enabled = "1"
 	}
 	keys := []string{
-		"hr1:wh:" + e.Type + ":" + e.Identifier,
+		endpointKey(e.Type, e.Identifier),
 		"hr1:bot:" + e.BotPlatform + ":" + e.BotID + ":webhooks",
 		"hr1:webhooks",
 		auditKey,
@@ -111,7 +111,7 @@ func (a *Adapter) CreateEndpoint(ctx context.Context, e Endpoint, eventID, opera
 func (a *Adapter) GetEndpoint(ctx context.Context, webhookType, identifier string) (_ *Endpoint, err error) {
 	start := time.Now()
 	defer func() { a.metrics.observe("endpoint_read", start, err) }()
-	key := "hr1:wh:" + webhookType + ":" + identifier
+	key := endpointKey(webhookType, identifier)
 	msg, err := a.client.Do(ctx, a.client.B().Hgetall().Key(key).Build()).ToMessage()
 	if err != nil {
 		if isWrongType(err) {
@@ -135,7 +135,7 @@ var errMalformedEndpoint = errors.New("valkey: malformed endpoint record")
 
 // parseEndpoint maps the fields of a non-empty endpoint Hash.
 func parseEndpoint(webhookType, identifier string, fields map[string]string) (_ *Endpoint, err error) {
-	key := "hr1:wh:" + webhookType + ":" + identifier
+	key := endpointKey(webhookType, identifier)
 	for _, required := range []string{"bot_id", "enabled", "credential_kind", "credential_value", "generation_id"} {
 		if fields[required] == "" {
 			return nil, fmt.Errorf("%w: %s: missing field %s", errMalformedEndpoint, key, required)
@@ -250,38 +250,32 @@ func (s *endpointStore) GetEndpoint(ctx context.Context, webhookType, identifier
 // SetEndpointEnabled runs endpoint_set_enabled_v1: the enabled flag,
 // config_version, updated_ms, and the mandatory audit append in one atomic
 // operation under the expected entity version.
-func (s *endpointStore) SetEndpointEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *administration.EntityVersion, eventID, requestID string) (*administration.Endpoint, administration.SetEnabledResult) {
+func (s *endpointStore) SetEndpointEnabled(ctx context.Context, ref administration.EndpointRef, enabled bool, expected *administration.EntityVersion, eventID, requestID string) (*administration.Endpoint, administration.SetEnabledResult) {
 	flag := "0"
 	if enabled {
 		flag = "1"
 	}
 	generation, version := expectedArgs(expected)
 	res, err := s.a.RunScript(ctx, "endpoint_set_enabled_v1",
-		[]string{"hr1:wh:" + webhookType + ":" + identifier, auditKey},
-		[]string{webhookType, identifier, flag, generation, version, eventID, requestID})
+		[]string{endpointKey(ref.Type, ref.Identifier), auditKey},
+		[]string{ref.Type, ref.Identifier, flag, generation, version, eventID, requestID})
 	if err != nil {
 		if errors.Is(err, ErrNotDispatched) {
 			return nil, administration.SetEnabledUnavailable
 		}
 		return nil, administration.SetEnabledUncertain
 	}
-	switch administration.SetEnabledResult(res.Status) {
+	switch result := administration.SetEnabledResult(res.Status); result {
 	case administration.SetEnabledUpdated, administration.SetEnabledUnchanged:
-		e, ok := safeEndpointFields(webhookType, identifier, res.Fields)
+		e, ok := safeEndpointFields(ref, res.Fields)
 		if !ok {
 			// The script ran; an unreadable result proves nothing.
 			return nil, administration.SetEnabledUncertain
 		}
-		return e, administration.SetEnabledResult(res.Status)
-	case administration.SetEnabledPreconditionFailed:
-		current, ok := versionFields(res.Fields)
-		if !ok {
-			return nil, administration.SetEnabledUncertain
-		}
-		return &administration.Endpoint{Type: webhookType, Identifier: identifier, GenerationID: current.GenerationID, ConfigVersion: current.ConfigVersion},
-			administration.SetEnabledPreconditionFailed
-	case administration.SetEnabledNotFound, administration.SetEnabledPreconditionRequired, administration.SetEnabledWrongType:
-		return nil, administration.SetEnabledResult(res.Status)
+		return e, result
+	case administration.SetEnabledNotFound, administration.SetEnabledPreconditionRequired,
+		administration.SetEnabledPreconditionFailed, administration.SetEnabledWrongType:
+		return nil, result
 	default:
 		return nil, administration.SetEnabledUncertain
 	}
@@ -289,49 +283,42 @@ func (s *endpointStore) SetEndpointEnabled(ctx context.Context, webhookType, ide
 
 // DeleteEndpoint runs endpoint_delete_v1: the endpoint Hash, Bot Identity
 // Set membership, listing member, and the mandatory audit append in one
-// atomic operation. The returned Endpoint carries the deleted record's
-// safe identity (bot, credential kind, generation, version) and, in
-// UpdatedMs, the deletion time.
-func (s *endpointStore) DeleteEndpoint(ctx context.Context, webhookType, identifier, botPlatform string, expected *administration.EntityVersion, eventID, requestID string) (*administration.Endpoint, administration.DeleteResult) {
+// atomic operation.
+func (s *endpointStore) DeleteEndpoint(ctx context.Context, ref administration.EndpointRef, botPlatform string, expected *administration.EntityVersion, eventID, requestID string) (*administration.DeletedEndpoint, administration.DeleteResult) {
 	generation, version := expectedArgs(expected)
 	res, err := s.a.RunScript(ctx, "endpoint_delete_v1",
-		[]string{"hr1:wh:" + webhookType + ":" + identifier, "hr1:webhooks", auditKey},
-		[]string{webhookType, identifier, botPlatform, generation, version, eventID, requestID})
+		[]string{endpointKey(ref.Type, ref.Identifier), "hr1:webhooks", auditKey},
+		[]string{ref.Type, ref.Identifier, botPlatform, generation, version, eventID, requestID})
 	if err != nil {
 		if errors.Is(err, ErrNotDispatched) {
 			return nil, administration.DeleteUnavailable
 		}
 		return nil, administration.DeleteUncertain
 	}
-	switch administration.DeleteResult(res.Status) {
+	switch result := administration.DeleteResult(res.Status); result {
 	case administration.DeleteDeleted:
-		var f [5]string
-		for i := range f {
-			v, err := res.Fields[i].ToString()
-			if err != nil {
-				return nil, administration.DeleteUncertain
-			}
-			f[i] = v
+		// bot_id, credential_kind, generation_id, config_version, deleted_ms
+		f, ok := stringFields(res.Fields, 5)
+		if !ok {
+			return nil, administration.DeleteUncertain
 		}
 		version, err1 := strconv.ParseInt(f[3], 10, 64)
 		deleted, err2 := strconv.ParseInt(f[4], 10, 64)
 		if err1 != nil || err2 != nil {
 			return nil, administration.DeleteUncertain
 		}
-		return &administration.Endpoint{Type: webhookType, Identifier: identifier, BotPlatform: botPlatform, BotID: f[0],
-			CredentialKind: f[1], GenerationID: f[2], ConfigVersion: version, UpdatedMs: deleted}, administration.DeleteDeleted
-	case administration.DeletePreconditionFailed:
-		current, ok := versionFields(res.Fields)
-		if !ok {
-			return nil, administration.DeleteUncertain
-		}
-		return &administration.Endpoint{Type: webhookType, Identifier: identifier, GenerationID: current.GenerationID, ConfigVersion: current.ConfigVersion},
-			administration.DeletePreconditionFailed
-	case administration.DeleteAbsent, administration.DeletePreconditionRequired, administration.DeleteMustBeDisabled, administration.DeleteWrongType:
-		return nil, administration.DeleteResult(res.Status)
+		return &administration.DeletedEndpoint{BotID: f[0], CredentialKind: f[1], GenerationID: f[2], ConfigVersion: version, DeletedMs: deleted}, result
+	case administration.DeleteAbsent, administration.DeletePreconditionRequired, administration.DeletePreconditionFailed,
+		administration.DeleteMustBeDisabled, administration.DeleteWrongType:
+		return nil, result
 	default:
 		return nil, administration.DeleteUncertain
 	}
+}
+
+// endpointKey is the endpoint Hash hr1:wh:<webhook_type>:<webhook_identifier>.
+func endpointKey(webhookType, identifier string) string {
+	return "hr1:wh:" + webhookType + ":" + identifier
 }
 
 // expectedArgs encodes an optional expected entity version as script
@@ -343,19 +330,27 @@ func expectedArgs(v *administration.EntityVersion) (generation, version string) 
 	return v.GenerationID, strconv.FormatInt(v.ConfigVersion, 10)
 }
 
-// safeEndpointFields maps the seven safe fields of an endpoint script
-// result: bot_id, enabled, credential_kind, generation_id, created_ms,
-// updated_ms, config_version. The credential value is never returned by a
-// script, so CredentialValue stays empty and CredentialSet is inferred by
-// the caller from the credential kind.
-func safeEndpointFields(webhookType, identifier string, f []valkey.ValkeyMessage) (*administration.Endpoint, bool) {
-	var s [7]string
-	for i := range s {
+// stringFields reads the first n positional result fields as strings.
+func stringFields(f []valkey.ValkeyMessage, n int) ([]string, bool) {
+	out := make([]string, n)
+	for i := range out {
 		v, err := f[i].ToString()
 		if err != nil {
 			return nil, false
 		}
-		s[i] = v
+		out[i] = v
+	}
+	return out, true
+}
+
+// safeEndpointFields maps the seven safe fields of an endpoint script
+// result: bot_id, enabled, credential_kind, generation_id, created_ms,
+// updated_ms, config_version. A script never returns the credential value,
+// so CredentialValue stays empty.
+func safeEndpointFields(ref administration.EndpointRef, f []valkey.ValkeyMessage) (*administration.Endpoint, bool) {
+	s, ok := stringFields(f, 7)
+	if !ok {
+		return nil, false
 	}
 	created, err1 := strconv.ParseInt(s[4], 10, 64)
 	updated, err2 := strconv.ParseInt(s[5], 10, 64)
@@ -364,20 +359,9 @@ func safeEndpointFields(webhookType, identifier string, f []valkey.ValkeyMessage
 		return nil, false
 	}
 	return &administration.Endpoint{
-		Type: webhookType, Identifier: identifier, BotID: s[0], Enabled: s[1] == "1", CredentialKind: s[2],
+		Type: ref.Type, Identifier: ref.Identifier, BotID: s[0], Enabled: s[1] == "1", CredentialKind: s[2],
 		GenerationID: s[3], CreatedMs: created, UpdatedMs: updated, ConfigVersion: version,
 	}, true
-}
-
-// versionFields maps a precondition_failed result's current version.
-func versionFields(f []valkey.ValkeyMessage) (administration.EntityVersion, bool) {
-	generation, err1 := f[0].ToString()
-	raw, err2 := f[1].ToString()
-	version, err3 := strconv.ParseInt(raw, 10, 64)
-	if err1 != nil || err2 != nil || err3 != nil {
-		return administration.EntityVersion{}, false
-	}
-	return administration.EntityVersion{GenerationID: generation, ConfigVersion: version}, true
 }
 
 // ListEndpoints pages hr1:webhooks in descending (score, member) order and
@@ -459,7 +443,8 @@ func (s *endpointStore) readListings(ctx context.Context, items []administration
 	c := s.a.client
 	cmds := make(valkey.Commands, len(items))
 	for i, it := range items {
-		cmds[i] = c.B().Hgetall().Key("hr1:wh:" + it.Member).Build()
+		webhookType, identifier, _ := strings.Cut(it.Member, ":")
+		cmds[i] = c.B().Hgetall().Key(endpointKey(webhookType, identifier)).Build()
 	}
 	for i, r := range c.DoMulti(ctx, cmds...) {
 		fields, err := r.AsStrMap()

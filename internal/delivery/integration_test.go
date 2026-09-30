@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/maxp/hookrelay/internal/administration"
 	"github.com/maxp/hookrelay/internal/app"
 	"github.com/maxp/hookrelay/internal/config"
 	"github.com/maxp/hookrelay/internal/delivery"
@@ -761,4 +762,90 @@ func gatherCounter(t *testing.T, reg *prometheus.Registry, name string, labels m
 		}
 	}
 	return 0
+}
+
+// TestReplayWakesWaitingClaimOverRealValkey pins the replay source through
+// the real Admin service: with a 20 s recheck interval, a claim waiting on
+// an empty index returns promptly after a dead letter is replayed to the
+// head of its Recipient.
+func TestReplayWakesWaitingClaimOverRealValkey(t *testing.T) {
+	notifier, err := delivery.NewReadyNotifier(true, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, _, _, store := composeStackWith(t, stackOptions{Notifier: notifier, Recheck: 20 * time.Second})
+	stop := runMaintenanceWith(t, store, notifier)
+	defer stop()
+	auth := map[string]string{"Authorization": "Bearer " + consumerSecret}
+	update := `{"update_id":91,"message":{"message_id":1,"date":1700000000,"chat":{"id":-9}}}`
+	if w := send(public, "/webhook/telegram/wh_d", update, map[string]string{"X-Telegram-Bot-Api-Secret-Token": webhookSecret}); w.Code != http.StatusOK {
+		t.Fatalf("webhook = %d", w.Code)
+	}
+	// Four failed attempts dead-letter the message; the retries wake the
+	// waiting claims through background activation signals.
+	var messageID string
+	for attempt := 1; attempt <= 4; attempt++ {
+		w := send(public, "/v1/deliveries/claim", fmt.Sprintf(`{"operation_id":"0195c4d8-0000-7000-8000-0000000000f%d","wait_ms":5000}`, attempt), auth)
+		var b claimBody
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &b) != nil || b.Delivery.Attempt != int64(attempt) {
+			t.Fatalf("claim %d = %d %s", attempt, w.Code, w.Body)
+		}
+		var m struct {
+			MessageID string `json:"message_id"`
+		}
+		_ = json.Unmarshal(b.Message, &m)
+		messageID = m.MessageID
+		if w := send(public, "/v1/deliveries/nack", `{"delivery_token":"`+b.Delivery.DeliveryToken+`"}`, auth); w.Code != http.StatusOK {
+			t.Fatalf("nack %d = %d", attempt, w.Code)
+		}
+	}
+
+	a := sameDatabaseAdapter(t)
+	admin, err := administration.NewService(administration.ServiceDeps{
+		Repo: valkey.NewEndpointStore(a), DeadLetters: valkey.NewDeadLetterStore(a), Gen: gen.Crypto{}, Ready: notifier,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- send(public, "/v1/deliveries/claim", `{"operation_id":"0195c4d8-0000-7000-8000-0000000000fa","wait_ms":15000}`, auth)
+	}()
+	time.Sleep(300 * time.Millisecond) // the claim is parked on an empty index
+	start := time.Now()
+	view, err := admin.ReplayDeadLetter(context.Background(), messageID, administration.ReplayRequest{}, "req-replay")
+	if err != nil || view.QueuePosition != "head" {
+		t.Fatalf("replay = %+v, %v", view, err)
+	}
+	select {
+	case w := <-result:
+		var b claimBody
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &b) != nil || b.Delivery.DeliveryCycle != 2 {
+			t.Fatalf("woken claim = %d %s", w.Code, w.Body)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("claim woke %v after the replay", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the replay did not wake the waiting claim")
+	}
+}
+
+// sameDatabaseAdapter opens a second adapter on the composed stack's
+// database 6.
+func sameDatabaseAdapter(t *testing.T) *valkey.Adapter {
+	t.Helper()
+	opt, err := valkey.ParseURL(strings.TrimSuffix(strings.TrimSuffix(os.Getenv("HOOKRELAY_TEST_VALKEY_URL"), "/0"), "/") + "/6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := valkey.NewAdapter(opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	if _, err := a.ValidateReadiness(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	return a
 }

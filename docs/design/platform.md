@@ -191,7 +191,7 @@ hookrelay_dead_letters_total{recipient_scope,reason}
 hookrelay_dead_letter_replays_total{outcome}
 ```
 
-Delivery attempt outcomes are bounded to acknowledgement, negative acknowledgement, expiry, and dead-letter. Active leases are derived from the unexpired range of `hr1:leases`; waiting claims are counted in process memory. Ready signals are bounded by `source` (`accept`, `ack`, `dead_letter`, `retry_activation`, `replay`, `block_clear`) and `result` (`delivered` woke a waiting claim, `no_waiter` was dropped); claim wake-ups by `trigger` (`notification`, `periodic`) and `outcome` (`claimed`, `empty`); waiting-claim duration by `outcome` (`claimed`, `empty`, `cancelled`, `unavailable`).
+Delivery attempt outcomes are bounded to acknowledgement, negative acknowledgement, expiry, and dead-letter. Active leases are derived from the unexpired range of `hr1:leases`; waiting claims are counted in process memory. Ready signals are bounded by `source` (`accept`, `ack`, `dead_letter`, `retry_activation`, `replay`, `block_clear`, `handoff` for a wake passed on by a claim that left without using it, and `unknown` for anything else) and `result` (`delivered` woke a waiting claim, `no_waiter` was dropped); claim wake-ups by `trigger` (`notification`, `periodic`) and `outcome` (`claimed`, `empty`); waiting-claim duration by `outcome` (`claimed`, `empty`, `cancelled`, `unavailable`, `refused`).
 
 `hookrelay_queue_messages` is backed by a derived global counter stored as `hr1:stats:queued_messages`. Atomic Lua transitions update it with queue changes. It is not authoritative state. Startup reconciliation compares it with bounded scans and repairs safe differences; whether a periodic consistency checker repeats that work after startup remains open.
 

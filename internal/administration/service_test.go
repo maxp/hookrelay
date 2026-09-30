@@ -75,19 +75,19 @@ func (f *fakeRepo) GetEndpoint(_ context.Context, webhookType, identifier string
 
 // SetEndpointEnabled mirrors endpoint_set_enabled_v1 over the fake store;
 // setEnabledResult forces an outcome.
-func (f *fakeRepo) SetEndpointEnabled(_ context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult) {
-	f.mutations = append(f.mutations, mutationCall{webhookType + ":" + identifier, expected, eventID, requestID})
+func (f *fakeRepo) SetEndpointEnabled(_ context.Context, ref EndpointRef, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult) {
+	f.mutations = append(f.mutations, mutationCall{ref.String(), expected, eventID, requestID})
 	if f.setEnabledResult != "" {
 		return nil, f.setEnabledResult
 	}
-	e, ok := f.endpoints[key(webhookType, identifier)]
+	e, ok := f.endpoints[ref.String()]
 	switch {
 	case !ok:
 		return nil, SetEnabledNotFound
 	case expected == nil:
 		return nil, SetEnabledPreconditionRequired
 	case expected.GenerationID != e.GenerationID || expected.ConfigVersion != e.ConfigVersion:
-		return &Endpoint{GenerationID: e.GenerationID, ConfigVersion: e.ConfigVersion}, SetEnabledPreconditionFailed
+		return nil, SetEnabledPreconditionFailed
 	case e.Enabled == enabled:
 		safe := *e
 		safe.CredentialValue = ""
@@ -101,12 +101,12 @@ func (f *fakeRepo) SetEndpointEnabled(_ context.Context, webhookType, identifier
 
 // DeleteEndpoint mirrors endpoint_delete_v1 over the fake store;
 // deleteResult forces an outcome.
-func (f *fakeRepo) DeleteEndpoint(_ context.Context, webhookType, identifier, botPlatform string, expected *EntityVersion, eventID, requestID string) (*Endpoint, DeleteResult) {
-	f.mutations = append(f.mutations, mutationCall{webhookType + ":" + identifier, expected, eventID, requestID})
+func (f *fakeRepo) DeleteEndpoint(_ context.Context, ref EndpointRef, _ string, expected *EntityVersion, eventID, requestID string) (*DeletedEndpoint, DeleteResult) {
+	f.mutations = append(f.mutations, mutationCall{ref.String(), expected, eventID, requestID})
 	if f.deleteResult != "" {
 		return nil, f.deleteResult
 	}
-	e, ok := f.endpoints[key(webhookType, identifier)]
+	e, ok := f.endpoints[ref.String()]
 	switch {
 	case !ok:
 		return nil, DeleteAbsent
@@ -117,9 +117,8 @@ func (f *fakeRepo) DeleteEndpoint(_ context.Context, webhookType, identifier, bo
 	case e.Enabled:
 		return nil, DeleteMustBeDisabled
 	}
-	delete(f.endpoints, key(webhookType, identifier))
-	return &Endpoint{Type: webhookType, Identifier: identifier, BotPlatform: botPlatform, BotID: e.BotID, CredentialKind: e.CredentialKind,
-		GenerationID: e.GenerationID, ConfigVersion: e.ConfigVersion, UpdatedMs: 1}, DeleteDeleted
+	delete(f.endpoints, ref.String())
+	return &DeletedEndpoint{BotID: e.BotID, CredentialKind: e.CredentialKind, GenerationID: e.GenerationID, ConfigVersion: e.ConfigVersion, DeletedMs: 1}, DeleteDeleted
 }
 
 func (f *fakeRepo) ListBotEndpoints(_ context.Context, botPlatform, botID string) ([]EndpointListing, error) {

@@ -300,7 +300,7 @@ func (h *Handler) accept(w http.ResponseWriter, ctx context.Context, req *reques
 	switch result.Outcome {
 	case AcceptAccepted:
 		if h.d.Ready != nil {
-			h.d.Ready.Signal("accept")
+			h.d.Ready.Signal(readySourceAccept)
 		}
 		h.metrics.accepted.WithLabelValues(string(req.def.Platform), string(msg.Recipient.Scope)).Inc()
 		if conv.RoutingIssue != "" {

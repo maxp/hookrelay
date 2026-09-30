@@ -17,12 +17,16 @@ const (
 	SignalRetryActivation = "retry_activation"
 	SignalReplay          = "replay"
 	SignalBlockClear      = "block_clear"
+	// signalHandoff counts a wake passed on by a claim that left without
+	// consuming it; signalUnknown replaces any unlisted source so the
+	// label stays bounded.
+	signalHandoff = "handoff"
+	signalUnknown = "unknown"
 )
 
-// ReadySignaler receives hints that claimable work may exist. Signals are
-// hints only: the ready index stays the source of truth.
-type ReadySignaler interface {
-	Signal(source string)
+var knownSignals = map[string]bool{
+	SignalAccept: true, SignalAck: true, SignalDeadLetter: true,
+	SignalRetryActivation: true, SignalReplay: true, SignalBlockClear: true,
 }
 
 // ReadyNotifier wakes waiting claims early (ADR 0008). Each signal wakes
@@ -52,7 +56,7 @@ func NewReadyNotifier(enabled bool, reg prometheus.Registerer) (*ReadyNotifier, 
 		waiters: list.New(),
 		signals: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hookrelay_ready_signals_total",
-			Help: "Ready-work hints by source and result (delivered woke a waiting claim, no_waiter was dropped).",
+			Help: "Ready-work hints by source and result (delivered woke a waiting claim, no_waiter was dropped); source handoff is a wake passed on by a claim that left without using it.",
 		}, []string{"source", "result"}),
 	}
 	if reg == nil {
@@ -69,14 +73,21 @@ func (n *ReadyNotifier) Signal(source string) {
 	if n == nil || !n.enabled {
 		return
 	}
+	if !knownSignals[source] {
+		source = signalUnknown
+	}
 	n.mu.Lock()
 	woke := n.wakeOldestLocked()
 	n.mu.Unlock()
+	n.count(source, woke)
+}
+
+func (n *ReadyNotifier) count(source string, woke bool) {
+	result := "no_waiter"
 	if woke {
-		n.signals.WithLabelValues(source, "delivered").Inc()
-	} else {
-		n.signals.WithLabelValues(source, "no_waiter").Inc()
+		result = "delivered"
 	}
+	n.signals.WithLabelValues(source, result).Inc()
 }
 
 func (n *ReadyNotifier) wakeOldestLocked() bool {
@@ -109,16 +120,21 @@ func (n *ReadyNotifier) deregister(w *readyWaiter) {
 		return
 	}
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if w.elem != nil {
 		n.waiters.Remove(w.elem)
 		w.elem = nil
+		n.mu.Unlock()
 		return
 	}
+	handedOn, woke := false, false
 	select {
 	case <-w.c:
-		n.wakeOldestLocked()
+		handedOn, woke = true, n.wakeOldestLocked()
 	default:
+	}
+	n.mu.Unlock()
+	if handedOn {
+		n.count(signalHandoff, woke)
 	}
 }
 

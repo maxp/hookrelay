@@ -170,6 +170,19 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 		}
 		return n, nil
 	}
+	// getBool accepts true/1 and false/0; empty keeps the default.
+	getBool := func(env string, def bool) (bool, error) {
+		switch raw := get(env); raw {
+		case "":
+			return def, nil
+		case "true", "1":
+			return true, nil
+		case "false", "0":
+			return false, nil
+		default:
+			return false, fmt.Errorf("%s: must be a boolean, got %q", env, raw)
+		}
+	}
 	getFloat := func(env string, def float64) (float64, error) {
 		raw := get(env)
 		if raw == "" {
@@ -243,29 +256,12 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	}
 	c.AdminOrigin = origin
 
-	cookieSecureRaw := get("HOOKRELAY_ADMIN_COOKIE_SECURE")
-	switch cookieSecureRaw {
-	case "":
-		if c.Production() {
-			c.AdminCookieSecure = true
-		} else {
-			c.AdminCookieSecure = false
-		}
-	case "true", "1":
-		c.AdminCookieSecure = true
-	case "false", "0":
-		c.AdminCookieSecure = false
-	default:
-		return nil, fmt.Errorf("HOOKRELAY_ADMIN_COOKIE_SECURE: must be a boolean, got %q", cookieSecureRaw)
+	// The session cookie is Secure by default only in production.
+	if c.AdminCookieSecure, err = getBool("HOOKRELAY_ADMIN_COOKIE_SECURE", c.Production()); err != nil {
+		return nil, err
 	}
-
-	switch raw := get("HOOKRELAY_PPROF_ENABLED"); raw {
-	case "", "false", "0":
-		c.PprofEnabled = false
-	case "true", "1":
-		c.PprofEnabled = true
-	default:
-		return nil, fmt.Errorf("HOOKRELAY_PPROF_ENABLED: must be a boolean, got %q", raw)
+	if c.PprofEnabled, err = getBool("HOOKRELAY_PPROF_ENABLED", false); err != nil {
+		return nil, err
 	}
 
 	parseCIDRs := func(env string) ([]*net.IPNet, error) {
@@ -366,13 +362,8 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	if c.MaxWaitingClaims, err = getInt("HOOKRELAY_MAX_WAITING_CLAIMS", 20); err != nil {
 		return nil, err
 	}
-	switch raw := get("HOOKRELAY_CLAIM_NOTIFICATIONS"); raw {
-	case "", "true", "1":
-		c.ClaimNotifications = true
-	case "false", "0":
-		c.ClaimNotifications = false
-	default:
-		return nil, fmt.Errorf("HOOKRELAY_CLAIM_NOTIFICATIONS: must be a boolean, got %q", raw)
+	if c.ClaimNotifications, err = getBool("HOOKRELAY_CLAIM_NOTIFICATIONS", true); err != nil {
+		return nil, err
 	}
 	if c.MaintenanceInterval, err = getDuration("HOOKRELAY_MAINTENANCE_INTERVAL", time.Second); err != nil {
 		return nil, err

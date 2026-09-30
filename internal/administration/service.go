@@ -21,16 +21,37 @@ type EndpointRepository interface {
 	GetEndpoint(ctx context.Context, webhookType, identifier string) (*Endpoint, error)
 	// SetEndpointEnabled runs the audited enable/disable transition under
 	// the expected entity version (nil when no If-Match was sent).
-	SetEndpointEnabled(ctx context.Context, webhookType, identifier string, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult)
+	// The Endpoint (safe fields only) is returned for updated and unchanged.
+	SetEndpointEnabled(ctx context.Context, ref EndpointRef, enabled bool, expected *EntityVersion, eventID, requestID string) (*Endpoint, SetEnabledResult)
 	// DeleteEndpoint runs the audited delete of a disabled endpoint under
 	// the expected entity version (nil when no If-Match was sent).
-	DeleteEndpoint(ctx context.Context, webhookType, identifier, botPlatform string, expected *EntityVersion, eventID, requestID string) (*Endpoint, DeleteResult)
+	// The DeletedEndpoint is returned for deleted.
+	DeleteEndpoint(ctx context.Context, ref EndpointRef, botPlatform string, expected *EntityVersion, eventID, requestID string) (*DeletedEndpoint, DeleteResult)
 	// ListBotEndpoints reads every endpoint of one Bot Identity (at most
 	// 100), newest first (descending created_ms, then member).
 	ListBotEndpoints(ctx context.Context, botPlatform, botID string) ([]EndpointListing, error)
 	// ListEndpoints pages the global listing newest first (descending
 	// created_ms, then descending member), strictly after the cursor.
 	ListEndpoints(ctx context.Context, limit int, after *EndpointCursor) ([]EndpointListing, error)
+}
+
+// EndpointRef names one Webhook Endpoint.
+type EndpointRef struct {
+	Type       string
+	Identifier string
+}
+
+// String is "<webhook_type>:<webhook_identifier>": the listing member and
+// the audit target.
+func (r EndpointRef) String() string { return r.Type + ":" + r.Identifier }
+
+// DeletedEndpoint is the safe identity of a deleted endpoint.
+type DeletedEndpoint struct {
+	BotID          string
+	CredentialKind string
+	GenerationID   string
+	ConfigVersion  int64
+	DeletedMs      int64
 }
 
 // EntityVersion is a parsed strong entity tag.
@@ -92,6 +113,8 @@ const (
 	OrphanMissing   = "missing"
 	OrphanWrongType = "wrong_type"
 	OrphanMalformed = "malformed"
+	// OrphanUnknownType: the record's Webhook Type is no longer registered.
+	OrphanUnknownType = "unknown_webhook_type"
 )
 
 // Endpoint mirrors the stored record without importing the adapter package.
@@ -169,10 +192,17 @@ type ServiceDeps struct {
 }
 
 // ReadySignal receives a hint that claimable work may exist; the delivery
-// notifier implements it.
+// notifier implements it and maps any source it does not list to
+// "unknown".
 type ReadySignal interface {
 	Signal(source string)
 }
+
+// Ready-signal sources of this module.
+const (
+	readySourceReplay     = "replay"
+	readySourceBlockClear = "block_clear"
+)
 
 // signalReady forwards a ready hint when a signal is wired.
 func (s *Service) signalReady(source string) {

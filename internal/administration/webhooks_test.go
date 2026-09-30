@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -350,5 +351,47 @@ func TestBotWebhooksContract(t *testing.T) {
 	}
 	if len(repo.botCalls) != 2 {
 		t.Errorf("invalid requests reached storage: %v", repo.botCalls)
+	}
+}
+
+// TestMalformedIfMatchOnMissingEndpoint pins the precedence the contract
+// promises: a missing endpoint answers 404 (PATCH) or 204 (DELETE) with
+// or without If-Match, even a malformed one; an existing endpoint gets 400.
+func TestMalformedIfMatchOnMissingEndpoint(t *testing.T) {
+	repo := newFakeRepo()
+	repo.endpoints["telegram:wh_a"] = storedEndpoint("wh_a", 100, false)
+	h, _ := webhookService(t, repo)
+	if rec := doPatch(t, h, "/admin/v1/webhooks/telegram/wh_x", "W/\"x:1\"", `{"enabled":true}`); rec.Code != http.StatusNotFound {
+		t.Errorf("patch missing = %d %s", rec.Code, rec.Body)
+	}
+	if rec := doDelete(t, h, "/admin/v1/webhooks/telegram/wh_x", "*"); rec.Code != http.StatusNoContent {
+		t.Errorf("delete missing = %d %s", rec.Code, rec.Body)
+	}
+	if rec := doPatch(t, h, "/admin/v1/webhooks/telegram/wh_a", "*", `{"enabled":true}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("patch existing = %d", rec.Code)
+	}
+	if rec := doDelete(t, h, "/admin/v1/webhooks/telegram/wh_a", "*"); rec.Code != http.StatusBadRequest {
+		t.Errorf("delete existing = %d", rec.Code)
+	}
+	if len(repo.mutations) != 0 {
+		t.Errorf("a malformed precondition reached a transition: %+v", repo.mutations)
+	}
+}
+
+// TestBotWebhooksCap pins the contract bound: an index holding more than
+// 100 members is truncated with a warning.
+func TestBotWebhooksCap(t *testing.T) {
+	repo := newFakeRepo()
+	for i := range 101 {
+		repo.botListings = append(repo.botListings, listing(fmt.Sprintf("wh_%03d", i), int64(1000-i)))
+	}
+	h, logs := webhookService(t, repo)
+	rec := doJSON(t, h, http.MethodGet, "/admin/v1/bots/telegram/42/webhooks", adminSecret, "")
+	var page listPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || len(page.Items) != 100 {
+		t.Fatalf("items = %d (%v)", len(page.Items), err)
+	}
+	if !strings.Contains(logs.String(), `"event":"webhook_bot_endpoint_limit_exceeded"`) {
+		t.Errorf("logs = %s", logs)
 	}
 }

@@ -111,13 +111,13 @@ func (s *Service) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r.Context())
-	webhookType, identifier, ok := endpointPath(r)
+	ref, ok := endpointPath(r)
 	if !ok {
 		writeAPIError(w, NotFoundError{}, requestID)
 		return
 	}
 
-	view, err := s.GetWebhook(r.Context(), webhookType, identifier)
+	view, err := s.GetWebhook(r.Context(), ref.Type, ref.Identifier)
 	if err != nil {
 		writeAPIError(w, err, requestID)
 		return

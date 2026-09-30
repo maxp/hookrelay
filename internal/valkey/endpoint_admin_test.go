@@ -87,6 +87,10 @@ func adminSetup(t *testing.T) (*Adapter, administration.EndpointRepository) {
 	return a, NewEndpointStore(a)
 }
 
+func ref(id string) administration.EndpointRef {
+	return administration.EndpointRef{Type: "telegram", Identifier: id}
+}
+
 func fixtureVersion(v int64) *administration.EntityVersion {
 	return &administration.EntityVersion{GenerationID: endpointFixture().GenerationID, ConfigVersion: v}
 }
@@ -110,7 +114,7 @@ func TestSetEndpointEnabledTuples(t *testing.T) {
 	ctx := context.Background()
 	before, _ := a.GetEndpoint(ctx, "telegram", "wh_test1")
 
-	e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(1), "event-1", "req-1")
+	e, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), false, fixtureVersion(1), "event-1", "req-1")
 	if r != administration.SetEnabledUpdated || e.Enabled || e.ConfigVersion != 2 || e.BotID != "123456789" ||
 		e.CredentialKind != "secret_token" || e.CredentialValue != "" || e.CreatedMs != before.CreatedMs || e.UpdatedMs < before.UpdatedMs {
 		t.Fatalf("disable = %s %+v", r, e)
@@ -131,27 +135,26 @@ func TestSetEndpointEnabledTuples(t *testing.T) {
 	}
 
 	snap := snapshot(t, a)
-	if e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(2), "event-2", "req-2"); r != administration.SetEnabledUnchanged || e.ConfigVersion != 2 || e.Enabled {
+	if e, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), false, fixtureVersion(2), "event-2", "req-2"); r != administration.SetEnabledUnchanged || e.ConfigVersion != 2 || e.Enabled {
 		t.Errorf("same value = %s %+v", r, e)
 	}
 	assertUnchanged(t, a, snap, "unchanged")
-	if e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, fixtureVersion(1), "event-3", "req-3"); r != administration.SetEnabledPreconditionFailed ||
-		e.GenerationID != endpointFixture().GenerationID || e.ConfigVersion != 2 {
+	if e, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), true, fixtureVersion(1), "event-3", "req-3"); r != administration.SetEnabledPreconditionFailed || e != nil {
 		t.Errorf("stale = %s %+v", r, e)
 	}
 	other := &administration.EntityVersion{GenerationID: "0195c4d8-0000-7000-8000-000000000099", ConfigVersion: 2}
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, other, "event-4", "req-4"); r != administration.SetEnabledPreconditionFailed {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), true, other, "event-4", "req-4"); r != administration.SetEnabledPreconditionFailed {
 		t.Errorf("other generation = %s", r)
 	}
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, nil, "event-5", "req-5"); r != administration.SetEnabledPreconditionRequired {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), true, nil, "event-5", "req-5"); r != administration.SetEnabledPreconditionRequired {
 		t.Errorf("no precondition = %s", r)
 	}
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_none", true, nil, "event-6", "req-6"); r != administration.SetEnabledNotFound {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_none"), true, nil, "event-6", "req-6"); r != administration.SetEnabledNotFound {
 		t.Errorf("missing = %s", r)
 	}
 	assertUnchanged(t, a, snap, "refusals")
 
-	if e, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", true, fixtureVersion(2), "event-7", "req-7"); r != administration.SetEnabledUpdated || !e.Enabled || e.ConfigVersion != 3 {
+	if e, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), true, fixtureVersion(2), "event-7", "req-7"); r != administration.SetEnabledUpdated || !e.Enabled || e.ConfigVersion != 3 {
 		t.Errorf("enable = %s %+v", r, e)
 	}
 	if audit := lastAudit(t, a); audit["operation"] != "webhook_endpoint_enabled" {
@@ -163,14 +166,14 @@ func TestSetEndpointEnabledTuples(t *testing.T) {
 	a.testDo(t, "SET", "hr1:wh:telegram:wh_str", "x")
 	snap = snapshot(t, a)
 	for _, id := range []string{"wh_bad", "wh_str"} {
-		if _, r := store.SetEndpointEnabled(ctx, "telegram", id, false, fixtureVersion(1), "event-8", "req-8"); r != administration.SetEnabledWrongType {
+		if _, r := store.SetEndpointEnabled(ctx, ref(id), false, fixtureVersion(1), "event-8", "req-8"); r != administration.SetEnabledWrongType {
 			t.Errorf("%s = %s", id, r)
 		}
 	}
 	a.testDo(t, "DEL", "hr1:audit")
 	a.testDo(t, "SET", "hr1:audit", "x")
 	snap = snapshot(t, a)
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(3), "event-9", "req-9"); r != administration.SetEnabledWrongType {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), false, fixtureVersion(3), "event-9", "req-9"); r != administration.SetEnabledWrongType {
 		t.Errorf("audit wrong type = %s", r)
 	}
 	assertUnchanged(t, a, snap, "wrong types")
@@ -195,7 +198,7 @@ func TestSetEndpointEnabledArgumentsAndReload(t *testing.T) {
 		}
 	}
 	a.testDo(t, "SCRIPT", "FLUSH")
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(1), "e", "r"); r != administration.SetEnabledUpdated {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), false, fixtureVersion(1), "e", "r"); r != administration.SetEnabledUpdated {
 		t.Errorf("after SCRIPT FLUSH = %s", r)
 	}
 }
@@ -215,23 +218,23 @@ func TestDeleteEndpointTuples(t *testing.T) {
 	const botKey = "hr1:bot:telegram:123456789:webhooks"
 
 	snap := snapshot(t, a)
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(1), "e", "r"); r != administration.DeleteMustBeDisabled {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", fixtureVersion(1), "e", "r"); r != administration.DeleteMustBeDisabled {
 		t.Errorf("enabled = %s", r)
 	}
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", nil, "e", "r"); r != administration.DeletePreconditionRequired {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", nil, "e", "r"); r != administration.DeletePreconditionRequired {
 		t.Errorf("no precondition = %s", r)
 	}
-	if e, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(7), "e", "r"); r != administration.DeletePreconditionFailed || e.ConfigVersion != 1 {
+	if e, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", fixtureVersion(7), "e", "r"); r != administration.DeletePreconditionFailed || e != nil {
 		t.Errorf("stale = %s %+v", r, e)
 	}
 	assertUnchanged(t, a, snap, "refusals")
 
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test1", false, fixtureVersion(1), "e-off", "r"); r != administration.SetEnabledUpdated {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_test1"), false, fixtureVersion(1), "e-off", "r"); r != administration.SetEnabledUpdated {
 		t.Fatal(r)
 	}
-	e, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(2), "event-del", "req-del")
+	e, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", fixtureVersion(2), "event-del", "req-del")
 	if r != administration.DeleteDeleted || e.BotID != "123456789" || e.CredentialKind != "secret_token" || e.ConfigVersion != 2 ||
-		e.GenerationID != endpointFixture().GenerationID || e.UpdatedMs <= 0 {
+		e.GenerationID != endpointFixture().GenerationID || e.DeletedMs <= 0 {
 		t.Fatalf("delete = %s %+v", r, e)
 	}
 	if got, _ := a.GetEndpoint(ctx, "telegram", "wh_test1"); got != nil {
@@ -246,24 +249,24 @@ func TestDeleteEndpointTuples(t *testing.T) {
 	}
 	audit := lastAudit(t, a)
 	if audit["operation"] != "webhook_endpoint_deleted" || audit["event_id"] != "event-del" || audit["target"] != "telegram:wh_test1" ||
-		audit["timestamp_ms"] != strconv.FormatInt(e.UpdatedMs, 10) {
+		audit["timestamp_ms"] != strconv.FormatInt(e.DeletedMs, 10) {
 		t.Errorf("audit = %v", audit)
 	}
 
 	snap = snapshot(t, a)
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(2), "e", "r"); r != administration.DeleteAbsent {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", fixtureVersion(2), "e", "r"); r != administration.DeleteAbsent {
 		t.Errorf("repeat = %s", r)
 	}
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", nil, "e", "r"); r != administration.DeleteAbsent {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", nil, "e", "r"); r != administration.DeleteAbsent {
 		t.Errorf("absent without precondition = %s", r)
 	}
 	assertUnchanged(t, a, snap, "absent")
 
 	// Deleting the last endpoint of a bot removes its Set.
-	if _, r := store.SetEndpointEnabled(ctx, "telegram", "wh_test2", false, fixtureVersion(1), "e", "r"); r != administration.SetEnabledUpdated {
+	if _, r := store.SetEndpointEnabled(ctx, ref("wh_test2"), false, fixtureVersion(1), "e", "r"); r != administration.SetEnabledUpdated {
 		t.Fatal(r)
 	}
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test2", "telegram", fixtureVersion(2), "e", "r"); r != administration.DeleteDeleted {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test2"), "telegram", fixtureVersion(2), "e", "r"); r != administration.DeleteDeleted {
 		t.Fatal(r)
 	}
 	if n, _ := a.client.Do(ctx, a.client.B().Exists().Key(botKey).Build()).AsInt64(); n != 0 {
@@ -277,7 +280,7 @@ func TestDeleteEndpointTuples(t *testing.T) {
 	if _, _, r := a.CreateEndpoint(ctx, recreated, "e", "webhook_endpoint_created", "r"); r != CreateOK {
 		t.Fatal(r)
 	}
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(1), "e", "r"); r != administration.DeletePreconditionFailed {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", fixtureVersion(1), "e", "r"); r != administration.DeletePreconditionFailed {
 		t.Errorf("earlier generation = %s", r)
 	}
 
@@ -286,7 +289,7 @@ func TestDeleteEndpointTuples(t *testing.T) {
 	a.testDo(t, "SET", botKey, "x")
 	snap = snapshot(t, a)
 	v := &administration.EntityVersion{GenerationID: recreated.GenerationID, ConfigVersion: 1}
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", v, "e", "r"); r != administration.DeleteWrongType {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", v, "e", "r"); r != administration.DeleteWrongType {
 		t.Errorf("bot set wrong type = %s", r)
 	}
 	assertUnchanged(t, a, snap, "wrong type")
@@ -309,7 +312,7 @@ func TestDeleteEndpointArgumentsAndReload(t *testing.T) {
 		}
 	}
 	a.testDo(t, "SCRIPT", "FLUSH")
-	if _, r := store.DeleteEndpoint(ctx, "telegram", "wh_test1", "telegram", fixtureVersion(1), "e", "r"); r != administration.DeleteMustBeDisabled {
+	if _, r := store.DeleteEndpoint(ctx, ref("wh_test1"), "telegram", fixtureVersion(1), "e", "r"); r != administration.DeleteMustBeDisabled {
 		t.Errorf("after SCRIPT FLUSH = %s", r)
 	}
 }

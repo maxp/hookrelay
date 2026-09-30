@@ -2,12 +2,9 @@ package administration
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"regexp"
-	"strconv"
 
 	"github.com/maxp/hookrelay/internal/observability"
 )
@@ -44,22 +41,13 @@ func deadLetterView(d DeadLetter) (DeadLetterView, bool) {
 
 // ListDeadLetters pages the global DLQ newest first by safe metadata.
 func (s *Service) ListDeadLetters(ctx context.Context, limit, cursor string) (DeadLetterPage, error) {
-	n := defaultListLimit
-	if limit != "" {
-		v, err := strconv.Atoi(limit)
-		if err != nil || v < 1 || v > maxListLimit {
-			return DeadLetterPage{}, BadRequestError{msg: "limit must be between 1 and 200"}
-		}
-		n = v
+	n, err := parseListLimit(limit)
+	if err != nil {
+		return DeadLetterPage{}, err
 	}
-	var after *DeadLetterCursor
-	if cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(cursor)
-		var c DeadLetterCursor
-		if err != nil || json.Unmarshal(raw, &c) != nil || c.Member == "" {
-			return DeadLetterPage{}, BadRequestError{msg: "cursor is malformed", code: "invalid_cursor"}
-		}
-		after = &c
+	after, err := decodeCursor(cursor, func(c DeadLetterCursor) bool { return c.Member != "" })
+	if err != nil {
+		return DeadLetterPage{}, err
 	}
 	items, err := s.deadLetters.ListDeadLetters(ctx, n+1, after)
 	if err != nil {
@@ -69,8 +57,7 @@ func (s *Service) ListDeadLetters(ctx context.Context, limit, cursor string) (De
 	for i, it := range items {
 		if i == n {
 			last := items[n-1]
-			raw, _ := json.Marshal(DeadLetterCursor{Score: last.DeadLetteredMs, Member: last.MessageID})
-			page.NextCursor = base64.RawURLEncoding.EncodeToString(raw)
+			page.NextCursor = encodeCursor(DeadLetterCursor{Score: last.DeadLetteredMs, Member: last.MessageID})
 			break
 		}
 		if it.RecordMissing {
@@ -163,7 +150,7 @@ func (s *Service) ReplayDeadLetter(ctx context.Context, messageID string, req Re
 		}
 		observability.LogEvent(s.log, slog.LevelInfo, "delivery_replayed", "dead-letter message replayed", fields...)
 		if r.QueuePosition == "head" {
-			s.signalReady("replay")
+			s.signalReady(readySourceReplay)
 		}
 		return ReplayView{Status: "replayed", MessageID: messageID, DeliveryCycle: r.DeliveryCycle, QueuePosition: r.QueuePosition,
 			ReplayedMs: r.ReplayedMs, DeduplicationResolution: r.DeduplicationResolution}, nil

@@ -349,3 +349,94 @@ func TestMaintenanceSignals(t *testing.T) {
 		t.Errorf("dead-letter signals = %v, want 1", got)
 	}
 }
+
+// signallingInline is an inline pass whose transitions signal the notifier.
+type signallingInline struct {
+	n      *ReadyNotifier
+	source string
+}
+
+func (s signallingInline) InlinePass(context.Context) { s.n.Signal(s.source) }
+
+// TestInlinePassDoesNotWakeItsOwnClaim pins that a claim leaves the waiter
+// queue while it runs the inline pass: the pass's own signal finds no
+// waiter instead of waking the claim that produced it.
+func TestInlinePassDoesNotWakeItsOwnClaim(t *testing.T) {
+	n, _ := newTestNotifier(t, true)
+	ph := newPollHarness(t, HandlerDeps{Notifier: n, RecheckInterval: 10 * time.Millisecond,
+		InlineMaintenance: signallingInline{n: n, source: SignalRetryActivation}}, alwaysEmpty)
+	if code := ph.claim(context.Background(), "50").Code; code != http.StatusNoContent {
+		t.Fatalf("claim = %d", code)
+	}
+	if got := counterValue(t, n.signals, SignalRetryActivation, "no_waiter"); got != 1 {
+		t.Errorf("inline signal no_waiter = %v, want 1 (it must not wake its own claim)", got)
+	}
+	if got := counterValue(t, ph.h.metrics.wakeups, "notification", "empty"); got != 0 {
+		t.Errorf("notification wake-ups = %v, want 0", got)
+	}
+}
+
+// TestInlinePassWakesAnotherWaiter pins that the inline pass's signal wakes
+// an earlier waiting claim.
+func TestInlinePassWakesAnotherWaiter(t *testing.T) {
+	n, _ := newTestNotifier(t, true)
+	earlier := n.register()
+	defer n.deregister(earlier)
+	ph := newPollHarness(t, HandlerDeps{Notifier: n, RecheckInterval: 10 * time.Millisecond,
+		InlineMaintenance: signallingInline{n: n, source: SignalRetryActivation}}, alwaysEmpty)
+	ph.claim(context.Background(), "30")
+	if !woken(earlier) {
+		t.Fatal("the inline pass's signal did not reach the earlier waiter")
+	}
+}
+
+// TestWaitDurationCoversEveryOutcome pins that a waiting claim ending in a
+// refusal is timed as refused, and a replayed active claim as claimed.
+func TestWaitDurationCoversEveryOutcome(t *testing.T) {
+	for outcome, label := range map[ClaimOutcome]string{ClaimOperationConflict: "refused", ClaimReplayActive: "claimed", ClaimReplayEmpty: "empty"} {
+		ph := newPollHarness(t, HandlerDeps{}, func(int) ClaimResult {
+			if outcome == ClaimReplayActive {
+				return claimedResult(ClaimReplayActive)
+			}
+			return ClaimResult{Outcome: outcome}
+		})
+		ph.claim(context.Background(), "1000")
+		families, _ := ph.reg.Gather()
+		found := false
+		for _, f := range families {
+			if f.GetName() != "hookrelay_claim_wait_duration_seconds" {
+				continue
+			}
+			for _, m := range f.GetMetric() {
+				if m.GetLabel()[0].GetValue() == label && m.GetHistogram().GetSampleCount() == 1 {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s: no %s wait-duration sample", outcome, label)
+		}
+	}
+}
+
+// TestNotifierBoundsSourcesAndCountsHandoff pins the label bounds: an
+// unlisted source counts as unknown, and a handed-on wake as handoff.
+func TestNotifierBoundsSourcesAndCountsHandoff(t *testing.T) {
+	n, _ := newTestNotifier(t, true)
+	n.Signal("anything")
+	if got := counterValue(t, n.signals, "unknown", "no_waiter"); got != 1 {
+		t.Errorf("unknown source = %v", got)
+	}
+	a, b := n.register(), n.register()
+	n.Signal(SignalAck)
+	n.deregister(a)
+	if got := counterValue(t, n.signals, "handoff", "delivered"); got != 1 || !woken(b) {
+		t.Errorf("handoff delivered = %v", got)
+	}
+	c := n.register()
+	n.Signal(SignalAck)
+	n.deregister(c) // nobody left to hand on to
+	if got := counterValue(t, n.signals, "handoff", "no_waiter"); got != 1 {
+		t.Errorf("handoff no_waiter = %v", got)
+	}
+}

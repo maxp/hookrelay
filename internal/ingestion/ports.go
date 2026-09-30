@@ -76,10 +76,14 @@ type DedupEvictor interface {
 }
 
 // ReadySignal receives a hint that an accepted message may have made a
-// Recipient claimable; the delivery notifier implements it.
+// Recipient claimable; the delivery notifier implements it and maps any
+// source it does not list to "unknown".
 type ReadySignal interface {
 	Signal(source string)
 }
+
+// readySourceAccept is this module's ready-signal source.
+const readySourceAccept = "accept"
 
 // MessageAcceptor atomically accepts a message or proves it duplicate. It
 // hides deduplication, queues, indexes, counters, and scripts.

@@ -2,20 +2,11 @@ package administration
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	"github.com/maxp/hookrelay/internal/model"
 	"github.com/maxp/hookrelay/internal/observability"
-)
-
-// Recipient-state list bounds.
-const (
-	defaultListLimit = 50
-	maxListLimit     = 200
 )
 
 // RecipientInput is the structured Recipient of the block routes and the
@@ -75,22 +66,13 @@ func (s *Service) ListRecipientStates(ctx context.Context, status, limit, cursor
 	default:
 		return RecipientStatePage{}, BadRequestError{msg: "status must be ready, leased, retry_wait, or blocked"}
 	}
-	n := defaultListLimit
-	if limit != "" {
-		v, err := strconv.Atoi(limit)
-		if err != nil || v < 1 || v > maxListLimit {
-			return RecipientStatePage{}, BadRequestError{msg: "limit must be between 1 and 200"}
-		}
-		n = v
+	n, err := parseListLimit(limit)
+	if err != nil {
+		return RecipientStatePage{}, err
 	}
-	var after *RecipientCursor
-	if cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(cursor)
-		var c RecipientCursor
-		if err != nil || json.Unmarshal(raw, &c) != nil || c.Member == "" {
-			return RecipientStatePage{}, BadRequestError{msg: "cursor is malformed", code: "invalid_cursor"}
-		}
-		after = &c
+	after, err := decodeCursor(cursor, func(c RecipientCursor) bool { return c.Member != "" })
+	if err != nil {
+		return RecipientStatePage{}, err
 	}
 	items, err := s.recipients.ListRecipientStates(ctx, st, n+1, after)
 	if err != nil {
@@ -100,8 +82,7 @@ func (s *Service) ListRecipientStates(ctx context.Context, status, limit, cursor
 	for i, it := range items {
 		if i == n {
 			last := items[n-1]
-			raw, _ := json.Marshal(RecipientCursor{Score: last.Score, Member: last.RecipientIdentity})
-			page.NextCursor = base64.RawURLEncoding.EncodeToString(raw)
+			page.NextCursor = encodeCursor(RecipientCursor{Score: last.Score, Member: last.RecipientIdentity})
 			break
 		}
 		rcpt, ok := recipientOf(it.RecipientIdentity)
@@ -183,7 +164,7 @@ func (s *Service) ClearBlock(ctx context.Context, req ClearBlockRequest, request
 		}
 		observability.LogEvent(s.log, slog.LevelInfo, opRecipientBlockCleared, "recipient block cleared", fields...)
 		if detail == "ready" {
-			s.signalReady("block_clear")
+			s.signalReady(readySourceBlockClear)
 		}
 		return nil
 	case ClearNotFound:

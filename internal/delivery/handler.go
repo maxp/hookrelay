@@ -273,30 +273,25 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 			h.observeWait(wait, c, "cancelled")
 			return
 		}
-		switch {
-		case trigger == "":
-		case res.Outcome == ClaimClaimed:
-			h.metrics.wakeups.WithLabelValues(trigger, "claimed").Inc()
-		case res.Outcome == ClaimEmpty:
-			h.metrics.wakeups.WithLabelValues(trigger, "empty").Inc()
+		outcome := waitOutcome(res.Outcome)
+		if trigger != "" && (outcome == "claimed" || outcome == "empty") {
+			h.metrics.wakeups.WithLabelValues(trigger, outcome).Inc()
 		}
 		trigger = ""
 		if res.Outcome != ClaimEmpty || final {
-			switch res.Outcome {
-			case ClaimClaimed:
-				h.observeWait(wait, c, "claimed")
-			case ClaimEmpty:
-				h.observeWait(wait, c, "empty")
-			case ClaimDependencyUnavailable:
-				h.observeWait(wait, c, "unavailable")
-			}
+			h.observeWait(wait, c, outcome)
 			h.respondClaim(w, c, req.OperationID, res)
 			return
 		}
 		if !inlineDone && h.d.InlineMaintenance != nil {
 			// Bounded self-healing before waiting: due expiries and retry
-			// activations may make work ready; recheck once at once.
+			// activations may make work ready; recheck once at once. The
+			// claim leaves the waiter queue meanwhile, so the pass's own
+			// signals wake other waiting claims instead of this one; it
+			// registers again before its recheck.
 			inlineDone = true
+			h.d.Notifier.deregister(waiter)
+			waiter = nil
 			h.d.InlineMaintenance.InlinePass(ctx)
 			if r.Context().Err() != nil {
 				h.metrics.claims.WithLabelValues("cancelled").Inc()
@@ -339,6 +334,22 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request, c call) {
 			h.observeWait(wait, c, "cancelled")
 			return
 		}
+	}
+}
+
+// waitOutcome maps a final claim outcome to its bounded wait label:
+// claimed, empty, unavailable, or refused (conflict, limit, completed
+// replay, internal failure).
+func waitOutcome(o ClaimOutcome) string {
+	switch o {
+	case ClaimClaimed, ClaimReplayActive:
+		return "claimed"
+	case ClaimEmpty, ClaimReplayEmpty:
+		return "empty"
+	case ClaimDependencyUnavailable:
+		return "unavailable"
+	default:
+		return "refused"
 	}
 }
 

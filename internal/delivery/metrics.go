@@ -74,7 +74,7 @@ func newMetrics(reg prometheus.Registerer, waiting func() float64) (*metrics, er
 		}, []string{"trigger", "outcome"}),
 		waitDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "hookrelay_claim_wait_duration_seconds",
-			Help:    "Waiting-claim duration (wait_ms > 0) by outcome (claimed, empty, cancelled, unavailable).",
+			Help:    "Waiting-claim duration (wait_ms > 0) by outcome (claimed, empty, cancelled, unavailable, refused).",
 			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30},
 		}, []string{"outcome"}),
 		retriesWaiting: prometheus.NewGauge(prometheus.GaugeOpts{
