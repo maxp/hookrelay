@@ -188,6 +188,16 @@ func init() {
 		"snapshot":   13,
 		"wrong_type": 0,
 	})
+	register("admin_auth_v1", 1, map[string]int{
+		"initialized":       0,
+		"exists":            0,
+		"current":           0,
+		"rotated":           1, // revoked_count
+		"changed":           0,
+		"absent":            0,
+		"too_many_sessions": 0,
+		"wrong_type":        0,
+	})
 	register("evict_dedup_v1", 1, map[string]int{
 		// count, oldest_accepted_ms, live_records, stop
 		"evicted":    4,

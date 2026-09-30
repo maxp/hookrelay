@@ -2,6 +2,7 @@ package valkey
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -26,6 +27,9 @@ type ReconcileOptions struct {
 	Gen gen.Gen
 	// Logger receives best-effort stdout copies of reconciliation audit events.
 	Logger *slog.Logger
+	// AdminSecret, when set, runs the Admin Secret generation check (and
+	// rotation) before anything else.
+	AdminSecret string
 }
 
 // ReconcileReport summarizes one pass with bounded finding kinds.
@@ -35,7 +39,8 @@ type ReconcileReport struct {
 	// already_blocked, due_lease, due_retry, unhandled,
 	// dedup_expired_removed, dedup_restored, dedup_orphans_removed,
 	// dedup_skipped, dlq_orphans_removed, dlq_restored, dlq_invalid,
-	// dlq_message_missing, counter_repaired, counter_unverified, and (from
+	// dlq_message_missing, counter_repaired, counter_unverified,
+	// admin_auth_initialized, admin_auth_rotated, and (from
 	// ReconcileAndProcessDue) due_leases_processed, due_retries_processed.
 	Findings map[string]int
 	// BlockReasons counts newly created markers by bounded reason.
@@ -83,6 +88,30 @@ func (a *Adapter) Reconcile(ctx context.Context, opts ReconcileOptions) (Reconci
 		opts.Gen = gen.Crypto{}
 	}
 	rep := ReconcileReport{Findings: map[string]int{}, BlockReasons: map[string]int{}}
+	// The Admin Secret generation comes first: browser sessions of a
+	// replaced secret must be revoked before readiness.
+	if opts.AdminSecret != "" {
+		out, err := a.EnsureAdminAuth(ctx, opts.AdminSecret, opts.Gen)
+		if err != nil {
+			if opts.Logger != nil {
+				reason := "dependency_unavailable"
+				if errors.Is(err, errAdminAuthInconsistent) {
+					reason = strings.TrimPrefix(err.Error(), errAdminAuthInconsistent.Error()+": ")
+				}
+				observability.LogEvent(opts.Logger, slog.LevelError, "admin_auth_inconsistent",
+					"the Admin Secret generation could not be confirmed", "error_code", "internal_error", "reason_code", reason)
+			}
+			return rep, fmt.Errorf("valkey: admin secret generation: %w", err)
+		}
+		switch out.Result {
+		case "initialized", "rotated":
+			rep.Findings["admin_auth_"+out.Result]++
+			if opts.Logger != nil {
+				observability.LogEvent(opts.Logger, slog.LevelWarn, "admin_secret_generation_"+out.Result,
+					"Admin Secret generation "+out.Result, "revoked_sessions", out.Revoked)
+			}
+		}
+	}
 	// Scan administrative records at startup and after loss of readiness, not
 	// on every one-second connectivity probe while the service is healthy.
 	if err := a.checkAdminRecords(ctx); err != nil {

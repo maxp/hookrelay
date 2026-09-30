@@ -302,6 +302,7 @@ func Serve(args []string) int {
 			Full:              full,
 			MessageCheckBound: cfg.MaxQueuedMessagesPerRecipient,
 			Logger:            log,
+			AdminSecret:       adminSecret,
 		}, maintenance.ProcessDue)
 		findings := report.Findings
 		for reason, n := range report.BlockReasons {
